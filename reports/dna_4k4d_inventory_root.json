@@ -1,0 +1,74 @@
+{
+  "dataset_path": "G:\\数据集\\datasets\\data_used_in_4K4D",
+  "subset_roots": [
+    "G:\\数据集\\datasets\\data_used_in_4K4D"
+  ],
+  "outer_zip_parts": [
+    "G:\\数据集\\datasets\\data_used_in_4K4D-20260204T055307Z-3-001.zip",
+    "G:\\数据集\\datasets\\data_used_in_4K4D-20260204T055307Z-3-003.zip",
+    "G:\\数据集\\datasets\\data_used_in_4K4D-20260204T055307Z-3-008.zip",
+    "G:\\数据集\\datasets\\data_used_in_4K4D-20260204T055307Z-3-009.zip",
+    "G:\\数据集\\datasets\\data_used_in_4K4D-20260204T055307Z-3-010.zip",
+    "G:\\数据集\\datasets\\data_used_in_4K4D-20260204T055307Z-3-011.zip",
+    "G:\\数据集\\datasets\\data_used_in_4K4D-20260204T055307Z-3-012.zip",
+    "G:\\数据集\\datasets\\data_used_in_4K4D-20260204T055307Z-3-013.zip",
+    "G:\\数据集\\datasets\\data_used_in_4K4D-20260204T055307Z-3-014.zip",
+    "G:\\数据集\\datasets\\data_used_in_4K4D-20260204T055307Z-3-015.zip",
+    "G:\\数据集\\datasets\\data_used_in_4K4D-20260204T055307Z-3-016.zip",
+    "G:\\数据集\\datasets\\data_used_in_4K4D-20260204T055307Z-3-017.zip"
+  ],
+  "heuristic_missing_zip_parts": [
+    2,
+    4,
+    5,
+    6,
+    7
+  ],
+  "file_gid_source": "G:\\数据集\\datasets\\data_used_in_4K4D\\data_used_in_4K4D_file_gid.json",
+  "expected_file_count": 48,
+  "local_expected_file_count": 48,
+  "missing_expected_file_count": 0,
+  "categories": {
+    "ReadMe.txt": {
+      "expected": 1,
+      "local": 1,
+      "missing": 0
+    },
+    "annotations": {
+      "expected": 8,
+      "local": 8,
+      "missing": 0
+    },
+    "apose/apose_kinect": {
+      "expected": 7,
+      "local": 7,
+      "missing": 0
+    },
+    "apose/apose_main": {
+      "expected": 7,
+      "local": 7,
+      "missing": 0
+    },
+    "data_used_in_4K4D_rgb_cams.zip": {
+      "expected": 1,
+      "local": 1,
+      "missing": 0
+    },
+    "kinect": {
+      "expected": 8,
+      "local": 8,
+      "missing": 0
+    },
+    "main": {
+      "expected": 8,
+      "local": 8,
+      "missing": 0
+    },
+    "preview": {
+      "expected": 8,
+      "local": 8,
+      "missing": 0
+    }
+  },
+  "missing_files": []
+}

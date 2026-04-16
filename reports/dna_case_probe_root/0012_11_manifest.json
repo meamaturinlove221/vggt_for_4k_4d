@@ -1,0 +1,259 @@
+{
+  "dataset_path": "G:\\数据集\\datasets\\data_used_in_4K4D",
+  "subset_name": "data_used_in_4K4D",
+  "seq_id": "0012_11",
+  "frame_id": "0",
+  "target_camera": "00",
+  "source_cameras": [
+    "01",
+    "10",
+    "19",
+    "28",
+    "37",
+    "46"
+  ],
+  "files": {
+    "main_smc": {
+      "status": "extracted",
+      "path": "G:\\数据集\\datasets\\data_used_in_4K4D\\main\\0012_11.smc",
+      "archives": []
+    },
+    "annotations_smc": {
+      "status": "extracted",
+      "path": "G:\\数据集\\datasets\\data_used_in_4K4D\\annotations\\0012_11_annots.smc",
+      "archives": []
+    },
+    "kinect_smc": {
+      "status": "extracted",
+      "path": "G:\\数据集\\datasets\\data_used_in_4K4D\\kinect\\0012_11_kinect.smc",
+      "archives": []
+    },
+    "preview_mp4": {
+      "status": "extracted",
+      "path": "G:\\数据集\\datasets\\data_used_in_4K4D\\preview\\0012_11.mp4",
+      "archives": []
+    },
+    "rgb_cams_smc": {
+      "status": "materialized",
+      "path": "C:\\Users\\WINDOWS\\AppData\\Local\\Temp\\dna_4k4d_7bpk9ibj\\0012_11_rgb_cams.smc",
+      "source": "G:\\数据集\\datasets\\data_used_in_4K4D\\data_used_in_4K4D_rgb_cams.zip!/0012_11_rgb_cams.smc"
+    }
+  },
+  "camera_summary": {
+    "camera_ids": [
+      "00",
+      "01",
+      "02",
+      "03",
+      "04",
+      "05",
+      "06",
+      "07",
+      "08",
+      "09",
+      "10",
+      "11",
+      "12",
+      "13",
+      "14",
+      "15",
+      "16",
+      "17",
+      "18",
+      "19",
+      "20",
+      "21",
+      "22",
+      "23",
+      "24",
+      "25",
+      "26",
+      "27",
+      "28",
+      "29",
+      "30",
+      "31",
+      "32",
+      "33",
+      "34",
+      "35",
+      "36",
+      "37",
+      "38",
+      "39",
+      "40",
+      "41",
+      "42",
+      "43",
+      "44",
+      "45",
+      "46",
+      "47",
+      "48",
+      "49",
+      "50",
+      "51",
+      "52",
+      "53",
+      "54",
+      "55",
+      "56",
+      "57",
+      "58",
+      "59"
+    ],
+    "camera_count": 60,
+    "matrix_shapes": {
+      "K": [
+        3,
+        3
+      ],
+      "D": [
+        5
+      ],
+      "RT": [
+        4,
+        4
+      ]
+    }
+  },
+  "probes": {
+    "main_smc": {
+      "root_keys": [
+        "Camera_5mp",
+        "Camera_12mp"
+      ],
+      "groups": {
+        "Camera_5mp": [
+          "0",
+          "1",
+          "2",
+          "3",
+          "4",
+          "5",
+          "6",
+          "7",
+          "8",
+          "9",
+          "10",
+          "11",
+          "12",
+          "13",
+          "14",
+          "15",
+          "16",
+          "17",
+          "18",
+          "19"
+        ],
+        "Camera_12mp": [
+          "48",
+          "49",
+          "50",
+          "51",
+          "52",
+          "53",
+          "54",
+          "55",
+          "56",
+          "57",
+          "58",
+          "59"
+        ]
+      }
+    },
+    "annotations_smc": {
+      "root_keys": [
+        "Keypoints_2D",
+        "Keypoints_3D",
+        "Camera_Parameter",
+        "Mask",
+        "SMPLx"
+      ],
+      "groups": {
+        "Keypoints_2D": [
+          "00",
+          "01",
+          "02",
+          "03",
+          "04",
+          "05",
+          "06",
+          "07",
+          "08",
+          "09",
+          "10",
+          "11",
+          "12",
+          "13",
+          "14",
+          "15",
+          "16",
+          "17",
+          "18",
+          "19"
+        ],
+        "Keypoints_3D": [
+          "keypoints3d"
+        ],
+        "Camera_Parameter": [
+          "00",
+          "01",
+          "02",
+          "03",
+          "04",
+          "05",
+          "06",
+          "07",
+          "08",
+          "09",
+          "10",
+          "11",
+          "12",
+          "13",
+          "14",
+          "15",
+          "16",
+          "17",
+          "18",
+          "19"
+        ],
+        "Mask": [
+          "0",
+          "1",
+          "2",
+          "3",
+          "4",
+          "5",
+          "6",
+          "7",
+          "8",
+          "9",
+          "10",
+          "11",
+          "12",
+          "13",
+          "14",
+          "15",
+          "16",
+          "17",
+          "18",
+          "19"
+        ],
+        "SMPLx": [
+          "betas",
+          "expression",
+          "fullpose",
+          "scale",
+          "transl"
+        ]
+      }
+    }
+  },
+  "status": {
+    "ready_for_rgb_bridge": true,
+    "ready_for_mask_bridge": true,
+    "needs_main_download": false
+  },
+  "blocking_issues": []
+}
