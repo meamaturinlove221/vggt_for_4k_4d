@@ -17,6 +17,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import dna_4k4d as dna  # noqa: E402
+from prepare_4k4d_prior_training_case import build_prior_stack, resolve_smplx_model_dir  # noqa: E402
 
 
 def decode_encoded_image(buffer: np.ndarray) -> Image.Image:
@@ -93,6 +94,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-cameras", nargs="*", default=[], help="Explicit source camera ids.")
     parser.add_argument("--auto-sources", type=int, default=6, help="Auto-pick N source cameras if none are provided.")
     parser.add_argument("--output-dir", required=True, help="Output scene directory.")
+    parser.add_argument("--target-size", type=int, default=518, help="Target square size for exported prior maps.")
+    parser.add_argument("--mask-only", action="store_true", help="Use silhouette-only non-SMPL channels.")
+    parser.add_argument("--sigma", type=float, default=6.0, help="Gaussian sigma for 2D keypoint heatmaps.")
+    parser.add_argument("--min-conf", type=float, default=0.05, help="Minimum confidence for 2D keypoint heatmaps.")
+    parser.add_argument("--smplx-model-dir", help="Directory containing SMPL-X model files such as SMPLX_NEUTRAL.npz.")
+    parser.add_argument("--smplx-gender", choices=("neutral", "female", "male"), default="neutral")
+    parser.add_argument("--mesh-fill-knn", type=int, default=4, help="KNN used to densify SMPL-X feature priors inside the silhouette.")
+    parser.add_argument("--summary-token-count", type=int, default=16, help="Number of pooled SMPL-X summary tokens per view.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing exported images.")
     return parser.parse_args()
 
@@ -171,6 +180,45 @@ def main() -> int:
             "annotations_smc": str(ann_smc),
             "exported_views": exported,
         }
+
+        smplx_model_dir = resolve_smplx_model_dir(args.smplx_model_dir)
+        if smplx_model_dir is None:
+            raise FileNotFoundError(
+                "SMPL-X prior export now requires model files. Pass --smplx-model-dir or set VGGT_SMPLX_MODEL_DIR."
+            )
+
+        prior_maps, prior_mask, prior_summary_tokens, _, _, prior_input_meta = build_prior_stack(
+            scene_manifest=scene_manifest,
+            dataset_root=Path(scene_manifest["dataset_root"]),
+            subset_name=dna.SUBSET_NAME,
+            target_size=int(args.target_size),
+            mask_only=bool(args.mask_only),
+            sigma=float(args.sigma),
+            min_conf=float(args.min_conf),
+            smplx_model_dir=smplx_model_dir,
+            smplx_gender=args.smplx_gender,
+            mesh_fill_knn=int(args.mesh_fill_knn),
+            summary_token_count=int(args.summary_token_count),
+        )
+        vertex_feature_meta = prior_input_meta.get("smplx_vertex_feature_meta", {})
+        if not bool(vertex_feature_meta.get("enabled")):
+            raise RuntimeError(f"Failed to export dense SMPL-X vertex priors: {vertex_feature_meta}")
+
+        prior_npz_path = output_dir / "prior_maps.npz"
+        np.savez_compressed(
+            prior_npz_path,
+            prior_maps=prior_maps.astype(np.float16),
+            prior_summary_tokens=prior_summary_tokens.astype(np.float16),
+            prior_mask=prior_mask.astype(bool),
+            prior_channels=np.asarray(prior_input_meta["channel_names"]),
+            prior_summary_channels=np.asarray(prior_input_meta.get("summary_channel_names", [])),
+        )
+        scene_manifest["prior_maps_file"] = prior_npz_path.name
+        scene_manifest["prior_channels"] = prior_input_meta["channel_names"]
+        scene_manifest["prior_summary_channels"] = prior_input_meta.get("summary_channel_names", [])
+        scene_manifest["prior_summary_token_count"] = 0 if prior_summary_tokens is None else int(prior_summary_tokens.shape[1])
+        scene_manifest["prior_input_meta"] = prior_input_meta
+
         with (output_dir / "scene_manifest.json").open("w", encoding="utf-8") as handle:
             json.dump(scene_manifest, handle, indent=2, ensure_ascii=False)
 

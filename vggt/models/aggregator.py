@@ -70,6 +70,7 @@ class Aggregator(nn.Module):
         rope_freq=100,
         init_values=0.01,
         human_prior_channels=0,
+        human_prior_summary_channels=0,
         human_prior_hidden_dim=64,
         human_prior_gate_init=0.0,
     ):
@@ -120,10 +121,13 @@ class Aggregator(nn.Module):
         self.patch_size = patch_size
         self.aa_block_size = aa_block_size
         self.human_prior_channels = human_prior_channels
+        self.human_prior_summary_channels = human_prior_summary_channels
         self.human_prior_adapter = (
             HumanPriorAdapter(
                 in_channels=human_prior_channels,
                 embed_dim=embed_dim,
+                depth=depth,
+                summary_in_channels=human_prior_summary_channels,
                 hidden_dim=human_prior_hidden_dim,
                 gate_init=human_prior_gate_init,
             )
@@ -196,12 +200,19 @@ class Aggregator(nn.Module):
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
 
-    def forward(self, images: torch.Tensor, prior_maps: Optional[torch.Tensor] = None) -> Tuple[List[torch.Tensor], int]:
+    def forward(
+        self,
+        images: torch.Tensor,
+        prior_maps: Optional[torch.Tensor] = None,
+        prior_summary_tokens: Optional[torch.Tensor] = None,
+    ) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
                 B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
             prior_maps (torch.Tensor, optional): Optional human prior maps with shape [B, S, C, H, W].
+            prior_summary_tokens (torch.Tensor, optional): Optional pooled human summary tokens
+                with shape [B, S, T, C_summary].
 
         Returns:
             (list[torch.Tensor], int):
@@ -225,6 +236,8 @@ class Aggregator(nn.Module):
 
         _, P, C = patch_tokens.shape
 
+        prior_tokens = None
+        summary_tokens = None
         if prior_maps is not None:
             if self.human_prior_adapter is None:
                 raise ValueError(
@@ -239,7 +252,7 @@ class Aggregator(nn.Module):
                     f"prior_maps batch/sequence dimensions {prior_maps.shape[:2]} do not match images {(B, S)}"
                 )
 
-            prior_tokens = self.human_prior_adapter(
+            prior_tokens = self.human_prior_adapter.project_prior_maps(
                 prior_maps=prior_maps.to(dtype=patch_tokens.dtype),
                 target_hw=(H // self.patch_size, W // self.patch_size),
             )
@@ -247,7 +260,29 @@ class Aggregator(nn.Module):
                 raise ValueError(
                     f"Prior token count {prior_tokens.shape[1]} does not match patch token count {P}."
                 )
-            patch_tokens = patch_tokens + prior_tokens.to(dtype=patch_tokens.dtype)
+            patch_tokens = self.human_prior_adapter.fuse_input_tokens(
+                patch_tokens,
+                prior_tokens.to(dtype=patch_tokens.dtype),
+            )
+
+        if prior_summary_tokens is not None:
+            if self.human_prior_adapter is None or self.human_prior_summary_channels <= 0:
+                raise ValueError(
+                    "prior_summary_tokens were provided, but the Aggregator was created without "
+                    "human_prior_summary_channels. Please enable the summary token adapter in the model config."
+                )
+            if prior_summary_tokens.ndim != 4:
+                raise ValueError(
+                    f"Expected prior_summary_tokens with shape [B, S, T, C], got {prior_summary_tokens.shape}"
+                )
+            if prior_summary_tokens.shape[:2] != (B, S):
+                raise ValueError(
+                    f"prior_summary_tokens batch/sequence dims {prior_summary_tokens.shape[:2]} "
+                    f"do not match images {(B, S)}"
+                )
+            summary_tokens = self.human_prior_adapter.project_summary_tokens(
+                prior_summary_tokens.to(dtype=patch_tokens.dtype)
+            )
 
         # Expand camera and register tokens to match batch size and sequence length
         camera_token = slice_expand_and_flatten(self.camera_token, B, S)
@@ -278,11 +313,19 @@ class Aggregator(nn.Module):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
-                        tokens, B, S, P, C, frame_idx, pos=pos
+                        tokens, B, S, P, C, frame_idx, pos=pos, prior_tokens=prior_tokens
                     )
                 elif attn_type == "global":
                     tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos
+                        tokens,
+                        B,
+                        S,
+                        P,
+                        C,
+                        global_idx,
+                        pos=pos,
+                        prior_tokens=prior_tokens,
+                        prior_summary_tokens=summary_tokens,
                     )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
@@ -297,50 +340,114 @@ class Aggregator(nn.Module):
         del global_intermediates
         return output_list, self.patch_start_idx
 
-    def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
+    def _fuse_frame_prior(self, tokens, prior_tokens, layer_idx):
+        if prior_tokens is None:
+            return tokens
+
+        patch_tokens = tokens[:, self.patch_start_idx :, :]
+        patch_tokens = self.human_prior_adapter.fuse_frame_tokens(
+            patch_tokens,
+            prior_tokens.to(dtype=patch_tokens.dtype),
+            layer_idx=layer_idx,
+        )
+        if self.patch_start_idx == 0:
+            return patch_tokens
+        return torch.cat([tokens[:, : self.patch_start_idx, :], patch_tokens], dim=1)
+
+    def _fuse_global_prior(self, tokens, B, S, P, C, prior_tokens, prior_summary_tokens, layer_idx):
+        if prior_tokens is None and prior_summary_tokens is None:
+            return tokens
+
+        tokens_view = tokens.reshape(B, S, P, C)
+        patch_tokens = tokens_view[:, :, self.patch_start_idx :, :].reshape(
+            B * S,
+            P - self.patch_start_idx,
+            C,
+        )
+        if prior_tokens is not None:
+            patch_tokens = self.human_prior_adapter.fuse_global_tokens(
+                patch_tokens,
+                prior_tokens.to(dtype=patch_tokens.dtype),
+                layer_idx=layer_idx,
+            )
+        if prior_summary_tokens is not None:
+            patch_tokens = self.human_prior_adapter.fuse_global_summary_tokens(
+                patch_tokens,
+                prior_summary_tokens.to(dtype=patch_tokens.dtype),
+                layer_idx=layer_idx,
+            )
+        patch_tokens = patch_tokens.reshape(B, S, P - self.patch_start_idx, C)
+        if self.patch_start_idx == 0:
+            return patch_tokens.reshape(B, S * P, C)
+        special_tokens = tokens_view[:, :, : self.patch_start_idx, :]
+        return torch.cat([special_tokens, patch_tokens], dim=2).reshape(B, S * P, C)
+
+    def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None, prior_tokens=None):
         """
         Process frame attention blocks. We keep tokens in shape (B*S, P, C).
         """
         # If needed, reshape tokens or positions:
         if tokens.shape != (B * S, P, C):
-            tokens = tokens.view(B, S, P, C).view(B * S, P, C)
+            tokens = tokens.reshape(B, S, P, C).reshape(B * S, P, C)
 
         if pos is not None and pos.shape != (B * S, P, 2):
-            pos = pos.view(B, S, P, 2).view(B * S, P, 2)
+            pos = pos.reshape(B, S, P, 2).reshape(B * S, P, 2)
 
         intermediates = []
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
+            tokens = self._fuse_frame_prior(tokens, prior_tokens=prior_tokens, layer_idx=frame_idx)
             if self.training:
                 tokens = checkpoint(self.frame_blocks[frame_idx], tokens, pos, use_reentrant=self.use_reentrant)
             else:
                 tokens = self.frame_blocks[frame_idx](tokens, pos=pos)
             frame_idx += 1
-            intermediates.append(tokens.view(B, S, P, C))
+            intermediates.append(tokens.reshape(B, S, P, C))
 
         return tokens, frame_idx, intermediates
 
-    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None):
+    def _process_global_attention(
+        self,
+        tokens,
+        B,
+        S,
+        P,
+        C,
+        global_idx,
+        pos=None,
+        prior_tokens=None,
+        prior_summary_tokens=None,
+    ):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
         """
         if tokens.shape != (B, S * P, C):
-            tokens = tokens.view(B, S, P, C).view(B, S * P, C)
+            tokens = tokens.reshape(B, S, P, C).reshape(B, S * P, C)
 
         if pos is not None and pos.shape != (B, S * P, 2):
-            pos = pos.view(B, S, P, 2).view(B, S * P, 2)
+            pos = pos.reshape(B, S, P, 2).reshape(B, S * P, 2)
 
         intermediates = []
 
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
+            tokens = self._fuse_global_prior(
+                tokens,
+                B=B,
+                S=S,
+                P=P,
+                C=C,
+                prior_tokens=prior_tokens,
+                prior_summary_tokens=prior_summary_tokens,
+                layer_idx=global_idx,
+            )
             if self.training:
                 tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
             else:
                 tokens = self.global_blocks[global_idx](tokens, pos=pos)
             global_idx += 1
-            intermediates.append(tokens.view(B, S, P, C))
+            intermediates.append(tokens.reshape(B, S, P, C))
 
         return tokens, global_idx, intermediates
 

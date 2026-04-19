@@ -8,25 +8,87 @@ from __future__ import annotations
 
 from typing import Tuple
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
+class PriorFusionBlock(nn.Module):
+    def __init__(self, embed_dim: int, hidden_dim: int = 64, gate_init: float = 0.0) -> None:
+        super().__init__()
+        self.token_norm = nn.LayerNorm(embed_dim)
+        self.prior_norm = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, embed_dim),
+        )
+        self.gate = nn.Parameter(torch.tensor(float(gate_init)))
+
+    def forward(self, patch_tokens: torch.Tensor, prior_tokens: torch.Tensor) -> torch.Tensor:
+        if patch_tokens.shape != prior_tokens.shape:
+            raise ValueError(
+                f"patch_tokens and prior_tokens must have the same shape, got "
+                f"{patch_tokens.shape} vs {prior_tokens.shape}"
+            )
+        fused = torch.cat(
+            [
+                self.token_norm(patch_tokens),
+                self.prior_norm(prior_tokens.to(dtype=patch_tokens.dtype)),
+            ],
+            dim=-1,
+        )
+        return patch_tokens + self.gate * self.mlp(fused)
+
+
+class SummaryTokenFusionBlock(nn.Module):
+    def __init__(self, embed_dim: int, hidden_dim: int = 64, gate_init: float = 0.0) -> None:
+        super().__init__()
+        self.token_norm = nn.LayerNorm(embed_dim)
+        self.summary_norm = nn.LayerNorm(embed_dim)
+        self.query = nn.Linear(embed_dim, hidden_dim, bias=False)
+        self.key = nn.Linear(embed_dim, hidden_dim, bias=False)
+        self.value = nn.Linear(embed_dim, hidden_dim, bias=False)
+        self.out = nn.Linear(hidden_dim, embed_dim, bias=False)
+        self.gate = nn.Parameter(torch.tensor(float(gate_init)))
+
+    def forward(self, patch_tokens: torch.Tensor, summary_tokens: torch.Tensor) -> torch.Tensor:
+        if patch_tokens.ndim != 3 or summary_tokens.ndim != 3:
+            raise ValueError(
+                f"Expected 3D patch/summary tensors, got {patch_tokens.shape} and {summary_tokens.shape}"
+            )
+        if patch_tokens.shape[0] != summary_tokens.shape[0]:
+            raise ValueError(
+                f"patch_tokens and summary_tokens batch dims must match, got "
+                f"{patch_tokens.shape} vs {summary_tokens.shape}"
+            )
+
+        token_features = self.token_norm(patch_tokens)
+        summary_features = self.summary_norm(summary_tokens.to(dtype=patch_tokens.dtype))
+        query = self.query(token_features)
+        key = self.key(summary_features)
+        value = self.value(summary_features)
+        attention = torch.softmax(
+            torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(max(1, key.shape[-1])),
+            dim=-1,
+        )
+        context = torch.matmul(attention, value)
+        return patch_tokens + self.gate * self.out(context)
+
+
 class HumanPriorAdapter(nn.Module):
     """
-    Projects optional image-space human prior maps to the patch-token space.
-
-    The module keeps the integration lightweight:
-    - resize prior maps to the patch grid
-    - project them to the token embedding dimension
-    - fuse them into the patch tokens with a learnable gate
+    Projects image-space human prior maps to patch-token space and exposes
+    lightweight fusion blocks for the input stage and every transformer layer.
     """
 
     def __init__(
         self,
         in_channels: int,
         embed_dim: int,
+        depth: int,
+        summary_in_channels: int = 0,
         hidden_dim: int = 64,
         gate_init: float = 0.0,
     ) -> None:
@@ -36,16 +98,39 @@ class HumanPriorAdapter(nn.Module):
             raise ValueError(f"in_channels must be positive, got {in_channels}")
 
         self.in_channels = in_channels
+        self.summary_in_channels = summary_in_channels
         self.embed_dim = embed_dim
+        self.depth = depth
 
         self.proj = nn.Sequential(
             nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1),
             nn.GELU(),
             nn.Conv2d(hidden_dim, embed_dim, kernel_size=1),
         )
-        self.gate = nn.Parameter(torch.tensor(float(gate_init)))
+        self.input_fusion = PriorFusionBlock(embed_dim=embed_dim, hidden_dim=hidden_dim, gate_init=gate_init)
+        self.frame_fusions = nn.ModuleList(
+            PriorFusionBlock(embed_dim=embed_dim, hidden_dim=hidden_dim, gate_init=gate_init)
+            for _ in range(depth)
+        )
+        self.global_fusions = nn.ModuleList(
+            PriorFusionBlock(embed_dim=embed_dim, hidden_dim=hidden_dim, gate_init=gate_init)
+            for _ in range(depth)
+        )
+        self.summary_proj = (
+            nn.Sequential(
+                nn.Linear(summary_in_channels, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, embed_dim),
+            )
+            if summary_in_channels > 0
+            else None
+        )
+        self.global_summary_fusions = nn.ModuleList(
+            SummaryTokenFusionBlock(embed_dim=embed_dim, hidden_dim=hidden_dim, gate_init=gate_init)
+            for _ in range(depth)
+        )
 
-    def forward(self, prior_maps: torch.Tensor, target_hw: Tuple[int, int]) -> torch.Tensor:
+    def project_prior_maps(self, prior_maps: torch.Tensor, target_hw: Tuple[int, int]) -> torch.Tensor:
         """
         Args:
             prior_maps: Tensor of shape [B, S, C, H, W].
@@ -73,4 +158,41 @@ class HumanPriorAdapter(nn.Module):
         )
         prior_tokens = self.proj(prior_maps)
         prior_tokens = prior_tokens.flatten(2).transpose(1, 2).contiguous()
-        return prior_tokens * self.gate
+        return prior_tokens
+
+    def fuse_input_tokens(self, patch_tokens: torch.Tensor, prior_tokens: torch.Tensor) -> torch.Tensor:
+        return self.input_fusion(patch_tokens, prior_tokens)
+
+    def fuse_frame_tokens(self, patch_tokens: torch.Tensor, prior_tokens: torch.Tensor, layer_idx: int) -> torch.Tensor:
+        return self.frame_fusions[layer_idx](patch_tokens, prior_tokens)
+
+    def fuse_global_tokens(self, patch_tokens: torch.Tensor, prior_tokens: torch.Tensor, layer_idx: int) -> torch.Tensor:
+        return self.global_fusions[layer_idx](patch_tokens, prior_tokens)
+
+    def project_summary_tokens(self, summary_tokens: torch.Tensor) -> torch.Tensor:
+        if self.summary_proj is None:
+            raise ValueError("summary_tokens were provided, but summary_in_channels=0 for HumanPriorAdapter.")
+        if summary_tokens.ndim != 4:
+            raise ValueError(
+                f"Expected summary_tokens with 4 dims [B, S, T, C], got {summary_tokens.shape}"
+            )
+
+        batch_size, seq_len, token_count, channels = summary_tokens.shape
+        if channels != self.summary_in_channels:
+            raise ValueError(
+                f"Expected {self.summary_in_channels} summary token channels, got {channels}. "
+                "Please align model.human_prior_summary_channels with the exported summary tokens."
+            )
+        projected = self.summary_proj(summary_tokens.reshape(batch_size * seq_len, token_count, channels))
+        return projected.contiguous()
+
+    def fuse_global_summary_tokens(
+        self,
+        patch_tokens: torch.Tensor,
+        summary_tokens: torch.Tensor,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        return self.global_summary_fusions[layer_idx](patch_tokens, summary_tokens)
+
+    def forward(self, prior_maps: torch.Tensor, target_hw: Tuple[int, int]) -> torch.Tensor:
+        return self.project_prior_maps(prior_maps=prior_maps, target_hw=target_hw)

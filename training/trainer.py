@@ -707,7 +707,7 @@ class Trainer:
         tensor_keys = [
             "images", "depths", "extrinsics", "intrinsics", 
             "cam_points", "world_points", "point_masks", 
-            "prior_maps", "prior_mask", "prior_masks",
+            "prior_maps", "prior_summary_tokens", "prior_mask", "prior_masks",
             "prior_depth", "prior_depths",
             "prior_points", "prior_cam_points",
         ]
@@ -787,7 +787,11 @@ class Trainer:
             A dictionary containing the computed losses.
         """
         # Forward pass
-        y_hat = model(images=batch["images"], prior_maps=batch.get("prior_maps"))
+        y_hat = model(
+            images=batch["images"],
+            prior_maps=batch.get("prior_maps"),
+            prior_summary_tokens=batch.get("prior_summary_tokens"),
+        )
         
         # Loss computation
         loss_dict = self.loss(y_hat, batch)

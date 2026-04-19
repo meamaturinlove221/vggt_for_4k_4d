@@ -35,7 +35,11 @@ from tools.export_4k4d_human_prior import (  # noqa: E402
     resolve_annotations_smc,
 )
 from tools.smplx_numpy import (  # noqa: E402
+    build_smplx_vertex_features,
+    build_surface_cluster_ids,
+    compute_pose_aligned_vertex_features,
     forward_smplx_mesh,
+    pool_vertex_features,
     rasterize_world_mesh,
     resolve_smplx_model_path,
 )
@@ -69,6 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smplx-model-dir", help="Directory containing SMPL-X model files such as SMPLX_NEUTRAL.npz.")
     parser.add_argument("--smplx-gender", choices=("neutral", "female", "male"), default="neutral")
     parser.add_argument("--mesh-fill-knn", type=int, default=4, help="KNN used to densify SMPL-X mesh priors inside the silhouette.")
+    parser.add_argument("--summary-token-count", type=int, default=16, help="Number of pooled SMPL-X human summary tokens per view.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite an existing output directory.")
     return parser.parse_args()
 
@@ -477,16 +482,31 @@ def build_prior_stack(
     mask_only: bool,
     sigma: float,
     min_conf: float,
-) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray], np.ndarray | None]:
+    smplx_model_dir: Path | None = None,
+    smplx_gender: str = "neutral",
+    mesh_fill_knn: int = 4,
+    summary_token_count: int = 16,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, dict[str, np.ndarray], np.ndarray | None, dict[str, object]]:
     context = build_context(dataset_root, subset_name)
     seq_id = scene_manifest["seq_id"]
     frame_idx = int(scene_manifest["frame_id"])
     camera_ids = [view["camera_id"] for view in scene_manifest["exported_views"]]
+    view_info_by_camera = {
+        normalize_camera_id(view["camera_id"]): view
+        for view in scene_manifest["exported_views"]
+    }
 
     prior_maps = []
     prior_masks = []
+    prior_summary_tokens = []
     smplx_params = {}
     keypoints3d = None
+    channel_names = ["silhouette"] + ([] if mask_only else ["keypoint_heatmap"])
+    summary_channel_names: list[str] = []
+    smplx_vertex_feature_meta: dict[str, object] = {
+        "enabled": False,
+        "source": "not_requested",
+    }
 
     temp_handle = tempfile.TemporaryDirectory(prefix="vggt_4k4d_case_")
     try:
@@ -503,6 +523,88 @@ def build_prior_stack(
         with h5py.File(annotation_path, "r") as annotation_handle:
             smplx_params = load_smplx_params(annotation_handle, frame_idx)
             keypoints3d = load_keypoints_3d(annotation_handle, frame_idx)
+
+            world_vertices = None
+            faces = None
+            camera_params = None
+            canonical_positions = None
+            canonical_scale = 1.0
+            cluster_ids = None
+            if smplx_model_dir is None:
+                smplx_vertex_feature_meta = {
+                    "enabled": False,
+                    "source": "missing_model_dir",
+                }
+            else:
+                required_keys = {"betas", "fullpose"}
+                if required_keys.issubset(smplx_params):
+                    model_path = resolve_smplx_model_path(smplx_model_dir, gender=smplx_gender)
+                    mesh = forward_smplx_mesh(
+                        model_path=model_path,
+                        betas=smplx_params["betas"],
+                        expression=smplx_params.get("expression"),
+                        fullpose=smplx_params["fullpose"],
+                        transl=smplx_params.get("transl"),
+                        scale=smplx_params.get("scale", 1.0),
+                    )
+                    vertex_feature_payload = build_smplx_vertex_features(
+                        model_path=model_path,
+                        betas=smplx_params["betas"],
+                        expression=smplx_params.get("expression"),
+                    )
+                    world_vertices = mesh["vertices"].astype(np.float32)
+                    faces = mesh["faces"].astype(np.int32)
+                    canonical_positions = np.asarray(vertex_feature_payload["canonical_positions"], dtype=np.float32)
+                    canonical_scale = float(np.asarray(vertex_feature_payload["canonical_scale"], dtype=np.float32))
+                    _, cluster_ids = build_surface_cluster_ids(
+                        canonical_positions,
+                        num_clusters=int(summary_token_count),
+                    )
+                    channel_names.extend(
+                        [
+                            "smplx_canonical_x",
+                            "smplx_canonical_y",
+                            "smplx_canonical_z",
+                            "smplx_posed_cam_x",
+                            "smplx_posed_cam_y",
+                            "smplx_posed_cam_z",
+                            "smplx_cam_nx",
+                            "smplx_cam_ny",
+                            "smplx_cam_nz",
+                            "smplx_visible_mask",
+                        ]
+                    )
+                    summary_channel_names = [
+                        "smplx_summary_canonical_x",
+                        "smplx_summary_canonical_y",
+                        "smplx_summary_canonical_z",
+                        "smplx_summary_posed_cam_x",
+                        "smplx_summary_posed_cam_y",
+                        "smplx_summary_posed_cam_z",
+                        "smplx_summary_cam_nx",
+                        "smplx_summary_cam_ny",
+                        "smplx_summary_cam_nz",
+                    ]
+                    camera_params = load_real_camera_params(scene_manifest, dataset_root, subset_name)
+                    smplx_vertex_feature_meta = {
+                        "enabled": True,
+                        "source": "smplx_mesh_pose_aligned_surface_prior",
+                        "smplx_model_path": str(model_path),
+                        "smplx_gender": smplx_gender,
+                        "num_vertices": int(world_vertices.shape[0]),
+                        "num_faces": int(faces.shape[0]),
+                        "dense_channels": list(channel_names),
+                        "summary_channels": list(summary_channel_names),
+                        "summary_token_count": int(summary_token_count),
+                        "fill_knn": int(mesh_fill_knn),
+                        "views": [],
+                    }
+                else:
+                    smplx_vertex_feature_meta = {
+                        "enabled": False,
+                        "source": "missing_smplx_params",
+                        "missing_keys": sorted(required_keys - set(smplx_params)),
+                    }
 
             for camera_id in camera_ids:
                 mask = load_mask(annotation_handle, camera_id, frame_idx)
@@ -527,6 +629,69 @@ def build_prior_stack(
                     keypoint_heatmap = pad_resize_map(keypoint_heatmap, target_size, mode="bilinear")
                     channels.append(keypoint_heatmap.astype(np.float32))
 
+                normalized_camera_id = normalize_camera_id(camera_id)
+                if (
+                    world_vertices is not None
+                    and faces is not None
+                    and canonical_positions is not None
+                    and cluster_ids is not None
+                    and camera_params is not None
+                ):
+                    pose_aligned = compute_pose_aligned_vertex_features(
+                        world_vertices=world_vertices,
+                        faces=faces,
+                        canonical_positions=canonical_positions,
+                        world_to_cam=camera_params[normalized_camera_id]["world_to_cam"],
+                        normalization_scale=canonical_scale,
+                    )
+                    dense_vertex_features = np.concatenate(
+                        [
+                            pose_aligned["canonical_positions"],
+                            pose_aligned["normalized_cam_vertices"],
+                            pose_aligned["cam_normals"],
+                        ],
+                        axis=1,
+                    ).astype(np.float32)
+                    intrinsic = align_intrinsics_for_pad_mode(
+                        camera_params[normalized_camera_id]["intrinsic"],
+                        view_info_by_camera[normalized_camera_id]["image_size"],
+                        target_size=target_size,
+                    )
+                    _, _, _, feature_map, raster_mask, raster_meta = rasterize_world_mesh(
+                        world_vertices=world_vertices,
+                        faces=faces,
+                        world_to_cam=camera_params[normalized_camera_id]["world_to_cam"],
+                        intrinsic=intrinsic,
+                        image_hw=(target_size, target_size),
+                        silhouette_mask=mask_aligned > 0.5,
+                        fill_knn=max(1, int(mesh_fill_knn)),
+                        vertex_features=dense_vertex_features,
+                        return_vertex_features=True,
+                        return_raster_mask=True,
+                    )
+                    channels.extend(np.moveaxis(feature_map, -1, 0).astype(np.float32))
+                    channels.append(raster_mask.astype(np.float32))
+                    prior_summary_tokens.append(
+                        pool_vertex_features(
+                            dense_vertex_features,
+                            cluster_ids=cluster_ids,
+                            num_clusters=int(summary_token_count),
+                        ).astype(np.float32)
+                    )
+                    if smplx_vertex_feature_meta.get("enabled"):
+                        smplx_vertex_feature_meta["views"].append(
+                            {
+                                "camera_id": normalized_camera_id,
+                                "silhouette_pixels": int((mask_aligned > 0.5).sum()),
+                                "visible_pixels": int(raster_mask.sum()),
+                                **raster_meta,
+                            }
+                        )
+                elif smplx_vertex_feature_meta.get("enabled"):
+                    prior_summary_tokens.append(
+                        np.zeros((int(summary_token_count), len(summary_channel_names)), dtype=np.float32)
+                    )
+
                 prior_maps.append(np.stack(channels, axis=0).astype(np.float32))
                 prior_masks.append(mask_aligned > 0.5)
     finally:
@@ -535,8 +700,14 @@ def build_prior_stack(
     return (
         np.stack(prior_maps, axis=0),
         np.stack(prior_masks, axis=0),
+        np.stack(prior_summary_tokens, axis=0) if prior_summary_tokens else None,
         smplx_params,
         keypoints3d,
+        {
+            "channel_names": channel_names,
+            "summary_channel_names": summary_channel_names,
+            "smplx_vertex_feature_meta": smplx_vertex_feature_meta,
+        },
     )
 
 
@@ -577,6 +748,7 @@ def main() -> int:
     if depths.ndim != 4 or depths.shape[1] != depths.shape[2]:
         raise ValueError(f"Expected square depth maps [V, H, W, 1], got {depths.shape}")
     target_size = int(depths.shape[1])
+    smplx_model_dir = resolve_smplx_model_dir(args.smplx_model_dir)
 
     image_paths = [view["image_path"] for view in scene_manifest["exported_views"]]
     images = load_and_preprocess_images_numpy(image_paths, target_size=target_size)
@@ -601,7 +773,7 @@ def main() -> int:
     world_valid = np.isfinite(world_points).all(axis=-1)
     point_masks = point_masks & depth_valid & world_valid
 
-    prior_maps, prior_mask, smplx_params, keypoints3d = build_prior_stack(
+    prior_maps, prior_mask, prior_summary_tokens, smplx_params, keypoints3d, prior_input_meta = build_prior_stack(
         scene_manifest=scene_manifest,
         dataset_root=dataset_root,
         subset_name=args.subset_name,
@@ -609,8 +781,11 @@ def main() -> int:
         mask_only=args.mask_only,
         sigma=args.sigma,
         min_conf=args.min_conf,
+        smplx_model_dir=smplx_model_dir,
+        smplx_gender=args.smplx_gender,
+        mesh_fill_knn=args.mesh_fill_knn,
+        summary_token_count=args.summary_token_count,
     )
-    smplx_model_dir = resolve_smplx_model_dir(args.smplx_model_dir)
     prior_depths = None
     prior_points = None
     prior_geometry_mask = None
@@ -656,15 +831,17 @@ def main() -> int:
     if prior_geometry_mask is not None:
         prior_mask = prior_geometry_mask
 
-    np.savez_compressed(
-        output_dir / "inputs.npz",
-        images=images,
-        point_masks=point_masks.astype(bool),
-        prior_maps=prior_maps.astype(np.float32),
-        prior_mask=prior_mask.astype(bool),
-        camera_ids=np.asarray(camera_ids),
-        view_roles=np.asarray(view_roles),
-    )
+    input_payload = {
+        "images": images,
+        "point_masks": point_masks.astype(bool),
+        "prior_maps": prior_maps.astype(np.float16),
+        "prior_mask": prior_mask.astype(bool),
+        "camera_ids": np.asarray(camera_ids),
+        "view_roles": np.asarray(view_roles),
+    }
+    if prior_summary_tokens is not None:
+        input_payload["prior_summary_tokens"] = prior_summary_tokens.astype(np.float16)
+    np.savez_compressed(output_dir / "inputs.npz", **input_payload)
     target_payload = {
         "depths": depths[..., 0].astype(np.float32),
         "extrinsics": extrinsics.astype(np.float32),
@@ -683,7 +860,6 @@ def main() -> int:
     frame_idx = int(scene_manifest["frame_id"])
     smplx_output, keypoints3d_output = save_optional_annotations(output_dir, frame_idx, smplx_params, keypoints3d)
 
-    channel_names = ["silhouette"] + ([] if args.mask_only else ["keypoint_heatmap"])
     case_manifest = {
         "case_id": output_dir.name,
         "scene_dir": str(scene_dir),
@@ -700,7 +876,10 @@ def main() -> int:
         "target_view_index": 0,
         "image_hw": list(images.shape[1:3]),
         "point_source": args.point_source,
-        "prior_channels": channel_names,
+        "prior_channels": prior_input_meta["channel_names"],
+        "prior_summary_channels": prior_input_meta.get("summary_channel_names", []),
+        "prior_summary_token_count": 0 if prior_summary_tokens is None else int(prior_summary_tokens.shape[1]),
+        "prior_input_meta": prior_input_meta,
         "prior_geometry_source": prior_geometry_meta.get("source"),
         "prior_geometry_meta": prior_geometry_meta,
         "inputs_npz": "inputs.npz",

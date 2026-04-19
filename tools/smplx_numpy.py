@@ -14,6 +14,15 @@ MODEL_FILENAMES = {
     "male": "SMPLX_MALE.npz",
 }
 
+SMPLX_VERTEX_FEATURE_CHANNELS = (
+    "smplx_template_x",
+    "smplx_template_y",
+    "smplx_template_z",
+    "smplx_template_nx",
+    "smplx_template_ny",
+    "smplx_template_nz",
+)
+
 
 def resolve_smplx_model_path(model_dir: str | Path, gender: str = "neutral") -> Path:
     normalized_gender = str(gender).strip().lower()
@@ -63,6 +72,10 @@ def load_smplx_model(model_path: str | Path) -> dict[str, np.ndarray]:
     return _load_smplx_model_cached(str(Path(model_path).expanduser().resolve()))
 
 
+def get_smplx_vertex_feature_channel_names() -> tuple[str, ...]:
+    return SMPLX_VERTEX_FEATURE_CHANNELS
+
+
 def _blend_shape_slice(shapedirs: np.ndarray, coeffs: np.ndarray, start: int) -> np.ndarray:
     coeffs = np.asarray(coeffs, dtype=np.float32).reshape(-1)
     if coeffs.size == 0 or start >= shapedirs.shape[-1]:
@@ -81,6 +94,132 @@ def _make_transform(rotation: np.ndarray, translation: np.ndarray) -> np.ndarray
     transform[:3, :3] = rotation
     transform[:3, 3] = translation
     return transform
+
+
+def _safe_normalize(vectors: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    norms = np.linalg.norm(vectors, axis=-1, keepdims=True)
+    return vectors / np.clip(norms, eps, None)
+
+
+def compute_vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    vertices = np.asarray(vertices, dtype=np.float32)
+    faces = np.asarray(faces, dtype=np.int32)
+    normals = np.zeros_like(vertices, dtype=np.float32)
+    triangles = vertices[faces]
+    face_normals = np.cross(
+        triangles[:, 1] - triangles[:, 0],
+        triangles[:, 2] - triangles[:, 0],
+    ).astype(np.float32)
+    for corner_idx in range(3):
+        np.add.at(normals, faces[:, corner_idx], face_normals)
+    return _safe_normalize(normals).astype(np.float32)
+
+
+def build_smplx_vertex_features(
+    model_path: str | Path,
+    betas: np.ndarray,
+    expression: np.ndarray | None = None,
+    expression_start: int = 300,
+) -> dict[str, np.ndarray | tuple[str, ...]]:
+    model = load_smplx_model(model_path)
+    betas = np.asarray(betas, dtype=np.float32).reshape(-1)
+    expression = (
+        np.zeros((0,), dtype=np.float32)
+        if expression is None
+        else np.asarray(expression, dtype=np.float32).reshape(-1)
+    )
+
+    rest_vertices = model["v_template"].copy()
+    rest_vertices += _blend_shape_slice(model["shapedirs"], betas, start=0)
+    rest_vertices += _blend_shape_slice(model["shapedirs"], expression, start=int(expression_start))
+    rest_vertices = rest_vertices.astype(np.float32)
+
+    centered_vertices = rest_vertices - rest_vertices.mean(axis=0, keepdims=True)
+    scale = float(np.linalg.norm(centered_vertices, axis=1).max())
+    if not np.isfinite(scale) or scale < 1e-8:
+        scale = 1.0
+    normalized_vertices = centered_vertices / scale
+    vertex_normals = compute_vertex_normals(rest_vertices, model["faces"])
+    vertex_features = np.concatenate([normalized_vertices, vertex_normals], axis=1).astype(np.float32)
+
+    return {
+        "vertex_features": vertex_features,
+        "channel_names": SMPLX_VERTEX_FEATURE_CHANNELS,
+        "rest_vertices": rest_vertices,
+        "canonical_positions": normalized_vertices.astype(np.float32),
+        "canonical_normals": vertex_normals.astype(np.float32),
+        "canonical_scale": np.asarray(scale, dtype=np.float32),
+    }
+
+
+def compute_pose_aligned_vertex_features(
+    world_vertices: np.ndarray,
+    faces: np.ndarray,
+    canonical_positions: np.ndarray,
+    world_to_cam: np.ndarray,
+    normalization_scale: float | np.ndarray,
+) -> dict[str, np.ndarray]:
+    world_vertices = np.asarray(world_vertices, dtype=np.float32)
+    faces = np.asarray(faces, dtype=np.int32)
+    canonical_positions = np.asarray(canonical_positions, dtype=np.float32)
+    rotation = np.asarray(world_to_cam[:3, :3], dtype=np.float32)
+    translation = np.asarray(world_to_cam[:3, 3], dtype=np.float32)
+
+    world_normals = compute_vertex_normals(world_vertices, faces)
+    cam_vertices = world_vertices @ rotation.T + translation[None, :]
+    cam_normals = _safe_normalize(world_normals @ rotation.T).astype(np.float32)
+
+    scale = float(np.asarray(normalization_scale, dtype=np.float32))
+    if not np.isfinite(scale) or scale < 1e-8:
+        scale = 1.0
+    normalized_cam_vertices = (cam_vertices / scale).astype(np.float32)
+
+    return {
+        "canonical_positions": canonical_positions.astype(np.float32),
+        "normalized_cam_vertices": normalized_cam_vertices,
+        "cam_normals": cam_normals.astype(np.float32),
+    }
+
+
+def build_surface_cluster_ids(canonical_positions: np.ndarray, num_clusters: int) -> tuple[np.ndarray, np.ndarray]:
+    canonical_positions = np.asarray(canonical_positions, dtype=np.float32)
+    num_vertices = canonical_positions.shape[0]
+    if num_vertices == 0:
+        raise ValueError("canonical_positions must contain at least one vertex.")
+
+    num_clusters = max(1, min(int(num_clusters), num_vertices))
+    anchor_indices = np.zeros((num_clusters,), dtype=np.int64)
+    distances = np.full((num_vertices,), np.inf, dtype=np.float32)
+
+    centroid = canonical_positions.mean(axis=0, keepdims=True)
+    farthest_idx = int(np.argmax(np.linalg.norm(canonical_positions - centroid, axis=1)))
+    for cluster_idx in range(num_clusters):
+        anchor_indices[cluster_idx] = farthest_idx
+        anchor = canonical_positions[farthest_idx]
+        sq_dists = np.sum((canonical_positions - anchor[None, :]) ** 2, axis=1).astype(np.float32)
+        distances = np.minimum(distances, sq_dists)
+        farthest_idx = int(np.argmax(distances))
+
+    anchor_positions = canonical_positions[anchor_indices]
+    sq_distances = np.sum(
+        (canonical_positions[:, None, :] - anchor_positions[None, :, :]) ** 2,
+        axis=2,
+    ).astype(np.float32)
+    cluster_ids = np.argmin(sq_distances, axis=1).astype(np.int64)
+    return anchor_indices, cluster_ids
+
+
+def pool_vertex_features(vertex_features: np.ndarray, cluster_ids: np.ndarray, num_clusters: int) -> np.ndarray:
+    vertex_features = np.asarray(vertex_features, dtype=np.float32)
+    cluster_ids = np.asarray(cluster_ids, dtype=np.int64).reshape(-1)
+    num_clusters = max(1, int(num_clusters))
+    pooled = np.zeros((num_clusters, vertex_features.shape[1]), dtype=np.float32)
+    for cluster_idx in range(num_clusters):
+        mask = cluster_ids == cluster_idx
+        if not np.any(mask):
+            continue
+        pooled[cluster_idx] = vertex_features[mask].mean(axis=0).astype(np.float32)
+    return pooled.astype(np.float32)
 
 
 def _compute_skinning_transforms(
@@ -168,25 +307,39 @@ def _edge_function(a: np.ndarray, b: np.ndarray, points_x: np.ndarray, points_y:
     return (points_x - a[0]) * (b[1] - a[1]) - (points_y - a[1]) * (b[0] - a[0])
 
 
-def _complete_dense_prior_from_mask(
-    depth_map: np.ndarray,
-    point_map: np.ndarray,
+def _compute_knn_fill_plan(
     raster_mask: np.ndarray,
     target_mask: np.ndarray,
     knn: int = 4,
     distance_eps: float = 1.0,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, int]]:
+) -> tuple[
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray,
+    dict[str, int],
+]:
     target_mask = np.asarray(target_mask, dtype=bool)
     raster_mask = np.asarray(raster_mask, dtype=bool)
 
     if not target_mask.any():
-        return depth_map, point_map, raster_mask, {"filled_pixels": 0, "completed_pixels": int(raster_mask.sum())}
+        return None, None, None, None, raster_mask.copy(), {
+            "filled_pixels": 0,
+            "completed_pixels": int(raster_mask.sum()),
+        }
     if not raster_mask.any():
-        return depth_map, point_map, raster_mask, {"filled_pixels": 0, "completed_pixels": 0}
+        return None, None, None, None, raster_mask.copy(), {
+            "filled_pixels": 0,
+            "completed_pixels": 0,
+        }
 
     query_mask = target_mask & ~raster_mask
     if not query_mask.any():
-        return depth_map, point_map, target_mask, {"filled_pixels": 0, "completed_pixels": int(target_mask.sum())}
+        return None, None, None, None, target_mask.copy(), {
+            "filled_pixels": 0,
+            "completed_pixels": int(target_mask.sum()),
+        }
 
     source_rc = np.argwhere(raster_mask)
     query_rc = np.argwhere(query_mask)
@@ -201,26 +354,55 @@ def _complete_dense_prior_from_mask(
         indices = indices[:, None]
 
     weights = 1.0 / np.maximum(dists, float(distance_eps)) ** 2
-    weight_sums = np.clip(weights.sum(axis=1, keepdims=True), 1e-8, None)
-    weights = weights / weight_sums
+    weights = weights / np.clip(weights.sum(axis=1, keepdims=True), 1e-8, None)
 
-    source_depth = depth_map[source_rc[:, 0], source_rc[:, 1]]
-    source_points = point_map[source_rc[:, 0], source_rc[:, 1]]
-
-    depth_values = np.sum(weights * source_depth[indices], axis=1).astype(np.float32)
-    point_values = np.sum(weights[..., None] * source_points[indices], axis=1).astype(np.float32)
-
-    depth_map = depth_map.copy()
-    point_map = point_map.copy()
     completed_mask = raster_mask.copy()
-    depth_map[query_rc[:, 0], query_rc[:, 1]] = depth_values
-    point_map[query_rc[:, 0], query_rc[:, 1]] = point_values
     completed_mask[target_mask] = True
-
-    return depth_map, point_map, completed_mask, {
+    return source_rc, query_rc, indices, weights, completed_mask, {
         "filled_pixels": int(query_mask.sum()),
         "completed_pixels": int(completed_mask.sum()),
     }
+
+
+def _fill_values_with_knn_plan(
+    value_map: np.ndarray,
+    source_rc: np.ndarray | None,
+    query_rc: np.ndarray | None,
+    indices: np.ndarray | None,
+    weights: np.ndarray | None,
+) -> np.ndarray:
+    if source_rc is None or query_rc is None or indices is None or weights is None or len(query_rc) == 0:
+        return np.asarray(value_map).copy()
+
+    value_map = np.asarray(value_map)
+    source_values = value_map[source_rc[:, 0], source_rc[:, 1]]
+    if value_map.ndim == 2:
+        filled_values = np.sum(weights * source_values[indices], axis=1)
+    else:
+        filled_values = np.sum(weights[..., None] * source_values[indices], axis=1)
+
+    filled_map = value_map.copy()
+    filled_map[query_rc[:, 0], query_rc[:, 1]] = filled_values.astype(value_map.dtype, copy=False)
+    return filled_map
+
+
+def _complete_dense_prior_from_mask(
+    depth_map: np.ndarray,
+    point_map: np.ndarray,
+    raster_mask: np.ndarray,
+    target_mask: np.ndarray,
+    knn: int = 4,
+    distance_eps: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, int]]:
+    source_rc, query_rc, indices, weights, completed_mask, fill_meta = _compute_knn_fill_plan(
+        raster_mask=raster_mask,
+        target_mask=target_mask,
+        knn=knn,
+        distance_eps=distance_eps,
+    )
+    depth_map = _fill_values_with_knn_plan(depth_map, source_rc, query_rc, indices, weights).astype(np.float32)
+    point_map = _fill_values_with_knn_plan(point_map, source_rc, query_rc, indices, weights).astype(np.float32)
+    return depth_map, point_map, completed_mask.astype(bool), fill_meta
 
 
 def rasterize_world_mesh(
@@ -231,7 +413,10 @@ def rasterize_world_mesh(
     image_hw: tuple[int, int],
     silhouette_mask: np.ndarray | None = None,
     fill_knn: int = 4,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, int]]:
+    vertex_features: np.ndarray | None = None,
+    return_vertex_features: bool = False,
+    return_raster_mask: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, int]] | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, int]] | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, int]] | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, int]]:
     height, width = int(image_hw[0]), int(image_hw[1])
     if height <= 0 or width <= 0:
         raise ValueError(f"Invalid raster image size: {(height, width)}")
@@ -253,10 +438,22 @@ def rasterize_world_mesh(
         if silhouette_mask.shape != (height, width):
             raise ValueError(f"Silhouette mask shape {silhouette_mask.shape} does not match {(height, width)}")
 
+    if vertex_features is not None:
+        vertex_features = np.asarray(vertex_features, dtype=np.float32)
+        if vertex_features.ndim != 2 or vertex_features.shape[0] != world_vertices.shape[0]:
+            raise ValueError(
+                f"vertex_features must have shape [V, C] aligned with world_vertices; got {vertex_features.shape}"
+            )
+    if return_vertex_features and vertex_features is None:
+        raise ValueError("return_vertex_features=True requires vertex_features to be provided.")
+
     z_buffer = np.full((height, width), np.inf, dtype=np.float32)
     depth_map = np.zeros((height, width), dtype=np.float32)
     point_map = np.zeros((height, width, 3), dtype=np.float32)
     raster_mask = np.zeros((height, width), dtype=bool)
+    feature_map = None
+    if vertex_features is not None:
+        feature_map = np.zeros((height, width, vertex_features.shape[1]), dtype=np.float32)
 
     faces_rasterized = 0
     for face in faces:
@@ -267,6 +464,7 @@ def rasterize_world_mesh(
         tri_uv = uv[face]
         tri_depth = depth[face]
         tri_world = world_vertices[face]
+        tri_features = vertex_features[face] if feature_map is not None else None
 
         min_x = max(int(np.floor(float(tri_uv[:, 0].min()) - 0.5)), 0)
         max_x = min(int(np.ceil(float(tri_uv[:, 0].max()) - 0.5)), width - 1)
@@ -304,29 +502,41 @@ def rasterize_world_mesh(
             + bary1[..., None] * tri_world[1][None, None, :]
             + bary2[..., None] * tri_world[2][None, None, :]
         )
+        interpolated_features = None
+        if tri_features is not None:
+            interpolated_features = (
+                bary0[..., None] * tri_features[0][None, None, :]
+                + bary1[..., None] * tri_features[1][None, None, :]
+                + bary2[..., None] * tri_features[2][None, None, :]
+            )
 
         local_depth = depth_map[min_y : max_y + 1, min_x : max_x + 1]
         local_points = point_map[min_y : max_y + 1, min_x : max_x + 1]
         local_mask = raster_mask[min_y : max_y + 1, min_x : max_x + 1]
+        local_features = feature_map[min_y : max_y + 1, min_x : max_x + 1] if feature_map is not None else None
 
         local_z[update] = interpolated_depth[update]
         local_depth[update] = interpolated_depth[update].astype(np.float32)
         local_points[update] = interpolated_world[update].astype(np.float32)
         local_mask[update] = True
+        if local_features is not None and interpolated_features is not None:
+            local_features[update] = interpolated_features[update].astype(np.float32)
         faces_rasterized += 1
 
     completed_mask = raster_mask
     fill_meta = {"filled_pixels": 0, "completed_pixels": int(raster_mask.sum())}
     if silhouette_mask is not None and fill_knn > 0:
-        depth_map, point_map, completed_mask, fill_meta = _complete_dense_prior_from_mask(
-            depth_map=depth_map,
-            point_map=point_map,
+        source_rc, query_rc, indices, weights, completed_mask, fill_meta = _compute_knn_fill_plan(
             raster_mask=raster_mask,
             target_mask=silhouette_mask,
             knn=fill_knn,
         )
+        depth_map = _fill_values_with_knn_plan(depth_map, source_rc, query_rc, indices, weights).astype(np.float32)
+        point_map = _fill_values_with_knn_plan(point_map, source_rc, query_rc, indices, weights).astype(np.float32)
+        if feature_map is not None:
+            feature_map = _fill_values_with_knn_plan(feature_map, source_rc, query_rc, indices, weights).astype(np.float32)
 
-    return depth_map.astype(np.float32), point_map.astype(np.float32), completed_mask.astype(bool), {
+    meta = {
         "valid_vertices": int(valid_vertices.sum()),
         "faces_total": int(len(faces)),
         "faces_rasterized": int(faces_rasterized),
@@ -334,3 +544,29 @@ def rasterize_world_mesh(
         "filled_pixels": int(fill_meta["filled_pixels"]),
         "completed_pixels": int(fill_meta["completed_pixels"]),
     }
+    if return_vertex_features and return_raster_mask:
+        return (
+            depth_map.astype(np.float32),
+            point_map.astype(np.float32),
+            completed_mask.astype(bool),
+            feature_map.astype(np.float32),
+            raster_mask.astype(bool),
+            meta,
+        )
+    if return_vertex_features:
+        return (
+            depth_map.astype(np.float32),
+            point_map.astype(np.float32),
+            completed_mask.astype(bool),
+            feature_map.astype(np.float32),
+            meta,
+        )
+    if return_raster_mask:
+        return (
+            depth_map.astype(np.float32),
+            point_map.astype(np.float32),
+            completed_mask.astype(bool),
+            raster_mask.astype(bool),
+            meta,
+        )
+    return depth_map.astype(np.float32), point_map.astype(np.float32), completed_mask.astype(bool), meta

@@ -167,6 +167,7 @@ class ComposedDataset(Dataset, ABC):
 
         optional_tensor_specs = {
             "prior_maps": np.float32,
+            "prior_summary_tokens": np.float32,
             "prior_mask": bool,
             "prior_masks": bool,
             "prior_depth": np.float32,
@@ -183,6 +184,8 @@ class ComposedDataset(Dataset, ABC):
             if key == "prior_maps":
                 tensor = _format_prior_maps(tensor).to(torch.get_default_dtype())
                 sample["prior_maps"] = tensor
+            elif key == "prior_summary_tokens":
+                sample["prior_summary_tokens"] = tensor.to(torch.get_default_dtype())
             elif key in {"prior_mask", "prior_masks"}:
                 sample["prior_mask"] = tensor.bool()
             elif key in {"prior_depth", "prior_depths"}:

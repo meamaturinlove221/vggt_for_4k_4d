@@ -116,6 +116,8 @@ class DNA4K4DPseudoDataset(BaseDataset):
 
         if "prior_maps" in inputs.files:
             case["prior_maps"] = inputs["prior_maps"].astype(np.float32)
+        if "prior_summary_tokens" in inputs.files:
+            case["prior_summary_tokens"] = inputs["prior_summary_tokens"].astype(np.float32)
         if "prior_mask" in inputs.files:
             case["prior_mask"] = inputs["prior_mask"].astype(bool)
         if "prior_depths" in targets.files:
@@ -199,6 +201,8 @@ class DNA4K4DPseudoDataset(BaseDataset):
 
         if "prior_maps" in case:
             batch["prior_maps"] = [case["prior_maps"][idx] for idx in ids]
+        if "prior_summary_tokens" in case:
+            batch["prior_summary_tokens"] = [case["prior_summary_tokens"][idx] for idx in ids]
         if "prior_mask" in case:
             batch["prior_mask"] = [case["prior_mask"][idx] for idx in ids]
         if "prior_depths" in case:

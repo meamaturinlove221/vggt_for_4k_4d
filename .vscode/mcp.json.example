@@ -1,0 +1,14 @@
+{
+  "servers": {
+    "yuque": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "yuque-mcp"
+      ],
+      "env": {
+        "YUQUE_PERSONAL_TOKEN": "YOUR_TOKEN_HERE"
+      }
+    }
+  }
+}

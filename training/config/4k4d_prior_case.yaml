@@ -242,8 +242,9 @@ model:
   enable_depth: True
   enable_point: True
   enable_track: False
-  human_prior_channels: 2
-  human_prior_hidden_dim: 64
+  human_prior_channels: 12
+  human_prior_summary_channels: 9
+  human_prior_hidden_dim: 128
   human_prior_gate_init: 0.0
 
 distributed:

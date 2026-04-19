@@ -90,6 +90,7 @@ class InferenceConfig:
     output_subdir: str = ""
     image_mode: str = "pad"
     hf_repo: str = "facebook/VGGT-1B"
+    checkpoint_relpath: str = ""
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -120,6 +121,38 @@ def _resolve_output_root(scene_subdir: str, output_subdir: str) -> Path:
     run_tag = time.strftime("%Y%m%d_%H%M%S")
     safe_scene = Path(scene_subdir).name.replace(" ", "_")
     return Path(str(REMOTE_OUTPUT_DIR / "vggt_4k4d_infer" / f"{run_tag}_{safe_scene}"))
+
+
+def _extract_model_state_dict(payload):
+    if isinstance(payload, dict):
+        if "model" in payload and isinstance(payload["model"], dict):
+            return payload["model"]
+        if "state_dict" in payload and isinstance(payload["state_dict"], dict):
+            return payload["state_dict"]
+    if isinstance(payload, dict):
+        return payload
+    raise TypeError(f"Unsupported checkpoint payload type: {type(payload)!r}")
+
+
+def _infer_model_kwargs_from_state_dict(state_dict: dict) -> dict:
+    camera_token = state_dict.get("aggregator.camera_token")
+    embed_dim = int(camera_token.shape[-1]) if camera_token is not None else 1024
+    proj0 = state_dict.get("aggregator.human_prior_adapter.proj.0.weight")
+    summary_proj0 = state_dict.get("aggregator.human_prior_adapter.summary_proj.0.weight")
+    gate = state_dict.get("aggregator.human_prior_adapter.input_fusion.gate")
+    return {
+        "img_size": 518,
+        "patch_size": 14,
+        "embed_dim": embed_dim,
+        "enable_camera": any(key.startswith("camera_head.") for key in state_dict),
+        "enable_point": any(key.startswith("point_head.") for key in state_dict),
+        "enable_depth": any(key.startswith("depth_head.") for key in state_dict),
+        "enable_track": any(key.startswith("track_head.") for key in state_dict),
+        "human_prior_channels": int(proj0.shape[1]) if proj0 is not None else 0,
+        "human_prior_summary_channels": int(summary_proj0.shape[1]) if summary_proj0 is not None else 0,
+        "human_prior_hidden_dim": int(proj0.shape[0]) if proj0 is not None else 64,
+        "human_prior_gate_init": float(gate.item()) if gate is not None else 0.0,
+    }
 
 
 def _upload_dir(local_dir: Path, remote_subdir: str) -> str:
@@ -325,14 +358,58 @@ def run_remote_vggt_inference(cfg_json: str) -> dict:
     device = "cuda"
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
     start_time = time.time()
-
-    model = VGGT.from_pretrained(cfg.hf_repo).to(device)
-    model.eval()
     images = load_and_preprocess_images([str(path) for path in image_paths], mode=cfg.image_mode).to(device)
+    prior_maps = None
+    prior_summary_tokens = None
+    prior_maps_path = scene_dir / "prior_maps.npz"
+    if prior_maps_path.is_file():
+        with np.load(prior_maps_path, allow_pickle=False) as prior_payload:
+            prior_maps = torch.from_numpy(np.array(prior_payload["prior_maps"])).to(device=device, dtype=torch.float32)
+            if "prior_summary_tokens" in prior_payload.files:
+                prior_summary_tokens = torch.from_numpy(
+                    np.array(prior_payload["prior_summary_tokens"])
+                ).to(device=device, dtype=torch.float32)
+
+    checkpoint_path = None
+    if cfg.checkpoint_relpath.strip():
+        checkpoint_path = _remote_output_path(cfg.checkpoint_relpath)
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"Remote checkpoint not found: {checkpoint_path}")
+        payload = torch.load(checkpoint_path, map_location="cpu")
+        state_dict = _extract_model_state_dict(payload)
+        model_kwargs = payload.get("model_kwargs") if isinstance(payload, dict) else None
+        if not isinstance(model_kwargs, dict):
+            model_kwargs = _infer_model_kwargs_from_state_dict(state_dict)
+        model = VGGT(**model_kwargs)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                f"Checkpoint load mismatch for {checkpoint_path}: missing={missing}, unexpected={unexpected}"
+            )
+    else:
+        model = VGGT.from_pretrained(cfg.hf_repo)
+
+    if prior_maps is not None and getattr(model.aggregator, "human_prior_channels", 0) <= 0:
+        raise RuntimeError(
+            "Scene includes prior_maps.npz, but the loaded model does not have a human prior adapter. "
+            "Use a prior-enabled checkpoint."
+        )
+    if prior_summary_tokens is not None and getattr(model.aggregator, "human_prior_summary_channels", 0) <= 0:
+        raise RuntimeError(
+            "Scene includes prior_summary_tokens, but the loaded model does not have a summary-token adapter. "
+            "Use a summary-enabled checkpoint."
+        )
+
+    model = model.to(device)
+    model.eval()
 
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
-            predictions = model(images)
+            predictions = model(
+                images,
+                prior_maps=prior_maps,
+                prior_summary_tokens=prior_summary_tokens,
+            )
 
     pose_enc = predictions["pose_enc"]
     extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
@@ -365,11 +442,14 @@ def run_remote_vggt_inference(cfg_json: str) -> dict:
         "scene_subdir": cfg.scene_subdir,
         "image_mode": cfg.image_mode,
         "hf_repo": cfg.hf_repo,
+        "checkpoint_relpath": cfg.checkpoint_relpath,
         "image_names": [path.name for path in image_paths],
         "num_images": len(image_paths),
         "device": device,
         "dtype": str(dtype),
         "input_tensor_shape": list(images.shape),
+        "prior_tensor_shape": list(prior_maps.shape) if prior_maps is not None else None,
+        "prior_summary_tensor_shape": list(prior_summary_tokens.shape) if prior_summary_tokens is not None else None,
         "output_shapes": {name: list(value.shape) for name, value in arrays.items()},
         "gpu_name": torch.cuda.get_device_name(0),
         "elapsed_seconds": round(time.time() - start_time, 3),
@@ -382,11 +462,14 @@ def run_remote_vggt_inference(cfg_json: str) -> dict:
         "output_subdir": output_root.relative_to(Path(str(REMOTE_OUTPUT_DIR))).as_posix(),
         "image_mode": cfg.image_mode,
         "hf_repo": cfg.hf_repo,
+        "checkpoint_relpath": cfg.checkpoint_relpath,
         "image_names": [path.name for path in image_paths],
         "num_images": len(image_paths),
         "device": device,
         "dtype": str(dtype),
         "input_tensor_shape": list(images.shape),
+        "prior_tensor_shape": list(prior_maps.shape) if prior_maps is not None else None,
+        "prior_summary_tensor_shape": list(prior_summary_tokens.shape) if prior_summary_tokens is not None else None,
         "output_shapes": {name: list(value.shape) for name, value in arrays.items()},
         "gpu_name": torch.cuda.get_device_name(0),
         "elapsed_seconds": round(time.time() - start_time, 3),
@@ -450,6 +533,7 @@ def run_scene(
     output_subdir: str = "",
     image_mode: str = "pad",
     hf_repo: str = "facebook/VGGT-1B",
+    checkpoint_relpath: str = "",
     download_local_dir: str = "",
 ) -> None:
     cfg = InferenceConfig(
@@ -457,6 +541,7 @@ def run_scene(
         output_subdir=output_subdir,
         image_mode=image_mode,
         hf_repo=hf_repo,
+        checkpoint_relpath=checkpoint_relpath,
     )
     print("[modal-4k4d] launch config:")
     print(json.dumps(asdict(cfg), indent=2, ensure_ascii=False))
@@ -476,6 +561,7 @@ def run_scene_from_local(
     output_subdir: str = "",
     image_mode: str = "pad",
     hf_repo: str = "facebook/VGGT-1B",
+    checkpoint_relpath: str = "",
     download_local_dir: str = "",
 ) -> None:
     local_dir = Path(local_scene_dir).expanduser().resolve()
@@ -487,6 +573,7 @@ def run_scene_from_local(
         output_subdir=output_subdir,
         image_mode=image_mode,
         hf_repo=hf_repo,
+        checkpoint_relpath=checkpoint_relpath,
     )
     print("[modal-4k4d] upload+run config:")
     print(json.dumps(asdict(cfg), indent=2, ensure_ascii=False))

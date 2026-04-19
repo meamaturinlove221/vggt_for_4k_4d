@@ -210,6 +210,46 @@ def _find_free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _extract_model_state_dict(payload):
+    if isinstance(payload, dict):
+        if "model" in payload and isinstance(payload["model"], dict):
+            return payload["model"]
+        if "state_dict" in payload and isinstance(payload["state_dict"], dict):
+            return payload["state_dict"]
+        return payload
+    raise TypeError(f"Unsupported checkpoint payload type: {type(payload)!r}")
+
+
+def _infer_model_kwargs_from_state_dict(state_dict: dict) -> dict:
+    camera_token = state_dict.get("aggregator.camera_token")
+    embed_dim = int(camera_token.shape[-1]) if camera_token is not None else 1024
+    proj0 = state_dict.get("aggregator.human_prior_adapter.proj.0.weight")
+    summary_proj0 = state_dict.get("aggregator.human_prior_adapter.summary_proj.0.weight")
+    gate = state_dict.get("aggregator.human_prior_adapter.input_fusion.gate")
+    return {
+        "img_size": 518,
+        "patch_size": 14,
+        "embed_dim": embed_dim,
+        "enable_camera": any(key.startswith("camera_head.") for key in state_dict),
+        "enable_point": any(key.startswith("point_head.") for key in state_dict),
+        "enable_depth": any(key.startswith("depth_head.") for key in state_dict),
+        "enable_track": any(key.startswith("track_head.") for key in state_dict),
+        "human_prior_channels": int(proj0.shape[1]) if proj0 is not None else 0,
+        "human_prior_summary_channels": int(summary_proj0.shape[1]) if summary_proj0 is not None else 0,
+        "human_prior_hidden_dim": int(proj0.shape[0]) if proj0 is not None else 64,
+        "human_prior_gate_init": float(gate.item()) if gate is not None else 0.0,
+    }
+
+
+def _find_latest_checkpoint(ckpt_dir: Path) -> Path:
+    if not ckpt_dir.is_dir():
+        raise FileNotFoundError(f"Checkpoint directory not found: {ckpt_dir}")
+    checkpoint_paths = sorted(ckpt_dir.glob("*.pt"), key=lambda path: path.stat().st_mtime)
+    if not checkpoint_paths:
+        raise FileNotFoundError(f"No .pt checkpoints found under {ckpt_dir}")
+    return checkpoint_paths[-1]
+
+
 def _build_hydra_overrides(cfg: TrainingConfig, case_roots: list[Path], log_dir: Path, ckpt_path: Path) -> list[str]:
     quoted_case_roots = ",".join(f"'{root.as_posix()}'" for root in case_roots)
     img_num_override = f"[{cfg.img_nums_min},{cfg.img_nums_max}]"
@@ -319,6 +359,19 @@ def run_remote_vggt_training(cfg_json: str) -> dict:
 
         import torch
 
+        latest_checkpoint = _find_latest_checkpoint(log_dir / "ckpts")
+        checkpoint_payload = torch.load(latest_checkpoint, map_location="cpu")
+        state_dict = _extract_model_state_dict(checkpoint_payload)
+        inference_checkpoint = output_root / "inference_model.pt"
+        torch.save(
+            {
+                "model": state_dict,
+                "model_kwargs": _infer_model_kwargs_from_state_dict(state_dict),
+                "source_checkpoint": latest_checkpoint.as_posix(),
+            },
+            inference_checkpoint,
+        )
+
         summary = {
             "status": "completed",
             "config_name": cfg.config_name,
@@ -331,6 +384,9 @@ def run_remote_vggt_training(cfg_json: str) -> dict:
             "output_subdir": output_root.relative_to(Path(str(REMOTE_OUTPUT_DIR))).as_posix(),
             "log_dir": log_dir.as_posix(),
             "checkpoint_dir": (log_dir / "ckpts").as_posix(),
+            "latest_checkpoint": latest_checkpoint.as_posix(),
+            "inference_checkpoint": inference_checkpoint.as_posix(),
+            "inference_checkpoint_relpath": inference_checkpoint.relative_to(Path(str(REMOTE_OUTPUT_DIR))).as_posix(),
             "elapsed_seconds": round(time.time() - started, 3),
             "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
             "max_epochs": cfg.max_epochs,

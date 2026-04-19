@@ -5,6 +5,7 @@ param(
     [string]$OutputSubdir = "",
     [string]$ImageMode = "pad",
     [string]$HfRepo = "facebook/VGGT-1B",
+    [string]$CheckpointRelpath = "",
     [switch]$DryRun
 )
 
@@ -55,6 +56,9 @@ if (-not [string]::IsNullOrWhiteSpace($RemoteSceneSubdir)) {
 }
 if (-not [string]::IsNullOrWhiteSpace($OutputSubdir)) {
     $argList += @("--output-subdir", $OutputSubdir)
+}
+if (-not [string]::IsNullOrWhiteSpace($CheckpointRelpath)) {
+    $argList += @("--checkpoint-relpath", $CheckpointRelpath)
 }
 
 Write-Host "[modal-4k4d] repo_root=$repoRoot"

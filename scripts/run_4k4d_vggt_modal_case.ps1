@@ -5,6 +5,9 @@ param(
     [string]$TargetCamera = "00",
     [int]$AutoSources = 6,
     [string]$OutputBase = "D:\vggt\vggt-main\output",
+    [int]$TargetSize = 518,
+    [string]$SmplxModelDir = "G:\数据集\datasets\smplx",
+    [string]$CheckpointRelpath = "",
     [string]$ModalExe = "",
     [switch]$OverwriteScene,
     [switch]$DryRun
@@ -37,6 +40,8 @@ $exportArgs = @(
     "--frame", $Frame,
     "--target-camera", $TargetCamera,
     "--auto-sources", $AutoSources,
+    "--target-size", $TargetSize,
+    "--smplx-model-dir", $SmplxModelDir,
     "--output-dir", $sceneDir
 )
 if ($OverwriteScene) {
@@ -52,6 +57,9 @@ $modalArgs = @(
 )
 if (-not [string]::IsNullOrWhiteSpace($ModalExe)) {
     $modalArgs += @("-ModalExe", $ModalExe)
+}
+if (-not [string]::IsNullOrWhiteSpace($CheckpointRelpath)) {
+    $modalArgs += @("-CheckpointRelpath", $CheckpointRelpath)
 }
 if ($DryRun) {
     $modalArgs += "-DryRun"

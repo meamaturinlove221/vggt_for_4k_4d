@@ -25,6 +25,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         enable_depth=True,
         enable_track=True,
         human_prior_channels=0,
+        human_prior_summary_channels=0,
         human_prior_hidden_dim=64,
         human_prior_gate_init=0.0,
     ):
@@ -35,6 +36,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             patch_size=patch_size,
             embed_dim=embed_dim,
             human_prior_channels=human_prior_channels,
+            human_prior_summary_channels=human_prior_summary_channels,
             human_prior_hidden_dim=human_prior_hidden_dim,
             human_prior_gate_init=human_prior_gate_init,
         )
@@ -49,6 +51,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         images: torch.Tensor,
         query_points: torch.Tensor = None,
         prior_maps: torch.Tensor = None,
+        prior_summary_tokens: torch.Tensor = None,
     ):
         """
         Forward pass of the VGGT model.
@@ -61,6 +64,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 Default: None
             prior_maps (torch.Tensor, optional): Human prior maps with shape [S, C, H, W]
                 or [B, S, C, H, W]. Channel-last inputs are also accepted.
+            prior_summary_tokens (torch.Tensor, optional): Pooled human summary tokens with
+                shape [S, T, C_summary] or [B, S, T, C_summary].
 
         Returns:
             dict: A dictionary containing the following predictions:
@@ -98,7 +103,19 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 if prior_maps.shape[-1] == expected_channels and prior_maps.shape[2] != expected_channels:
                     prior_maps = prior_maps.permute(0, 1, 4, 2, 3).contiguous()
 
-        aggregated_tokens_list, patch_start_idx = self.aggregator(images, prior_maps=prior_maps)
+        if prior_summary_tokens is not None:
+            if prior_summary_tokens.ndim == 3:
+                prior_summary_tokens = prior_summary_tokens.unsqueeze(0)
+            elif prior_summary_tokens.ndim != 4:
+                raise ValueError(
+                    f"Expected prior_summary_tokens to have 3 or 4 dims, got {prior_summary_tokens.shape}"
+                )
+
+        aggregated_tokens_list, patch_start_idx = self.aggregator(
+            images,
+            prior_maps=prior_maps,
+            prior_summary_tokens=prior_summary_tokens,
+        )
 
         predictions = {}
 
