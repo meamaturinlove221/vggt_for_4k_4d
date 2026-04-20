@@ -44,6 +44,7 @@ class DNA4K4DPseudoDataset(BaseDataset):
         self.inside_random = common_conf.inside_random
         self.allow_duplicate_img = common_conf.allow_duplicate_img
         self.keep_target_first = keep_target_first
+        self.prior_pose_noise = self._resolve_prior_pose_noise(common_conf)
 
         if not case_roots:
             raise ValueError("DNA4K4DPseudoDataset requires at least one case root.")
@@ -94,6 +95,126 @@ class DNA4K4DPseudoDataset(BaseDataset):
                 spec["case_root"],
             )
 
+    @staticmethod
+    def _cfg_get(config, key, default=None):
+        if config is None:
+            return default
+        if isinstance(config, dict):
+            return config.get(key, default)
+        return getattr(config, key, default)
+
+    def _resolve_prior_pose_noise(self, common_conf) -> dict:
+        cfg = self._cfg_get(common_conf, "prior_pose_noise", None)
+        enabled = bool(self._cfg_get(cfg, "enabled", False))
+        return {
+            "enabled": enabled,
+            "prob": float(self._cfg_get(cfg, "prob", 0.5)),
+            "cam_xyz_std": float(self._cfg_get(cfg, "cam_xyz_std", 0.01)),
+            "cam_xyz_global_std": float(self._cfg_get(cfg, "cam_xyz_global_std", 0.005)),
+            "scale_std": float(self._cfg_get(cfg, "scale_std", 0.01)),
+            "normal_std": float(self._cfg_get(cfg, "normal_std", 0.03)),
+            "visibility_dropout": float(self._cfg_get(cfg, "visibility_dropout", 0.05)),
+            "spatial_shift_std_px": float(self._cfg_get(cfg, "spatial_shift_std_px", 1.0)),
+            "max_spatial_shift_px": int(self._cfg_get(cfg, "max_spatial_shift_px", 3)),
+        }
+
+    def _apply_prior_pose_noise(
+        self,
+        prior_maps: np.ndarray | None,
+        prior_summary_tokens: np.ndarray | None,
+        prior_input_meta: dict | None,
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        cfg = self.prior_pose_noise
+        if not self.training or not cfg["enabled"]:
+            return prior_maps, prior_summary_tokens
+        if np.random.rand() > cfg["prob"]:
+            return prior_maps, prior_summary_tokens
+
+        channel_groups = (prior_input_meta or {}).get("channel_groups", {})
+        dense_groups = channel_groups.get("dense", {})
+        summary_groups = channel_groups.get("summary", {})
+
+        maps = None if prior_maps is None else np.asarray(prior_maps, dtype=np.float32).copy()
+        summaries = None if prior_summary_tokens is None else np.asarray(prior_summary_tokens, dtype=np.float32).copy()
+
+        dense_spatial_idx = list(dense_groups.get("smplx_spatial", []))
+        dense_posed_idx = list(dense_groups.get("smplx_posed_cam", []))
+        dense_normal_idx = list(dense_groups.get("smplx_cam_normals", []))
+        dense_visibility_idx = list(dense_groups.get("smplx_visibility", []))
+        summary_posed_idx = list(summary_groups.get("smplx_posed_cam", []))
+        summary_normal_idx = list(summary_groups.get("smplx_cam_normals", []))
+
+        if maps is not None and dense_spatial_idx:
+            max_shift = max(0, int(cfg["max_spatial_shift_px"]))
+            shift_std = max(0.0, float(cfg["spatial_shift_std_px"]))
+            if max_shift > 0 and shift_std > 0:
+                for view_idx in range(maps.shape[0]):
+                    shift_x = int(np.clip(np.round(np.random.normal(0.0, shift_std)), -max_shift, max_shift))
+                    shift_y = int(np.clip(np.round(np.random.normal(0.0, shift_std)), -max_shift, max_shift))
+                    if shift_x != 0 or shift_y != 0:
+                        maps[view_idx, dense_spatial_idx] = np.roll(
+                            maps[view_idx, dense_spatial_idx],
+                            shift=(shift_y, shift_x),
+                            axis=(1, 2),
+                        )
+
+        global_offset = np.random.normal(0.0, cfg["cam_xyz_global_std"], size=(3,)).astype(np.float32)
+        view_offsets = None
+        scale = np.float32(1.0 + np.random.normal(0.0, cfg["scale_std"]))
+
+        if maps is not None and len(dense_posed_idx) == 3:
+            view_offsets = np.random.normal(
+                0.0,
+                cfg["cam_xyz_std"],
+                size=(maps.shape[0], 3),
+            ).astype(np.float32)
+            maps[:, dense_posed_idx] = (
+                maps[:, dense_posed_idx] * scale
+                + global_offset[None, :, None, None]
+                + view_offsets[:, :, None, None]
+            ).astype(np.float32)
+
+        if summaries is not None and len(summary_posed_idx) == 3:
+            if view_offsets is None:
+                view_offsets = np.random.normal(
+                    0.0,
+                    cfg["cam_xyz_std"],
+                    size=(summaries.shape[0], 3),
+                ).astype(np.float32)
+            summaries[:, :, summary_posed_idx] = (
+                summaries[:, :, summary_posed_idx] * scale
+                + global_offset[None, None, :]
+                + view_offsets[:, None, :]
+            ).astype(np.float32)
+
+        if maps is not None and len(dense_normal_idx) == 3 and cfg["normal_std"] > 0:
+            maps[:, dense_normal_idx] += np.random.normal(
+                0.0,
+                cfg["normal_std"],
+                size=maps[:, dense_normal_idx].shape,
+            ).astype(np.float32)
+            norms = np.linalg.norm(maps[:, dense_normal_idx], axis=1, keepdims=True)
+            maps[:, dense_normal_idx] /= np.clip(norms, 1e-6, None)
+
+        if summaries is not None and len(summary_normal_idx) == 3 and cfg["normal_std"] > 0:
+            summaries[:, :, summary_normal_idx] += np.random.normal(
+                0.0,
+                cfg["normal_std"],
+                size=summaries[:, :, summary_normal_idx].shape,
+            ).astype(np.float32)
+            norms = np.linalg.norm(summaries[:, :, summary_normal_idx], axis=2, keepdims=True)
+            summaries[:, :, summary_normal_idx] /= np.clip(norms, 1e-6, None)
+
+        if maps is not None and dense_visibility_idx and cfg["visibility_dropout"] > 0:
+            keep_prob = float(np.clip(1.0 - cfg["visibility_dropout"], 0.0, 1.0))
+            keep_mask = (
+                np.random.rand(maps.shape[0], maps.shape[2], maps.shape[3]) < keep_prob
+            ).astype(np.float32)
+            maps[:, dense_visibility_idx] *= keep_mask[:, None, :, :]
+            maps[:, dense_visibility_idx] = np.clip(maps[:, dense_visibility_idx], 0.0, 1.0)
+
+        return maps, summaries
+
     def _load_case_arrays(self, seq_name: str) -> dict:
         if seq_name in self._case_cache:
             return self._case_cache[seq_name]
@@ -107,6 +228,7 @@ class DNA4K4DPseudoDataset(BaseDataset):
             "point_masks": inputs["point_masks"].astype(bool),
             "camera_ids": inputs["camera_ids"],
             "view_roles": inputs["view_roles"],
+            "prior_input_meta": spec["manifest"].get("prior_input_meta", {}),
             "depths": targets["depths"].astype(np.float32),
             "extrinsics": targets["extrinsics"].astype(np.float32),
             "intrinsics": targets["intrinsics"].astype(np.float32),
@@ -124,6 +246,8 @@ class DNA4K4DPseudoDataset(BaseDataset):
             case["prior_depths"] = targets["prior_depths"].astype(np.float32)
         if "prior_points" in targets.files:
             case["prior_points"] = targets["prior_points"].astype(np.float32)
+        if "prior_normals" in targets.files:
+            case["prior_normals"] = targets["prior_normals"].astype(np.float32)
 
         self._case_cache[seq_name] = case
         return case
@@ -199,15 +323,34 @@ class DNA4K4DPseudoDataset(BaseDataset):
             "original_sizes": [np.array(case["images"][idx].shape[:2]) for idx in ids],
         }
 
+        selected_prior_maps = None
+        selected_prior_summary_tokens = None
         if "prior_maps" in case:
-            batch["prior_maps"] = [case["prior_maps"][idx] for idx in ids]
+            selected_prior_maps = np.asarray([case["prior_maps"][idx] for idx in ids], dtype=np.float32)
         if "prior_summary_tokens" in case:
-            batch["prior_summary_tokens"] = [case["prior_summary_tokens"][idx] for idx in ids]
+            selected_prior_summary_tokens = np.asarray(
+                [case["prior_summary_tokens"][idx] for idx in ids],
+                dtype=np.float32,
+            )
+        if selected_prior_maps is not None or selected_prior_summary_tokens is not None:
+            selected_prior_maps, selected_prior_summary_tokens = self._apply_prior_pose_noise(
+                selected_prior_maps,
+                selected_prior_summary_tokens,
+                case.get("prior_input_meta", {}),
+            )
+        if selected_prior_maps is not None:
+            batch["prior_maps"] = [selected_prior_maps[idx] for idx in range(len(ids))]
+        if selected_prior_summary_tokens is not None:
+            batch["prior_summary_tokens"] = [
+                selected_prior_summary_tokens[idx] for idx in range(len(ids))
+            ]
         if "prior_mask" in case:
             batch["prior_mask"] = [case["prior_mask"][idx] for idx in ids]
         if "prior_depths" in case:
             batch["prior_depths"] = [case["prior_depths"][idx] for idx in ids]
         if "prior_points" in case:
             batch["prior_points"] = [case["prior_points"][idx] for idx in ids]
+        if "prior_normals" in case:
+            batch["prior_normals"] = [case["prior_normals"][idx] for idx in ids]
 
         return batch

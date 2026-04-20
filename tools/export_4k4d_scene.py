@@ -18,6 +18,11 @@ if str(SCRIPT_DIR) not in sys.path:
 
 import dna_4k4d as dna  # noqa: E402
 from prepare_4k4d_prior_training_case import build_prior_stack, resolve_smplx_model_dir  # noqa: E402
+from smplx_numpy import (  # noqa: E402
+    DEFAULT_BODY_PART_COUNT,
+    DEFAULT_BODY_PART_EMBED_DIM,
+    DEFAULT_VERTEX_ID_EMBED_DIM,
+)
 
 
 def decode_encoded_image(buffer: np.ndarray) -> Image.Image:
@@ -102,6 +107,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smplx-gender", choices=("neutral", "female", "male"), default="neutral")
     parser.add_argument("--mesh-fill-knn", type=int, default=4, help="KNN used to densify SMPL-X feature priors inside the silhouette.")
     parser.add_argument("--summary-token-count", type=int, default=16, help="Number of pooled SMPL-X summary tokens per view.")
+    parser.add_argument("--vertex-id-dim", type=int, default=DEFAULT_VERTEX_ID_EMBED_DIM, help="Dimensionality of deterministic vertex identity embeddings.")
+    parser.add_argument("--body-part-dim", type=int, default=DEFAULT_BODY_PART_EMBED_DIM, help="Dimensionality of deterministic body-part embeddings.")
+    parser.add_argument("--body-part-count", type=int, default=DEFAULT_BODY_PART_COUNT, help="Number of coarse body-part groups derived from SMPL-X joint influence.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing exported images.")
     return parser.parse_args()
 
@@ -199,6 +207,9 @@ def main() -> int:
             smplx_gender=args.smplx_gender,
             mesh_fill_knn=int(args.mesh_fill_knn),
             summary_token_count=int(args.summary_token_count),
+            vertex_id_dim=int(args.vertex_id_dim),
+            body_part_dim=int(args.body_part_dim),
+            body_part_count=int(args.body_part_count),
         )
         vertex_feature_meta = prior_input_meta.get("smplx_vertex_feature_meta", {})
         if not bool(vertex_feature_meta.get("enabled")):

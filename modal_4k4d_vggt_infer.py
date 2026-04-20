@@ -140,6 +140,11 @@ def _infer_model_kwargs_from_state_dict(state_dict: dict) -> dict:
     proj0 = state_dict.get("aggregator.human_prior_adapter.proj.0.weight")
     summary_proj0 = state_dict.get("aggregator.human_prior_adapter.summary_proj.0.weight")
     gate = state_dict.get("aggregator.human_prior_adapter.input_fusion.gate")
+    scale_factors = state_dict.get("aggregator.human_prior_adapter.scale_factors_tensor")
+    if scale_factors is not None:
+        scale_factors = [int(value) for value in scale_factors.tolist()]
+    else:
+        scale_factors = [1]
     return {
         "img_size": 518,
         "patch_size": 14,
@@ -147,11 +152,13 @@ def _infer_model_kwargs_from_state_dict(state_dict: dict) -> dict:
         "enable_camera": any(key.startswith("camera_head.") for key in state_dict),
         "enable_point": any(key.startswith("point_head.") for key in state_dict),
         "enable_depth": any(key.startswith("depth_head.") for key in state_dict),
+        "enable_normal": any(key.startswith("normal_head.") for key in state_dict),
         "enable_track": any(key.startswith("track_head.") for key in state_dict),
         "human_prior_channels": int(proj0.shape[1]) if proj0 is not None else 0,
         "human_prior_summary_channels": int(summary_proj0.shape[1]) if summary_proj0 is not None else 0,
         "human_prior_hidden_dim": int(proj0.shape[0]) if proj0 is not None else 64,
         "human_prior_gate_init": float(gate.item()) if gate is not None else 0.0,
+        "human_prior_multi_scale_factors": scale_factors,
     }
 
 
@@ -321,6 +328,21 @@ def _write_preview_png(array, output_path: Path) -> None:
     Image.fromarray(preview).save(output_path)
 
 
+def _write_normal_preview_png(array, output_path: Path) -> None:
+    import numpy as np
+    from PIL import Image
+
+    arr = np.asarray(array, dtype=np.float32)
+    if arr.ndim != 3 or arr.shape[-1] != 3:
+        raise ValueError(f"Expected normal map with shape [H, W, 3], got {arr.shape}")
+
+    finite = np.isfinite(arr).all(axis=-1, keepdims=True)
+    arr = np.where(finite, arr, 0.0)
+    arr = arr / np.clip(np.linalg.norm(arr, axis=-1, keepdims=True), 1e-6, None)
+    preview = np.clip((arr + 1.0) * 0.5, 0.0, 1.0)
+    Image.fromarray((preview * 255.0).astype(np.uint8)).save(output_path)
+
+
 @app.function(
     image=INFER_IMAGE,
     gpu=GPU_SPEC,
@@ -423,6 +445,10 @@ def run_remote_vggt_inference(cfg_json: str) -> dict:
         "world_points": _to_numpy(predictions["world_points"].squeeze(0)),
         "world_points_conf": _to_numpy(predictions["world_points_conf"].squeeze(0)),
     }
+    if "normal" in predictions:
+        arrays["normal"] = _to_numpy(predictions["normal"].squeeze(0))
+    if "normal_conf" in predictions:
+        arrays["normal_conf"] = _to_numpy(predictions["normal_conf"].squeeze(0))
     np.savez_compressed(output_root / "predictions.npz", **arrays)
 
     preview_dir = output_root / "previews"
@@ -432,6 +458,10 @@ def run_remote_vggt_inference(cfg_json: str) -> dict:
         _write_preview_png(arrays["depth"][idx, ..., 0], preview_dir / f"{stem}_depth.png")
         _write_preview_png(arrays["depth_conf"][idx], preview_dir / f"{stem}_depth_conf.png")
         _write_preview_png(arrays["world_points_conf"][idx], preview_dir / f"{stem}_point_conf.png")
+        if "normal" in arrays:
+            _write_normal_preview_png(arrays["normal"][idx], preview_dir / f"{stem}_normal.png")
+        if "normal_conf" in arrays:
+            _write_preview_png(arrays["normal_conf"][idx], preview_dir / f"{stem}_normal_conf.png")
 
     scene_manifest_path = scene_dir / "scene_manifest.json"
     scene_manifest = {}

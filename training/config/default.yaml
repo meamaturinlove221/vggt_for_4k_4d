@@ -198,10 +198,13 @@ model:
   enable_camera: True
   enable_depth: True
   enable_point: False
+  enable_normal: False
   enable_track: False
   human_prior_channels: 0
+  human_prior_summary_channels: 0
   human_prior_hidden_dim: 64
   human_prior_gate_init: 0.0
+  human_prior_multi_scale_factors: [1]
 
 
 distributed:

@@ -709,7 +709,7 @@ class Trainer:
             "cam_points", "world_points", "point_masks", 
             "prior_maps", "prior_summary_tokens", "prior_mask", "prior_masks",
             "prior_depth", "prior_depths",
-            "prior_points", "prior_cam_points",
+            "prior_points", "prior_normals", "prior_cam_points",
         ]
         string_keys = ["seq_name"]
         

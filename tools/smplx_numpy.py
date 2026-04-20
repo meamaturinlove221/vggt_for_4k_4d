@@ -14,13 +14,16 @@ MODEL_FILENAMES = {
     "male": "SMPLX_MALE.npz",
 }
 
-SMPLX_VERTEX_FEATURE_CHANNELS = (
-    "smplx_template_x",
-    "smplx_template_y",
-    "smplx_template_z",
-    "smplx_template_nx",
-    "smplx_template_ny",
-    "smplx_template_nz",
+DEFAULT_VERTEX_ID_EMBED_DIM = 6
+DEFAULT_BODY_PART_EMBED_DIM = 6
+DEFAULT_BODY_PART_COUNT = 12
+SKINNING_SUMMARY_CHANNELS = (
+    "smplx_skinning_joint_centroid_x",
+    "smplx_skinning_joint_centroid_y",
+    "smplx_skinning_joint_centroid_z",
+    "smplx_skinning_top1_weight",
+    "smplx_skinning_top2_weight",
+    "smplx_skinning_weight_entropy",
 )
 
 
@@ -72,8 +75,23 @@ def load_smplx_model(model_path: str | Path) -> dict[str, np.ndarray]:
     return _load_smplx_model_cached(str(Path(model_path).expanduser().resolve()))
 
 
-def get_smplx_vertex_feature_channel_names() -> tuple[str, ...]:
-    return SMPLX_VERTEX_FEATURE_CHANNELS
+def _build_embedding_channel_names(prefix: str, dim: int) -> tuple[str, ...]:
+    dim = max(0, int(dim))
+    return tuple(f"{prefix}_{idx:02d}" for idx in range(dim))
+
+
+def get_smplx_vertex_feature_channel_names(
+    vertex_id_dim: int = DEFAULT_VERTEX_ID_EMBED_DIM,
+    body_part_dim: int = DEFAULT_BODY_PART_EMBED_DIM,
+) -> tuple[str, ...]:
+    return (
+        "smplx_canonical_x",
+        "smplx_canonical_y",
+        "smplx_canonical_z",
+        *_build_embedding_channel_names("smplx_vertex_id_emb", vertex_id_dim),
+        *_build_embedding_channel_names("smplx_body_part_emb", body_part_dim),
+        *SKINNING_SUMMARY_CHANNELS,
+    )
 
 
 def _blend_shape_slice(shapedirs: np.ndarray, coeffs: np.ndarray, start: int) -> np.ndarray:
@@ -101,6 +119,100 @@ def _safe_normalize(vectors: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     return vectors / np.clip(norms, eps, None)
 
 
+def _sincos_embed_scalar(values: np.ndarray, dim: int, max_frequency: float = 1000.0) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32).reshape(-1, 1)
+    dim = max(0, int(dim))
+    if dim == 0:
+        return np.zeros((values.shape[0], 0), dtype=np.float32)
+
+    num_bands = max(1, (dim + 1) // 2)
+    freqs = np.exp(
+        np.linspace(0.0, np.log(max(1.0, float(max_frequency))), num=num_bands, dtype=np.float32)
+    ).reshape(1, -1)
+    angles = values * freqs
+    embedding = np.concatenate([np.sin(angles), np.cos(angles)], axis=1)
+    return embedding[:, :dim].astype(np.float32)
+
+
+def _build_vertex_id_embedding(num_vertices: int, dim: int) -> np.ndarray:
+    if num_vertices <= 0:
+        raise ValueError("num_vertices must be positive.")
+    normalized = np.linspace(-1.0, 1.0, num_vertices, dtype=np.float32)
+    return _sincos_embed_scalar(np.pi * normalized, dim=dim, max_frequency=256.0)
+
+
+def _build_body_part_embedding(
+    dominant_joint_ids: np.ndarray,
+    normalized_joint_positions: np.ndarray,
+    dim: int,
+    body_part_count: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    dominant_joint_ids = np.asarray(dominant_joint_ids, dtype=np.int64).reshape(-1)
+    normalized_joint_positions = np.asarray(normalized_joint_positions, dtype=np.float32)
+    if normalized_joint_positions.ndim != 2 or normalized_joint_positions.shape[1] != 3:
+        raise ValueError(
+            f"normalized_joint_positions must have shape [J, 3], got {normalized_joint_positions.shape}"
+        )
+
+    num_joints = int(normalized_joint_positions.shape[0])
+    body_part_count = max(1, min(int(body_part_count), num_joints))
+    if body_part_count == 1:
+        joint_body_part_ids = np.zeros((num_joints,), dtype=np.int64)
+    else:
+        _, joint_body_part_ids = build_surface_cluster_ids(
+            normalized_joint_positions,
+            num_clusters=body_part_count,
+        )
+    vertex_body_part_ids = joint_body_part_ids[dominant_joint_ids]
+    if body_part_count == 1:
+        normalized_part_id = np.zeros_like(vertex_body_part_ids, dtype=np.float32)
+    else:
+        normalized_part_id = (
+            2.0 * vertex_body_part_ids.astype(np.float32) / float(max(1, body_part_count - 1)) - 1.0
+        )
+    body_part_embedding = _sincos_embed_scalar(np.pi * normalized_part_id, dim=dim, max_frequency=64.0)
+    return body_part_embedding.astype(np.float32), vertex_body_part_ids.astype(np.int64), joint_body_part_ids.astype(np.int64)
+
+
+def _build_skinning_summary(weights: np.ndarray, normalized_joint_positions: np.ndarray) -> dict[str, np.ndarray]:
+    weights = np.asarray(weights, dtype=np.float32)
+    normalized_joint_positions = np.asarray(normalized_joint_positions, dtype=np.float32)
+    if weights.ndim != 2:
+        raise ValueError(f"weights must have shape [V, J], got {weights.shape}")
+    if normalized_joint_positions.ndim != 2 or normalized_joint_positions.shape[1] != 3:
+        raise ValueError(
+            f"normalized_joint_positions must have shape [J, 3], got {normalized_joint_positions.shape}"
+        )
+    if weights.shape[1] != normalized_joint_positions.shape[0]:
+        raise ValueError(
+            f"weights joint dimension {weights.shape[1]} does not match joint positions "
+            f"{normalized_joint_positions.shape[0]}"
+        )
+
+    weighted_joint_centroid = (weights @ normalized_joint_positions).astype(np.float32)
+    sorted_weights = np.sort(weights, axis=1)
+    top1 = sorted_weights[:, -1]
+    top2 = sorted_weights[:, -2] if sorted_weights.shape[1] >= 2 else np.zeros_like(top1)
+    entropy = -np.sum(weights * np.log(np.clip(weights, 1e-8, None)), axis=1)
+    entropy = entropy / float(np.log(max(2, weights.shape[1])))
+    summary = np.concatenate(
+        [
+            weighted_joint_centroid,
+            top1[:, None].astype(np.float32),
+            top2[:, None].astype(np.float32),
+            entropy[:, None].astype(np.float32),
+        ],
+        axis=1,
+    ).astype(np.float32)
+    return {
+        "summary": summary,
+        "weighted_joint_centroid": weighted_joint_centroid.astype(np.float32),
+        "top1_weight": top1.astype(np.float32),
+        "top2_weight": top2.astype(np.float32),
+        "weight_entropy": entropy.astype(np.float32),
+    }
+
+
 def compute_vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
     vertices = np.asarray(vertices, dtype=np.float32)
     faces = np.asarray(faces, dtype=np.int32)
@@ -120,6 +232,9 @@ def build_smplx_vertex_features(
     betas: np.ndarray,
     expression: np.ndarray | None = None,
     expression_start: int = 300,
+    vertex_id_dim: int = DEFAULT_VERTEX_ID_EMBED_DIM,
+    body_part_dim: int = DEFAULT_BODY_PART_EMBED_DIM,
+    body_part_count: int = DEFAULT_BODY_PART_COUNT,
 ) -> dict[str, np.ndarray | tuple[str, ...]]:
     model = load_smplx_model(model_path)
     betas = np.asarray(betas, dtype=np.float32).reshape(-1)
@@ -140,15 +255,64 @@ def build_smplx_vertex_features(
         scale = 1.0
     normalized_vertices = centered_vertices / scale
     vertex_normals = compute_vertex_normals(rest_vertices, model["faces"])
-    vertex_features = np.concatenate([normalized_vertices, vertex_normals], axis=1).astype(np.float32)
+    joints = (model["J_regressor"] @ rest_vertices).astype(np.float32)
+    normalized_joints = ((joints - rest_vertices.mean(axis=0, keepdims=True)) / scale).astype(np.float32)
+    weights = np.asarray(model["weights"], dtype=np.float32)
+    dominant_joint_ids = np.argmax(weights, axis=1).astype(np.int64)
+
+    vertex_id_embedding = _build_vertex_id_embedding(num_vertices=rest_vertices.shape[0], dim=vertex_id_dim)
+    body_part_embedding, vertex_body_part_ids, joint_body_part_ids = _build_body_part_embedding(
+        dominant_joint_ids=dominant_joint_ids,
+        normalized_joint_positions=normalized_joints,
+        dim=body_part_dim,
+        body_part_count=body_part_count,
+    )
+    skinning_summary = _build_skinning_summary(weights=weights, normalized_joint_positions=normalized_joints)
+    static_channel_names = get_smplx_vertex_feature_channel_names(
+        vertex_id_dim=vertex_id_dim,
+        body_part_dim=body_part_dim,
+    )
+    static_vertex_features = np.concatenate(
+        [
+            normalized_vertices.astype(np.float32),
+            vertex_id_embedding.astype(np.float32),
+            body_part_embedding.astype(np.float32),
+            skinning_summary["summary"].astype(np.float32),
+        ],
+        axis=1,
+    ).astype(np.float32)
 
     return {
-        "vertex_features": vertex_features,
-        "channel_names": SMPLX_VERTEX_FEATURE_CHANNELS,
+        "vertex_features": static_vertex_features,
+        "channel_names": static_channel_names,
         "rest_vertices": rest_vertices,
         "canonical_positions": normalized_vertices.astype(np.float32),
         "canonical_normals": vertex_normals.astype(np.float32),
+        "canonical_joints": normalized_joints.astype(np.float32),
+        "vertex_id_embedding": vertex_id_embedding.astype(np.float32),
+        "body_part_embedding": body_part_embedding.astype(np.float32),
+        "vertex_body_part_ids": vertex_body_part_ids.astype(np.int64),
+        "joint_body_part_ids": joint_body_part_ids.astype(np.int64),
+        "dominant_joint_ids": dominant_joint_ids.astype(np.int64),
+        "skinning_summary": skinning_summary["summary"].astype(np.float32),
+        "weighted_joint_centroid": skinning_summary["weighted_joint_centroid"].astype(np.float32),
+        "top1_weight": skinning_summary["top1_weight"].astype(np.float32),
+        "top2_weight": skinning_summary["top2_weight"].astype(np.float32),
+        "weight_entropy": skinning_summary["weight_entropy"].astype(np.float32),
         "canonical_scale": np.asarray(scale, dtype=np.float32),
+        "channel_groups": {
+            "canonical_positions": list(range(0, 3)),
+            "vertex_id_embedding": list(range(3, 3 + int(vertex_id_dim))),
+            "body_part_embedding": list(
+                range(3 + int(vertex_id_dim), 3 + int(vertex_id_dim) + int(body_part_dim))
+            ),
+            "skinning_summary": list(
+                range(
+                    3 + int(vertex_id_dim) + int(body_part_dim),
+                    3 + int(vertex_id_dim) + int(body_part_dim) + len(SKINNING_SUMMARY_CHANNELS),
+                )
+            ),
+        },
     }
 
 

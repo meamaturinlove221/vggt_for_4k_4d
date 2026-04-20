@@ -173,6 +173,7 @@ class ComposedDataset(Dataset, ABC):
             "prior_depth": np.float32,
             "prior_depths": np.float32,
             "prior_points": np.float32,
+            "prior_normals": np.float32,
             "prior_cam_points": np.float32,
         }
 

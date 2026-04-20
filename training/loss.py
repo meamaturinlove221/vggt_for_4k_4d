@@ -285,7 +285,7 @@ def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
     return loss_dict
 
 
-def compute_human_prior_loss(predictions, batch, depth=None, point=None, **kwargs):
+def compute_human_prior_loss(predictions, batch, depth=None, point=None, normal=None, **kwargs):
     """
     Optional auxiliary supervision from human priors.
 
@@ -306,6 +306,11 @@ def compute_human_prior_loss(predictions, batch, depth=None, point=None, **kwarg
         point_loss_dict = compute_prior_point_loss(predictions, batch, **point)
         total_prior_loss = total_prior_loss + point_loss_dict["loss_prior_point"]
         loss_dict.update(point_loss_dict)
+
+    if normal is not None and "normal" in predictions:
+        normal_loss_dict = compute_prior_normal_loss(predictions, batch, **normal)
+        total_prior_loss = total_prior_loss + normal_loss_dict["loss_prior_normal"]
+        loss_dict.update(normal_loss_dict)
 
     loss_dict["loss_human_prior"] = total_prior_loss
     return loss_dict
@@ -417,6 +422,71 @@ def compute_prior_point_loss(predictions, batch, gamma=1.0, alpha=0.0, gradient_
     }
 
 
+def compute_prior_normal_loss(predictions, batch, gamma=1.0, alpha=0.0, valid_range=-1, **kwargs):
+    pred_normals = predictions["normal"]
+    pred_normal_conf = predictions.get("normal_conf")
+    if pred_normal_conf is None:
+        pred_normal_conf = torch.ones(pred_normals.shape[:-1], device=pred_normals.device, dtype=pred_normals.dtype)
+
+    prior_normals = _first_present(batch, "prior_normals", "prior_normal")
+    prior_mask = _first_present(batch, "prior_mask", "prior_masks")
+    dummy_loss = _zero_loss_from_predictions({"normal": pred_normals})
+
+    if prior_normals is None or prior_mask is None:
+        return {
+            "loss_prior_normal_conf": dummy_loss,
+            "loss_prior_normal_reg": dummy_loss,
+            "loss_prior_normal": dummy_loss,
+        }
+
+    prior_normals = _canonicalize_normal_map(prior_normals)
+    prior_mask = _canonicalize_mask(prior_mask)
+
+    target_hw = pred_normals.shape[2:4]
+    prior_normals = _resize_spatial_batch(prior_normals, target_hw, mode="bilinear")
+    prior_mask = _resize_spatial_batch(prior_mask.float(), target_hw, mode="nearest") > 0.5
+
+    pred_normals = F.normalize(pred_normals, p=2, dim=-1, eps=1e-6)
+    prior_normals = F.normalize(prior_normals, p=2, dim=-1, eps=1e-6)
+    prior_normals = check_and_fix_inf_nan(prior_normals, "prior_normals")
+
+    valid = (
+        prior_mask
+        & torch.isfinite(prior_normals).all(dim=-1)
+        & torch.isfinite(pred_normals).all(dim=-1)
+        & (prior_normals.norm(dim=-1) > 0.5)
+    )
+    if valid.sum() < 100:
+        return {
+            "loss_prior_normal_conf": dummy_loss,
+            "loss_prior_normal_reg": dummy_loss,
+            "loss_prior_normal": dummy_loss,
+        }
+
+    dot = torch.sum(pred_normals[valid] * prior_normals[valid], dim=-1)
+    dot = torch.clamp(dot, -1.0 + 1e-6, 1.0 - 1e-6)
+    loss_reg = 1.0 - dot
+    loss_reg = check_and_fix_inf_nan(loss_reg, "loss_prior_normal_reg")
+
+    conf = pred_normal_conf[valid].clamp(min=1e-6)
+    loss_conf = gamma * loss_reg * conf - alpha * torch.log(conf)
+    loss_conf = check_and_fix_inf_nan(loss_conf, "loss_prior_normal_conf")
+
+    if valid_range > 0 and loss_conf.numel() > 0:
+        loss_conf = filter_by_quantile(loss_conf, valid_range)
+    if valid_range > 0 and loss_reg.numel() > 0:
+        loss_reg = filter_by_quantile(loss_reg, valid_range)
+
+    loss_conf = loss_conf.mean() if loss_conf.numel() > 0 else dummy_loss
+    loss_reg = loss_reg.mean() if loss_reg.numel() > 0 else dummy_loss
+    total_loss = loss_conf + loss_reg
+    return {
+        "loss_prior_normal_conf": loss_conf,
+        "loss_prior_normal_reg": loss_reg,
+        "loss_prior_normal": total_loss,
+    }
+
+
 def _first_present(batch, *keys):
     for key in keys:
         if key in batch and batch[key] is not None:
@@ -462,6 +532,10 @@ def _canonicalize_point_map(points):
     if points.shape[2] == 3:
         return points.permute(0, 1, 3, 4, 2).contiguous()
     raise ValueError(f"Expected prior points with 3 channels, got {points.shape}")
+
+
+def _canonicalize_normal_map(normals):
+    return _canonicalize_point_map(normals)
 
 
 def _resize_spatial_batch(tensor, target_hw, mode="bilinear"):
@@ -1023,4 +1097,3 @@ def sequence_loss(flow_preds, flow_gt, vis, valids, gamma=0.8, vis_aware=False, 
 
     return flow_loss
 '''
-

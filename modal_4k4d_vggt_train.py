@@ -226,6 +226,11 @@ def _infer_model_kwargs_from_state_dict(state_dict: dict) -> dict:
     proj0 = state_dict.get("aggregator.human_prior_adapter.proj.0.weight")
     summary_proj0 = state_dict.get("aggregator.human_prior_adapter.summary_proj.0.weight")
     gate = state_dict.get("aggregator.human_prior_adapter.input_fusion.gate")
+    scale_factors = state_dict.get("aggregator.human_prior_adapter.scale_factors_tensor")
+    if scale_factors is not None:
+        scale_factors = [int(value) for value in scale_factors.tolist()]
+    else:
+        scale_factors = [1]
     return {
         "img_size": 518,
         "patch_size": 14,
@@ -233,11 +238,13 @@ def _infer_model_kwargs_from_state_dict(state_dict: dict) -> dict:
         "enable_camera": any(key.startswith("camera_head.") for key in state_dict),
         "enable_point": any(key.startswith("point_head.") for key in state_dict),
         "enable_depth": any(key.startswith("depth_head.") for key in state_dict),
+        "enable_normal": any(key.startswith("normal_head.") for key in state_dict),
         "enable_track": any(key.startswith("track_head.") for key in state_dict),
         "human_prior_channels": int(proj0.shape[1]) if proj0 is not None else 0,
         "human_prior_summary_channels": int(summary_proj0.shape[1]) if summary_proj0 is not None else 0,
         "human_prior_hidden_dim": int(proj0.shape[0]) if proj0 is not None else 64,
         "human_prior_gate_init": float(gate.item()) if gate is not None else 0.0,
+        "human_prior_multi_scale_factors": scale_factors,
     }
 
 
@@ -250,9 +257,25 @@ def _find_latest_checkpoint(ckpt_dir: Path) -> Path:
     return checkpoint_paths[-1]
 
 
+def _read_case_prior_spec(case_root: Path) -> tuple[int, int]:
+    manifest_path = case_root / "case_manifest.json"
+    if not manifest_path.is_file():
+        return 0, 0
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return (
+        int(len(manifest.get("prior_channels", []))),
+        int(len(manifest.get("prior_summary_channels", []))),
+    )
+
+
 def _build_hydra_overrides(cfg: TrainingConfig, case_roots: list[Path], log_dir: Path, ckpt_path: Path) -> list[str]:
     quoted_case_roots = ",".join(f"'{root.as_posix()}'" for root in case_roots)
     img_num_override = f"[{cfg.img_nums_min},{cfg.img_nums_max}]"
+    prior_specs = {_read_case_prior_spec(case_root) for case_root in case_roots}
+    prior_specs.discard((0, 0))
+    if len(prior_specs) > 1:
+        raise ValueError(f"Case roots contain inconsistent prior channel specs: {sorted(prior_specs)}")
+    prior_channels, prior_summary_channels = next(iter(prior_specs), (0, 0))
 
     return [
         f"exp_name={cfg.exp_name}",
@@ -280,6 +303,8 @@ def _build_hydra_overrides(cfg: TrainingConfig, case_roots: list[Path], log_dir:
         f"data.val.dataset.dataset_configs.0.len_test={cfg.len_test}",
         f"data.train.dataset.dataset_configs.0.case_roots=[{quoted_case_roots}]",
         f"data.val.dataset.dataset_configs.0.case_roots=[{quoted_case_roots}]",
+        f"model.human_prior_channels={prior_channels}",
+        f"model.human_prior_summary_channels={prior_summary_channels}",
     ]
 
 

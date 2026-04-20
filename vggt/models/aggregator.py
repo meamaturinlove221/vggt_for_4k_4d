@@ -73,6 +73,7 @@ class Aggregator(nn.Module):
         human_prior_summary_channels=0,
         human_prior_hidden_dim=64,
         human_prior_gate_init=0.0,
+        human_prior_multi_scale_factors=(1,),
     ):
         super().__init__()
 
@@ -130,6 +131,7 @@ class Aggregator(nn.Module):
                 summary_in_channels=human_prior_summary_channels,
                 hidden_dim=human_prior_hidden_dim,
                 gate_init=human_prior_gate_init,
+                multi_scale_factors=human_prior_multi_scale_factors,
             )
             if human_prior_channels > 0
             else None

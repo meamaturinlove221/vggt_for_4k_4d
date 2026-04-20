@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Sequence, Tuple
 
 import math
 import torch
@@ -91,6 +91,7 @@ class HumanPriorAdapter(nn.Module):
         summary_in_channels: int = 0,
         hidden_dim: int = 64,
         gate_init: float = 0.0,
+        multi_scale_factors: Sequence[int] | None = None,
     ) -> None:
         super().__init__()
 
@@ -101,12 +102,40 @@ class HumanPriorAdapter(nn.Module):
         self.summary_in_channels = summary_in_channels
         self.embed_dim = embed_dim
         self.depth = depth
+        normalized_scale_factors = []
+        for factor in (multi_scale_factors or (1,)):
+            factor = max(1, int(factor))
+            if factor not in normalized_scale_factors:
+                normalized_scale_factors.append(factor)
+        if 1 not in normalized_scale_factors:
+            normalized_scale_factors = [1, *normalized_scale_factors]
+        self.multi_scale_factors = tuple(normalized_scale_factors)
+        if len(self.multi_scale_factors) > 1:
+            self.register_buffer(
+                "scale_factors_tensor",
+                torch.tensor(self.multi_scale_factors, dtype=torch.int64),
+                persistent=True,
+            )
+        else:
+            self.register_buffer("scale_factors_tensor", None, persistent=False)
 
         self.proj = nn.Sequential(
             nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1),
             nn.GELU(),
             nn.Conv2d(hidden_dim, embed_dim, kernel_size=1),
         )
+        self.scale_projs = nn.ModuleList(
+            nn.Sequential(
+                nn.Conv2d(in_channels, hidden_dim, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(hidden_dim, embed_dim, kernel_size=1),
+            )
+            for _ in self.multi_scale_factors[1:]
+        )
+        if len(self.multi_scale_factors) > 1:
+            self.scale_logits = nn.Parameter(torch.zeros((len(self.multi_scale_factors),), dtype=torch.float32))
+        else:
+            self.register_parameter("scale_logits", None)
         self.input_fusion = PriorFusionBlock(embed_dim=embed_dim, hidden_dim=hidden_dim, gate_init=gate_init)
         self.frame_fusions = nn.ModuleList(
             PriorFusionBlock(embed_dim=embed_dim, hidden_dim=hidden_dim, gate_init=gate_init)
@@ -150,14 +179,49 @@ class HumanPriorAdapter(nn.Module):
             )
 
         prior_maps = prior_maps.reshape(batch_size * seq_len, channels, prior_maps.shape[-2], prior_maps.shape[-1])
-        prior_maps = F.interpolate(
-            prior_maps,
-            size=target_hw,
-            mode="bilinear",
-            align_corners=False,
-        )
-        prior_tokens = self.proj(prior_maps)
-        prior_tokens = prior_tokens.flatten(2).transpose(1, 2).contiguous()
+        branch_features = []
+        for branch_idx, scale_factor in enumerate(self.multi_scale_factors):
+            if branch_idx == 0:
+                scaled_maps = F.interpolate(
+                    prior_maps,
+                    size=target_hw,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                branch_feature = self.proj(scaled_maps)
+            else:
+                scaled_hw = (
+                    max(1, int(round(target_hw[0] / float(scale_factor)))),
+                    max(1, int(round(target_hw[1] / float(scale_factor)))),
+                )
+                scaled_maps = F.interpolate(
+                    prior_maps,
+                    size=scaled_hw,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                branch_feature = self.scale_projs[branch_idx - 1](scaled_maps)
+                if scaled_hw != target_hw:
+                    branch_feature = F.interpolate(
+                        branch_feature,
+                        size=target_hw,
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+            branch_features.append(branch_feature)
+
+        if len(branch_features) == 1:
+            fused_features = branch_features[0]
+        else:
+            scale_weights = torch.softmax(self.scale_logits[: len(branch_features)], dim=0).to(
+                dtype=branch_features[0].dtype,
+                device=branch_features[0].device,
+            )
+            fused_features = torch.zeros_like(branch_features[0])
+            for weight, feature in zip(scale_weights, branch_features):
+                fused_features = fused_features + weight * feature
+
+        prior_tokens = fused_features.flatten(2).transpose(1, 2).contiguous()
         return prior_tokens
 
     def fuse_input_tokens(self, patch_tokens: torch.Tensor, prior_tokens: torch.Tensor) -> torch.Tensor:

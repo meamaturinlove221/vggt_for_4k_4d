@@ -23,11 +23,13 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         enable_camera=True,
         enable_point=True,
         enable_depth=True,
+        enable_normal=False,
         enable_track=True,
         human_prior_channels=0,
         human_prior_summary_channels=0,
         human_prior_hidden_dim=64,
         human_prior_gate_init=0.0,
+        human_prior_multi_scale_factors=(1,),
     ):
         super().__init__()
 
@@ -39,11 +41,13 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             human_prior_summary_channels=human_prior_summary_channels,
             human_prior_hidden_dim=human_prior_hidden_dim,
             human_prior_gate_init=human_prior_gate_init,
+            human_prior_multi_scale_factors=human_prior_multi_scale_factors,
         )
 
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None
         self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1") if enable_point else None
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1") if enable_depth else None
+        self.normal_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="norm", conf_activation="sigmoid") if enable_normal else None
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size) if enable_track else None
 
     def forward(
@@ -74,6 +78,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 - depth_conf (torch.Tensor): Confidence scores for depth predictions with shape [B, S, H, W]
                 - world_points (torch.Tensor): 3D world coordinates for each pixel with shape [B, S, H, W, 3]
                 - world_points_conf (torch.Tensor): Confidence scores for world points with shape [B, S, H, W]
+                - normal (torch.Tensor): Predicted camera-space normal map with shape [B, S, H, W, 3]
+                - normal_conf (torch.Tensor): Confidence scores for normals with shape [B, S, H, W]
                 - images (torch.Tensor): Original input images, preserved for visualization
 
                 If query_points is provided, also includes:
@@ -138,6 +144,13 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 )
                 predictions["world_points"] = pts3d
                 predictions["world_points_conf"] = pts3d_conf
+
+            if self.normal_head is not None:
+                normals, normal_conf = self.normal_head(
+                    aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
+                )
+                predictions["normal"] = normals
+                predictions["normal_conf"] = normal_conf
 
         if self.track_head is not None and query_points is not None:
             track_list, vis, conf = self.track_head(

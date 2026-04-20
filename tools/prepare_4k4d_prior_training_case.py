@@ -35,8 +35,12 @@ from tools.export_4k4d_human_prior import (  # noqa: E402
     resolve_annotations_smc,
 )
 from tools.smplx_numpy import (  # noqa: E402
+    DEFAULT_BODY_PART_COUNT,
+    DEFAULT_BODY_PART_EMBED_DIM,
+    DEFAULT_VERTEX_ID_EMBED_DIM,
     build_smplx_vertex_features,
     build_surface_cluster_ids,
+    compute_vertex_normals,
     compute_pose_aligned_vertex_features,
     forward_smplx_mesh,
     pool_vertex_features,
@@ -46,6 +50,34 @@ from tools.smplx_numpy import (  # noqa: E402
 
 
 POINT_SOURCES = ("world_points", "depth_unprojection")
+
+# Current V2 is already built around pose-aligned, vertex-derived dense surface priors,
+# and now includes richer identity semantics needed by the upgraded condition branch.
+CURRENT_V2_SURFACE_CAPABILITIES = [
+    "pose_aligned_smplx_driver",
+    "vertex_derived_dense_surface_maps",
+    "vertex_id_embedding",
+    "body_part_embedding",
+    "skinning_weight_summary",
+    "per_view_projected_surface_condition",
+    "summary_tokens_from_vertex_pooling",
+    "layerwise_human_prior_adapter_ready",
+    "multi_scale_surface_map_projection_ready",
+    "output_side_depth_point_supervision",
+]
+
+NEXT_STAGE_SURFACE_ENHANCEMENTS = [
+    "occlusion-aware dynamic surface features",
+    "learned body-part / vertex identity codes",
+    "stronger pose-noise schedules",
+    "deeper multi-scale fusion policies",
+]
+
+NEXT_STAGE_ENHANCEMENT_GOALS = [
+    "进一步增强身份语义表达",
+    "继续提高对 pose 误差的鲁棒性",
+    "让人体条件在不同层级位置上更充分地进入 backbone",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,6 +106,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--smplx-gender", choices=("neutral", "female", "male"), default="neutral")
     parser.add_argument("--mesh-fill-knn", type=int, default=4, help="KNN used to densify SMPL-X mesh priors inside the silhouette.")
     parser.add_argument("--summary-token-count", type=int, default=16, help="Number of pooled SMPL-X human summary tokens per view.")
+    parser.add_argument("--vertex-id-dim", type=int, default=DEFAULT_VERTEX_ID_EMBED_DIM, help="Dimensionality of deterministic vertex identity embeddings.")
+    parser.add_argument("--body-part-dim", type=int, default=DEFAULT_BODY_PART_EMBED_DIM, help="Dimensionality of deterministic body-part embeddings.")
+    parser.add_argument("--body-part-count", type=int, default=DEFAULT_BODY_PART_COUNT, help="Number of coarse body-part groups derived from SMPL-X joint influence.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite an existing output directory.")
     return parser.parse_args()
 
@@ -256,6 +291,71 @@ def load_real_camera_params(scene_manifest: dict, dataset_root: Path, subset_nam
         temp_handle.cleanup()
 
 
+def _prefixed_summary_channel_names(channel_names: list[str]) -> list[str]:
+    summary_names: list[str] = []
+    for name in channel_names:
+        if name.startswith("smplx_"):
+            summary_names.append(name.replace("smplx_", "smplx_summary_", 1))
+        else:
+            summary_names.append(f"summary_{name}")
+    return summary_names
+
+
+def _build_channel_group_meta(channel_names: list[str], summary_channel_names: list[str]) -> dict[str, dict[str, list[int]]]:
+    def _collect(names: list[str], predicate) -> list[int]:
+        return [idx for idx, name in enumerate(names) if predicate(name)]
+
+    dense = {
+        "smplx_all": _collect(channel_names, lambda name: name.startswith("smplx_")),
+        "smplx_static": _collect(
+            channel_names,
+            lambda name: (
+                name.startswith("smplx_canonical_")
+                or name.startswith("smplx_vertex_id_emb_")
+                or name.startswith("smplx_body_part_emb_")
+                or name.startswith("smplx_skinning_")
+            ),
+        ),
+        "smplx_dynamic": _collect(
+            channel_names,
+            lambda name: (
+                name.startswith("smplx_posed_cam_")
+                or name.startswith("smplx_cam_n")
+                or name == "smplx_visible_mask"
+            ),
+        ),
+        "smplx_posed_cam": _collect(channel_names, lambda name: name.startswith("smplx_posed_cam_")),
+        "smplx_cam_normals": _collect(channel_names, lambda name: name.startswith("smplx_cam_n")),
+        "smplx_visibility": _collect(channel_names, lambda name: name == "smplx_visible_mask"),
+    }
+    summary = {
+        "smplx_all": _collect(summary_channel_names, lambda name: name.startswith("smplx_summary_")),
+        "smplx_static": _collect(
+            summary_channel_names,
+            lambda name: (
+                name.startswith("smplx_summary_canonical_")
+                or name.startswith("smplx_summary_vertex_id_emb_")
+                or name.startswith("smplx_summary_body_part_emb_")
+                or name.startswith("smplx_summary_skinning_")
+            ),
+        ),
+        "smplx_dynamic": _collect(
+            summary_channel_names,
+            lambda name: (
+                name.startswith("smplx_summary_posed_cam_")
+                or name.startswith("smplx_summary_cam_n")
+            ),
+        ),
+        "smplx_posed_cam": _collect(summary_channel_names, lambda name: name.startswith("smplx_summary_posed_cam_")),
+        "smplx_cam_normals": _collect(summary_channel_names, lambda name: name.startswith("smplx_summary_cam_n")),
+    }
+    dense["smplx_spatial"] = sorted(set(dense["smplx_static"] + dense["smplx_dynamic"]))
+    return {
+        "dense": dense,
+        "summary": summary,
+    }
+
+
 def project_world_points(
     world_points: np.ndarray,
     world_to_cam: np.ndarray,
@@ -291,7 +391,7 @@ def render_keypoints3d_geometry_prior(
     min_conf: float,
     knn: int = 8,
     distance_eps: float = 1.0,
-) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, dict[str, object]]:
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None, dict[str, object]]:
     if keypoints3d is None:
         return None, None, None, {"source": "missing_keypoints3d"}
 
@@ -307,8 +407,10 @@ def render_keypoints3d_geometry_prior(
 
     prior_depths = []
     prior_points = []
+    prior_normals = []
     prior_masks = []
     view_summaries = []
+    world_normals = compute_vertex_normals(world_vertices, faces)
 
     for view_idx, view in enumerate(scene_manifest["exported_views"]):
         camera_id = normalize_camera_id(view["camera_id"])
@@ -406,11 +508,11 @@ def render_smplx_mesh_geometry_prior(
     smplx_model_dir: Path,
     smplx_gender: str = "neutral",
     fill_knn: int = 4,
-) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, dict[str, object]]:
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, np.ndarray | None, dict[str, object]]:
     required_keys = {"betas", "fullpose"}
     if not required_keys.issubset(smplx_params):
         missing = sorted(required_keys - set(smplx_params))
-        return None, None, None, {"source": "missing_smplx_params", "missing_keys": missing}
+        return None, None, None, None, {"source": "missing_smplx_params", "missing_keys": missing}
 
     model_path = resolve_smplx_model_path(smplx_model_dir, gender=smplx_gender)
     mesh = forward_smplx_mesh(
@@ -427,8 +529,10 @@ def render_smplx_mesh_geometry_prior(
     camera_params = load_real_camera_params(scene_manifest, dataset_root, subset_name)
     prior_depths = []
     prior_points = []
+    prior_normals = []
     prior_masks = []
     view_summaries = []
+    world_normals = compute_vertex_normals(world_vertices, faces)
 
     for view_idx, view in enumerate(scene_manifest["exported_views"]):
         camera_id = normalize_camera_id(view["camera_id"])
@@ -438,7 +542,10 @@ def render_smplx_mesh_geometry_prior(
             target_size=target_size,
         )
         silhouette_mask = silhouette_masks[view_idx].astype(bool)
-        depth_map, point_map, completed_mask, raster_meta = rasterize_world_mesh(
+        rotation = np.asarray(camera_params[camera_id]["world_to_cam"][:3, :3], dtype=np.float32)
+        cam_normals = world_normals @ rotation.T
+        cam_normals /= np.clip(np.linalg.norm(cam_normals, axis=1, keepdims=True), 1e-8, None)
+        depth_map, point_map, completed_mask, normal_map, raster_meta = rasterize_world_mesh(
             world_vertices=world_vertices,
             faces=faces,
             world_to_cam=camera_params[camera_id]["world_to_cam"],
@@ -446,9 +553,13 @@ def render_smplx_mesh_geometry_prior(
             image_hw=(target_size, target_size),
             silhouette_mask=silhouette_mask,
             fill_knn=max(1, int(fill_knn)),
+            vertex_features=cam_normals.astype(np.float32),
+            return_vertex_features=True,
         )
         prior_depths.append(depth_map.astype(np.float32))
         prior_points.append(point_map.astype(np.float32))
+        normal_map /= np.clip(np.linalg.norm(normal_map, axis=-1, keepdims=True), 1e-8, None)
+        prior_normals.append(normal_map.astype(np.float32))
         prior_masks.append(completed_mask.astype(bool))
         view_summaries.append(
             {
@@ -461,6 +572,7 @@ def render_smplx_mesh_geometry_prior(
     return (
         np.stack(prior_depths, axis=0).astype(np.float32),
         np.stack(prior_points, axis=0).astype(np.float32),
+        np.stack(prior_normals, axis=0).astype(np.float32),
         np.stack(prior_masks, axis=0).astype(bool),
         {
             "source": "smplx_mesh_real_camera_rasterize_knnfill",
@@ -486,6 +598,9 @@ def build_prior_stack(
     smplx_gender: str = "neutral",
     mesh_fill_knn: int = 4,
     summary_token_count: int = 16,
+    vertex_id_dim: int = DEFAULT_VERTEX_ID_EMBED_DIM,
+    body_part_dim: int = DEFAULT_BODY_PART_EMBED_DIM,
+    body_part_count: int = DEFAULT_BODY_PART_COUNT,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, dict[str, np.ndarray], np.ndarray | None, dict[str, object]]:
     context = build_context(dataset_root, subset_name)
     seq_id = scene_manifest["seq_id"]
@@ -503,9 +618,18 @@ def build_prior_stack(
     keypoints3d = None
     channel_names = ["silhouette"] + ([] if mask_only else ["keypoint_heatmap"])
     summary_channel_names: list[str] = []
+    channel_group_meta = {"dense": {}, "summary": {}}
     smplx_vertex_feature_meta: dict[str, object] = {
         "enabled": False,
         "source": "not_requested",
+        "design_stage": "v2_surface_condition_established",
+        "current_v2_capabilities": list(CURRENT_V2_SURFACE_CAPABILITIES),
+        "next_stage_enhancements": list(NEXT_STAGE_SURFACE_ENHANCEMENTS),
+        "next_stage_goals": list(NEXT_STAGE_ENHANCEMENT_GOALS),
+        "roadmap_note": (
+            "These enhancements are next-stage upgrades for a stronger SMPL-X condition branch, "
+            "not prerequisites for the current V2 to be considered valid."
+        ),
     }
 
     temp_handle = tempfile.TemporaryDirectory(prefix="vggt_4k4d_case_")
@@ -528,12 +652,21 @@ def build_prior_stack(
             faces = None
             camera_params = None
             canonical_positions = None
+            static_vertex_features = None
             canonical_scale = 1.0
             cluster_ids = None
             if smplx_model_dir is None:
                 smplx_vertex_feature_meta = {
                     "enabled": False,
                     "source": "missing_model_dir",
+                    "design_stage": "v2_surface_condition_established",
+                    "current_v2_capabilities": list(CURRENT_V2_SURFACE_CAPABILITIES),
+                    "next_stage_enhancements": list(NEXT_STAGE_SURFACE_ENHANCEMENTS),
+                    "next_stage_goals": list(NEXT_STAGE_ENHANCEMENT_GOALS),
+                    "roadmap_note": (
+                        "These enhancements are next-stage upgrades for a stronger SMPL-X condition branch, "
+                        "not prerequisites for the current V2 to be considered valid."
+                    ),
                 }
             else:
                 required_keys = {"betas", "fullpose"}
@@ -551,33 +684,30 @@ def build_prior_stack(
                         model_path=model_path,
                         betas=smplx_params["betas"],
                         expression=smplx_params.get("expression"),
+                        vertex_id_dim=int(vertex_id_dim),
+                        body_part_dim=int(body_part_dim),
+                        body_part_count=int(body_part_count),
                     )
                     world_vertices = mesh["vertices"].astype(np.float32)
                     faces = mesh["faces"].astype(np.int32)
                     canonical_positions = np.asarray(vertex_feature_payload["canonical_positions"], dtype=np.float32)
+                    static_vertex_features = np.asarray(vertex_feature_payload["vertex_features"], dtype=np.float32)
                     canonical_scale = float(np.asarray(vertex_feature_payload["canonical_scale"], dtype=np.float32))
                     _, cluster_ids = build_surface_cluster_ids(
                         canonical_positions,
                         num_clusters=int(summary_token_count),
                     )
-                    channel_names.extend(
-                        [
-                            "smplx_canonical_x",
-                            "smplx_canonical_y",
-                            "smplx_canonical_z",
-                            "smplx_posed_cam_x",
-                            "smplx_posed_cam_y",
-                            "smplx_posed_cam_z",
-                            "smplx_cam_nx",
-                            "smplx_cam_ny",
-                            "smplx_cam_nz",
-                            "smplx_visible_mask",
-                        ]
-                    )
-                    summary_channel_names = [
-                        "smplx_summary_canonical_x",
-                        "smplx_summary_canonical_y",
-                        "smplx_summary_canonical_z",
+                    static_channel_names = list(vertex_feature_payload["channel_names"])
+                    dynamic_dense_channel_names = [
+                        "smplx_posed_cam_x",
+                        "smplx_posed_cam_y",
+                        "smplx_posed_cam_z",
+                        "smplx_cam_nx",
+                        "smplx_cam_ny",
+                        "smplx_cam_nz",
+                        "smplx_visible_mask",
+                    ]
+                    summary_channel_names = _prefixed_summary_channel_names(static_channel_names) + [
                         "smplx_summary_posed_cam_x",
                         "smplx_summary_posed_cam_y",
                         "smplx_summary_posed_cam_z",
@@ -585,24 +715,46 @@ def build_prior_stack(
                         "smplx_summary_cam_ny",
                         "smplx_summary_cam_nz",
                     ]
+                    channel_names.extend(static_channel_names + dynamic_dense_channel_names)
+                    channel_group_meta = _build_channel_group_meta(channel_names, summary_channel_names)
                     camera_params = load_real_camera_params(scene_manifest, dataset_root, subset_name)
                     smplx_vertex_feature_meta = {
                         "enabled": True,
                         "source": "smplx_mesh_pose_aligned_surface_prior",
+                        "design_stage": "v2_surface_condition_established",
+                        "current_v2_capabilities": list(CURRENT_V2_SURFACE_CAPABILITIES),
+                        "next_stage_enhancements": list(NEXT_STAGE_SURFACE_ENHANCEMENTS),
+                        "next_stage_goals": list(NEXT_STAGE_ENHANCEMENT_GOALS),
+                        "roadmap_note": (
+                            "These enhancements are next-stage upgrades for a stronger SMPL-X condition branch, "
+                            "not prerequisites for the current V2 to be considered valid."
+                        ),
                         "smplx_model_path": str(model_path),
                         "smplx_gender": smplx_gender,
                         "num_vertices": int(world_vertices.shape[0]),
                         "num_faces": int(faces.shape[0]),
                         "dense_channels": list(channel_names),
                         "summary_channels": list(summary_channel_names),
+                        "channel_groups": channel_group_meta,
                         "summary_token_count": int(summary_token_count),
                         "fill_knn": int(mesh_fill_knn),
+                        "vertex_id_dim": int(vertex_id_dim),
+                        "body_part_dim": int(body_part_dim),
+                        "body_part_count": int(body_part_count),
                         "views": [],
                     }
                 else:
                     smplx_vertex_feature_meta = {
                         "enabled": False,
                         "source": "missing_smplx_params",
+                        "design_stage": "v2_surface_condition_established",
+                        "current_v2_capabilities": list(CURRENT_V2_SURFACE_CAPABILITIES),
+                        "next_stage_enhancements": list(NEXT_STAGE_SURFACE_ENHANCEMENTS),
+                        "next_stage_goals": list(NEXT_STAGE_ENHANCEMENT_GOALS),
+                        "roadmap_note": (
+                            "These enhancements are next-stage upgrades for a stronger SMPL-X condition branch, "
+                            "not prerequisites for the current V2 to be considered valid."
+                        ),
                         "missing_keys": sorted(required_keys - set(smplx_params)),
                     }
 
@@ -634,6 +786,7 @@ def build_prior_stack(
                     world_vertices is not None
                     and faces is not None
                     and canonical_positions is not None
+                    and static_vertex_features is not None
                     and cluster_ids is not None
                     and camera_params is not None
                 ):
@@ -646,7 +799,7 @@ def build_prior_stack(
                     )
                     dense_vertex_features = np.concatenate(
                         [
-                            pose_aligned["canonical_positions"],
+                            static_vertex_features,
                             pose_aligned["normalized_cam_vertices"],
                             pose_aligned["cam_normals"],
                         ],
@@ -706,6 +859,7 @@ def build_prior_stack(
         {
             "channel_names": channel_names,
             "summary_channel_names": summary_channel_names,
+            "channel_groups": channel_group_meta,
             "smplx_vertex_feature_meta": smplx_vertex_feature_meta,
         },
     )
@@ -785,9 +939,13 @@ def main() -> int:
         smplx_gender=args.smplx_gender,
         mesh_fill_knn=args.mesh_fill_knn,
         summary_token_count=args.summary_token_count,
+        vertex_id_dim=args.vertex_id_dim,
+        body_part_dim=args.body_part_dim,
+        body_part_count=args.body_part_count,
     )
     prior_depths = None
     prior_points = None
+    prior_normals = None
     prior_geometry_mask = None
     prior_geometry_meta: dict[str, object] = {"source": "missing_geometry_prior"}
 
@@ -806,7 +964,7 @@ def main() -> int:
         and bool(smplx_params)
     )
     if use_smplx_mesh:
-        prior_depths, prior_points, prior_geometry_mask, prior_geometry_meta = render_smplx_mesh_geometry_prior(
+        prior_depths, prior_points, prior_normals, prior_geometry_mask, prior_geometry_meta = render_smplx_mesh_geometry_prior(
             scene_manifest=scene_manifest,
             dataset_root=dataset_root,
             subset_name=args.subset_name,
@@ -855,6 +1013,8 @@ def main() -> int:
         target_payload["prior_depths"] = prior_depths.astype(np.float32)
     if prior_points is not None:
         target_payload["prior_points"] = prior_points.astype(np.float32)
+    if prior_normals is not None:
+        target_payload["prior_normals"] = prior_normals.astype(np.float32)
     np.savez_compressed(output_dir / "targets.npz", **target_payload)
 
     frame_idx = int(scene_manifest["frame_id"])

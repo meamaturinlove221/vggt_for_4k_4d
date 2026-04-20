@@ -39,6 +39,16 @@ data:
       max_img_per_gpu: ${max_img_per_gpu}
       allow_duplicate_img: True
       repeat_batch: False
+      prior_pose_noise:
+        enabled: True
+        prob: 0.5
+        cam_xyz_std: 0.01
+        cam_xyz_global_std: 0.005
+        scale_std: 0.01
+        normal_std: 0.03
+        visibility_dropout: 0.05
+        spatial_shift_std_px: 1.0
+        max_spatial_shift_px: 3
       augs:
         cojitter: False
         cojitter_ratio: 0.0
@@ -55,8 +65,8 @@ data:
           len_train: 200
           len_test: 20
           case_roots:
-            - D:/vggt/vggt-main/output/training_cases/0012_11_frame0000_7views_depth_prior
-            - D:/vggt/vggt-main/output/training_cases/0012_11_frame0000_13views_depth_prior
+            - D:/vggt/vggt-main/output/training_cases/0012_11_frame0000_7views_smplxsurfacepose_v2
+            - D:/vggt/vggt-main/output/training_cases/0012_11_frame0000_13views_smplxsurfacepose_v2
   val:
     _target_: data.dynamic_dataloader.DynamicTorchDataset
     num_workers: ${num_workers}
@@ -81,6 +91,8 @@ data:
       img_nums: [7, 13]
       allow_duplicate_img: True
       repeat_batch: False
+      prior_pose_noise:
+        enabled: False
       augs:
         cojitter: False
         cojitter_ratio: 0.0
@@ -97,8 +109,8 @@ data:
           len_train: 200
           len_test: 20
           case_roots:
-            - D:/vggt/vggt-main/output/training_cases/0012_11_frame0000_7views_depth_prior
-            - D:/vggt/vggt-main/output/training_cases/0012_11_frame0000_13views_depth_prior
+            - D:/vggt/vggt-main/output/training_cases/0012_11_frame0000_7views_smplxsurfacepose_v2
+            - D:/vggt/vggt-main/output/training_cases/0012_11_frame0000_13views_smplxsurfacepose_v2
 
 logging:
   log_dir: logs
@@ -133,6 +145,9 @@ logging:
         - loss_prior_point_conf
         - loss_prior_point_reg
         - loss_prior_point_grad
+        - loss_prior_normal
+        - loss_prior_normal_conf
+        - loss_prior_normal_reg
     val:
       keys_to_log:
         - loss_objective
@@ -155,6 +170,9 @@ logging:
         - loss_prior_point_conf
         - loss_prior_point_reg
         - loss_prior_point_grad
+        - loss_prior_normal
+        - loss_prior_normal_conf
+        - loss_prior_normal_reg
 
 checkpoint:
   enabled: True
@@ -189,6 +207,10 @@ loss:
       alpha: 0.0
       gradient_loss_fn: null
       valid_range: 0.98
+    normal:
+      gamma: 1.0
+      alpha: 0.0
+      valid_range: 0.98
   track: null
 
 optim:
@@ -216,6 +238,9 @@ optim:
       - module_name: ["camera"]
         max_norm: 1.0
         norm_type: 2
+      - module_name: ["normal"]
+        max_norm: 1.0
+        norm_type: 2
   options:
     lr:
       - scheduler:
@@ -241,11 +266,13 @@ model:
   enable_camera: True
   enable_depth: True
   enable_point: True
+  enable_normal: True
   enable_track: False
-  human_prior_channels: 12
-  human_prior_summary_channels: 9
+  human_prior_channels: 30
+  human_prior_summary_channels: 27
   human_prior_hidden_dim: 128
   human_prior_gate_init: 0.0
+  human_prior_multi_scale_factors: [1, 2, 4]
 
 distributed:
   backend: nccl
