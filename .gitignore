@@ -144,6 +144,12 @@ dmypy.json
 **/outputs/skyseg.onnx
 skyseg.onnx
 
+# Local scratch downloads and capture snapshots
+__tmp_*/
+__pshuman_tmp/
+DepthCamera_*.json
+DepthCapture_*.png
+
 # pixi environments
 .pixi
 *.egg-info

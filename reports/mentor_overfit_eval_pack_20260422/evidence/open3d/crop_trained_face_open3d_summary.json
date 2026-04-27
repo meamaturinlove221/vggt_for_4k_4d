@@ -1,0 +1,34 @@
+{
+  "predictions_npz": "D:\\vggt\\vggt-main\\output\\modal_results\\20260422_crop_trained_eval\\predictions.npz",
+  "scene_dir": "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\0012_11_frame0000_6views_sparseproto_human_crop",
+  "output_dir": "D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\crop_trained\\face",
+  "point_source": "world_points",
+  "human_only": true,
+  "roi": "face",
+  "summary": {
+    "valid_points_before_conf": 185130,
+    "conf_threshold": 32.03609848022461,
+    "points_after_conf": 111078,
+    "points_written": 111078
+  },
+  "roi_summary": {
+    "roi": "face",
+    "head_cut_y": 0.08357707694172858,
+    "points_after_head_cut": 28881,
+    "x_lo": -0.04489477723836899,
+    "x_hi": 0.01404897402971983,
+    "z_lo": 1.0371888875961304,
+    "z_hi": 1.1138463020324707,
+    "y_lo": 0.1052001342177391,
+    "points_after_roi": 10952
+  },
+  "ply_path": "D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\crop_trained\\face\\pointcloud_open3d.ply",
+  "screenshots": [
+    "D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\crop_trained\\face\\front.png",
+    "D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\crop_trained\\face\\side.png",
+    "D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\crop_trained\\face\\top.png",
+    "D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\crop_trained\\face\\iso.png",
+    "D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\crop_trained\\face\\head_close.png",
+    "D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\crop_trained\\face\\face_close.png"
+  ]
+}

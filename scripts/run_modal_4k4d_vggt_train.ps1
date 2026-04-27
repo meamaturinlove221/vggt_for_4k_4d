@@ -1,6 +1,7 @@
 param(
     [string]$ModalExe = "",
     [string]$LocalCaseDirs = "",
+    [string]$CaseSubdirs = "",
     [string]$RemoteCaseRoot = "training_cases",
     [string]$OutputSubdir = "",
     [string]$DownloadLocalDir = "",
@@ -8,6 +9,9 @@ param(
     [string]$ExpName = "4k4d_prior_case",
     [string]$PretrainedRepo = "facebook/VGGT-1B",
     [string]$PretrainedFilename = "model.pt",
+    [string]$PretrainedLocalPath = "",
+    [string]$PretrainedRemoteSubpath = "",
+    [string]$PretrainedVolumeSubpath = "",
     [int]$MaxEpochs = 5,
     [int]$LimitTrainBatches = 100,
     [int]$LimitValBatches = 10,
@@ -19,7 +23,7 @@ param(
     [int]$ImgNumsMax = 13,
     [int]$LenTrain = 200,
     [int]$LenTest = 20,
-    [string]$ModalGpu = "A100-40GB",
+    [string]$ModalGpu = "A100-80GB",
     [double]$ModalCpu = 8.0,
     [int]$ModalMemoryMb = 98304,
     [int]$ModalTimeoutSec = 43200,
@@ -98,8 +102,14 @@ function Wait-ModalAppsToStop([string]$ModalCmd, [string]$DescriptionFilter, [in
     return (Get-ActiveModalApps -ModalCmd $ModalCmd -DescriptionFilter $DescriptionFilter)
 }
 
-if ([string]::IsNullOrWhiteSpace($LocalCaseDirs)) {
-    throw "LocalCaseDirs is required."
+if ([string]::IsNullOrWhiteSpace($LocalCaseDirs) -and [string]::IsNullOrWhiteSpace($CaseSubdirs)) {
+    throw "Either LocalCaseDirs or CaseSubdirs is required."
+}
+if (-not [string]::IsNullOrWhiteSpace($LocalCaseDirs) -and -not [string]::IsNullOrWhiteSpace($CaseSubdirs)) {
+    throw "Use either LocalCaseDirs or CaseSubdirs, not both."
+}
+if (-not [string]::IsNullOrWhiteSpace($PretrainedVolumeSubpath) -and -not [string]::IsNullOrWhiteSpace($PretrainedLocalPath)) {
+    throw "Use either PretrainedVolumeSubpath or PretrainedLocalPath, not both."
 }
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
@@ -147,28 +157,66 @@ if ([string]::IsNullOrWhiteSpace($DownloadLocalDir)) {
     $DownloadLocalDir = Join-Path $repoRoot "output\\modal_training_results"
 }
 
-$argList = @(
-    "run",
-    "$entryScript::run_cases_from_local",
-    "--local-case-dirs", $LocalCaseDirs,
-    "--remote-case-root", $RemoteCaseRoot,
-    "--download-local-dir", $DownloadLocalDir,
-    "--config-name", $ConfigName,
-    "--exp-name", $ExpName,
-    "--pretrained-repo", $PretrainedRepo,
-    "--pretrained-filename", $PretrainedFilename,
-    "--max-epochs", $MaxEpochs,
-    "--limit-train-batches", $LimitTrainBatches,
-    "--limit-val-batches", $LimitValBatches,
-    "--val-epoch-freq", $ValEpochFreq,
-    "--learning-rate", $LearningRate,
-    "--max-img-per-gpu", $MaxImgPerGpu,
-    "--fix-img-num", $FixImgNum,
-    "--img-nums-min", $ImgNumsMin,
-    "--img-nums-max", $ImgNumsMax,
-    "--len-train", $LenTrain,
-    "--len-test", $LenTest
-)
+if (-not [string]::IsNullOrWhiteSpace($CaseSubdirs)) {
+    $entrypoint = "$entryScript::run_cases"
+    $argList = @(
+        "run",
+        $entrypoint,
+        "--case-subdirs", $CaseSubdirs,
+        "--download-local-dir", $DownloadLocalDir,
+        "--config-name", $ConfigName,
+        "--exp-name", $ExpName,
+        "--pretrained-repo", $PretrainedRepo,
+        "--pretrained-filename", $PretrainedFilename,
+        "--max-epochs", $MaxEpochs,
+        "--limit-train-batches", $LimitTrainBatches,
+        "--limit-val-batches", $LimitValBatches,
+        "--val-epoch-freq", $ValEpochFreq,
+        "--learning-rate", $LearningRate,
+        "--max-img-per-gpu", $MaxImgPerGpu,
+        "--fix-img-num", $FixImgNum,
+        "--img-nums-min", $ImgNumsMin,
+        "--img-nums-max", $ImgNumsMax,
+        "--len-train", $LenTrain,
+        "--len-test", $LenTest
+    )
+    if (-not [string]::IsNullOrWhiteSpace($PretrainedVolumeSubpath)) {
+        $argList += @("--pretrained-volume-subpath", $PretrainedVolumeSubpath)
+    }
+} else {
+    $entrypoint = "$entryScript::run_cases_from_local"
+    $argList = @(
+        "run",
+        $entrypoint,
+        "--local-case-dirs", $LocalCaseDirs,
+        "--remote-case-root", $RemoteCaseRoot,
+        "--download-local-dir", $DownloadLocalDir,
+        "--config-name", $ConfigName,
+        "--exp-name", $ExpName,
+        "--pretrained-repo", $PretrainedRepo,
+        "--pretrained-filename", $PretrainedFilename,
+        "--max-epochs", $MaxEpochs,
+        "--limit-train-batches", $LimitTrainBatches,
+        "--limit-val-batches", $LimitValBatches,
+        "--val-epoch-freq", $ValEpochFreq,
+        "--learning-rate", $LearningRate,
+        "--max-img-per-gpu", $MaxImgPerGpu,
+        "--fix-img-num", $FixImgNum,
+        "--img-nums-min", $ImgNumsMin,
+        "--img-nums-max", $ImgNumsMax,
+        "--len-train", $LenTrain,
+        "--len-test", $LenTest
+    )
+    if (-not [string]::IsNullOrWhiteSpace($PretrainedLocalPath)) {
+        $argList += @("--pretrained-local-path", $PretrainedLocalPath)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($PretrainedRemoteSubpath)) {
+        $argList += @("--pretrained-remote-subpath", $PretrainedRemoteSubpath)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($PretrainedVolumeSubpath)) {
+        $argList += @("--pretrained-volume-subpath", $PretrainedVolumeSubpath)
+    }
+}
 
 if (-not [string]::IsNullOrWhiteSpace($OutputSubdir)) {
     $argList += @("--output-subdir", $OutputSubdir)
@@ -177,8 +225,23 @@ if (-not [string]::IsNullOrWhiteSpace($OutputSubdir)) {
 Write-Host "[modal-4k4d-train] repo_root=$repoRoot"
 Write-Host "[modal-4k4d-train] modal=$modal"
 Write-Host "[modal-4k4d-train] entry=$entryScript"
-Write-Host "[modal-4k4d-train] local_case_dirs=$LocalCaseDirs"
+Write-Host "[modal-4k4d-train] entrypoint=$entrypoint"
+if (-not [string]::IsNullOrWhiteSpace($LocalCaseDirs)) {
+    Write-Host "[modal-4k4d-train] local_case_dirs=$LocalCaseDirs"
+}
+if (-not [string]::IsNullOrWhiteSpace($CaseSubdirs)) {
+    Write-Host "[modal-4k4d-train] case_subdirs=$CaseSubdirs"
+}
 Write-Host "[modal-4k4d-train] download_local_dir=$DownloadLocalDir"
+if (-not [string]::IsNullOrWhiteSpace($PretrainedLocalPath)) {
+    Write-Host "[modal-4k4d-train] pretrained_local_path=$PretrainedLocalPath"
+}
+if (-not [string]::IsNullOrWhiteSpace($PretrainedRemoteSubpath)) {
+    Write-Host "[modal-4k4d-train] pretrained_remote_subpath=$PretrainedRemoteSubpath"
+}
+if (-not [string]::IsNullOrWhiteSpace($PretrainedVolumeSubpath)) {
+    Write-Host "[modal-4k4d-train] pretrained_volume_subpath=$PretrainedVolumeSubpath"
+}
 if (-not [string]::IsNullOrWhiteSpace($env:VGGT_MODAL_GPU)) {
     Write-Host "[modal-4k4d-train] modal_gpu=$env:VGGT_MODAL_GPU"
 }

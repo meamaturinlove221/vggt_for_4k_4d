@@ -145,9 +145,16 @@ logging:
         - loss_prior_point_conf
         - loss_prior_point_reg
         - loss_prior_point_grad
+        - loss_prior_point_normal
+        - loss_prior_point_normal_conf
+        - loss_prior_point_normal_reg
+        - loss_prior_point_normal_consistency
+        - loss_prior_depth_normal
+        - loss_prior_depth_normal_consistency
         - loss_prior_normal
         - loss_prior_normal_conf
         - loss_prior_normal_reg
+        - loss_prior_normal_weight_mean
     val:
       keys_to_log:
         - loss_objective
@@ -170,9 +177,16 @@ logging:
         - loss_prior_point_conf
         - loss_prior_point_reg
         - loss_prior_point_grad
+        - loss_prior_point_normal
+        - loss_prior_point_normal_conf
+        - loss_prior_point_normal_reg
+        - loss_prior_point_normal_consistency
+        - loss_prior_depth_normal
+        - loss_prior_depth_normal_consistency
         - loss_prior_normal
         - loss_prior_normal_conf
         - loss_prior_normal_reg
+        - loss_prior_normal_weight_mean
 
 checkpoint:
   enabled: True
@@ -211,6 +225,11 @@ loss:
       gamma: 1.0
       alpha: 0.0
       valid_range: 0.98
+      head_roi_weight: 1.5
+      face_roi_weight: 2.0
+      hairline_roi_weight: 2.5
+      ear_band_roi_weight: 1.5
+      boundary_boost: 2.0
   track: null
 
 optim:

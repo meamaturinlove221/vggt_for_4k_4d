@@ -1,0 +1,17 @@
+defaults:
+  - 4k4d_prior_case_sparseproto_strongfusion
+  - _self_
+
+exp_name: 4k4d_prior_case_6view_focus_strongfusion
+limit_train_batches: 220
+limit_val_batches: 20
+max_epochs: 6
+max_img_per_gpu: 6
+
+data:
+  train:
+    common_config:
+      img_nums: [6, 6]
+  val:
+    common_config:
+      img_nums: [6, 6]

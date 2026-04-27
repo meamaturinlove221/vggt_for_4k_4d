@@ -203,7 +203,7 @@ def camera_loss_single(pred_pose_enc, gt_pose_enc, loss_type="l1"):
     return loss_T, loss_R, loss_FL
 
 
-def compute_point_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_fn = None, valid_range=-1, **kwargs):
+def compute_point_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_fn = None, valid_range=-1, supervise_conf=True, **kwargs):
     """
     Compute point loss.
     
@@ -231,8 +231,17 @@ def compute_point_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
         return loss_dict
     
     # Compute confidence-weighted regression loss with optional gradient loss
-    loss_conf, loss_grad, loss_reg = regression_loss(pred_points, gt_points, gt_points_mask, conf=pred_points_conf,
-                                             gradient_loss_fn=gradient_loss_fn, gamma=gamma, alpha=alpha, valid_range=valid_range)
+    loss_conf, loss_grad, loss_reg = regression_loss(
+        pred_points,
+        gt_points,
+        gt_points_mask,
+        conf=pred_points_conf,
+        gradient_loss_fn=gradient_loss_fn,
+        gamma=gamma,
+        alpha=alpha,
+        valid_range=valid_range,
+        supervise_conf=supervise_conf,
+    )
     
     loss_dict = {
         f"loss_conf_point": loss_conf,
@@ -243,7 +252,7 @@ def compute_point_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
     return loss_dict
 
 
-def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_fn = None, valid_range=-1, **kwargs):
+def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_fn = None, valid_range=-1, supervise_conf=True, **kwargs):
     """
     Compute depth loss.
     
@@ -273,8 +282,17 @@ def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
 
     # NOTE: we put conf inside regression_loss so that we can also apply conf loss to the gradient loss in a multi-scale manner
     # this is hacky, but very easier to implement
-    loss_conf, loss_grad, loss_reg = regression_loss(pred_depth, gt_depth, gt_depth_mask, conf=pred_depth_conf,
-                                             gradient_loss_fn=gradient_loss_fn, gamma=gamma, alpha=alpha, valid_range=valid_range)
+    loss_conf, loss_grad, loss_reg = regression_loss(
+        pred_depth,
+        gt_depth,
+        gt_depth_mask,
+        conf=pred_depth_conf,
+        gradient_loss_fn=gradient_loss_fn,
+        gamma=gamma,
+        alpha=alpha,
+        valid_range=valid_range,
+        supervise_conf=supervise_conf,
+    )
 
     loss_dict = {
         f"loss_conf_depth": loss_conf,
@@ -285,7 +303,16 @@ def compute_depth_loss(predictions, batch, gamma=1.0, alpha=0.2, gradient_loss_f
     return loss_dict
 
 
-def compute_human_prior_loss(predictions, batch, depth=None, point=None, normal=None, **kwargs):
+def compute_human_prior_loss(
+    predictions,
+    batch,
+    depth=None,
+    point=None,
+    normal=None,
+    point_normal=None,
+    depth_normal=None,
+    **kwargs,
+):
     """
     Optional auxiliary supervision from human priors.
 
@@ -312,11 +339,21 @@ def compute_human_prior_loss(predictions, batch, depth=None, point=None, normal=
         total_prior_loss = total_prior_loss + normal_loss_dict["loss_prior_normal"]
         loss_dict.update(normal_loss_dict)
 
+    if point_normal is not None and "world_points" in predictions:
+        point_normal_loss_dict = compute_prior_point_normal_loss(predictions, batch, **point_normal)
+        total_prior_loss = total_prior_loss + point_normal_loss_dict["loss_prior_point_normal"]
+        loss_dict.update(point_normal_loss_dict)
+
+    if depth_normal is not None and "depth" in predictions and "normal" in predictions:
+        depth_normal_loss_dict = compute_prior_depth_normal_consistency_loss(predictions, batch, **depth_normal)
+        total_prior_loss = total_prior_loss + depth_normal_loss_dict["loss_prior_depth_normal"]
+        loss_dict.update(depth_normal_loss_dict)
+
     loss_dict["loss_human_prior"] = total_prior_loss
     return loss_dict
 
 
-def compute_prior_depth_loss(predictions, batch, gamma=1.0, alpha=0.0, gradient_loss_fn=None, valid_range=-1, **kwargs):
+def compute_prior_depth_loss(predictions, batch, gamma=1.0, alpha=0.0, gradient_loss_fn=None, valid_range=-1, supervise_conf=True, **kwargs):
     pred_depth = predictions["depth"]
     pred_depth_conf = predictions.get("depth_conf")
     if pred_depth_conf is None:
@@ -340,6 +377,14 @@ def compute_prior_depth_loss(predictions, batch, gamma=1.0, alpha=0.0, gradient_
     target_hw = pred_depth.shape[2:4]
     prior_depth = _resize_spatial_batch(prior_depth, target_hw, mode="bilinear")
     prior_mask = _resize_spatial_batch(prior_mask.float(), target_hw, mode="nearest") > 0.5
+    weight_map = _make_prior_roi_weight_map(
+        batch,
+        prior_mask,
+        target_hw,
+        device=pred_depth.device,
+        dtype=pred_depth.dtype,
+        **kwargs,
+    )
 
     prior_depth = check_and_fix_inf_nan(prior_depth, "prior_depth")
     if prior_mask.sum() < 100:
@@ -359,6 +404,8 @@ def compute_prior_depth_loss(predictions, batch, gamma=1.0, alpha=0.0, gradient_
         gamma=gamma,
         alpha=alpha,
         valid_range=valid_range,
+        weight_map=weight_map,
+        supervise_conf=supervise_conf,
     )
     total_loss = loss_conf + loss_reg + loss_grad
     return {
@@ -369,7 +416,7 @@ def compute_prior_depth_loss(predictions, batch, gamma=1.0, alpha=0.0, gradient_
     }
 
 
-def compute_prior_point_loss(predictions, batch, gamma=1.0, alpha=0.0, gradient_loss_fn=None, valid_range=-1, **kwargs):
+def compute_prior_point_loss(predictions, batch, gamma=1.0, alpha=0.0, gradient_loss_fn=None, valid_range=-1, supervise_conf=True, **kwargs):
     pred_points = predictions["world_points"]
     pred_points_conf = predictions.get("world_points_conf")
     if pred_points_conf is None:
@@ -393,6 +440,14 @@ def compute_prior_point_loss(predictions, batch, gamma=1.0, alpha=0.0, gradient_
     target_hw = pred_points.shape[2:4]
     prior_points = _resize_spatial_batch(prior_points, target_hw, mode="bilinear")
     prior_mask = _resize_spatial_batch(prior_mask.float(), target_hw, mode="nearest") > 0.5
+    weight_map = _make_prior_roi_weight_map(
+        batch,
+        prior_mask,
+        target_hw,
+        device=pred_points.device,
+        dtype=pred_points.dtype,
+        **kwargs,
+    )
 
     prior_points = check_and_fix_inf_nan(prior_points, "prior_points")
     if prior_mask.sum() < 100:
@@ -412,6 +467,8 @@ def compute_prior_point_loss(predictions, batch, gamma=1.0, alpha=0.0, gradient_
         gamma=gamma,
         alpha=alpha,
         valid_range=valid_range,
+        weight_map=weight_map,
+        supervise_conf=supervise_conf,
     )
     total_loss = loss_conf + loss_reg + loss_grad
     return {
@@ -422,39 +479,46 @@ def compute_prior_point_loss(predictions, batch, gamma=1.0, alpha=0.0, gradient_
     }
 
 
-def compute_prior_normal_loss(predictions, batch, gamma=1.0, alpha=0.0, valid_range=-1, **kwargs):
+def compute_prior_normal_loss(predictions, batch, gamma=1.0, alpha=0.0, valid_range=-1, supervise_conf=True, **kwargs):
     pred_normals = predictions["normal"]
     pred_normal_conf = predictions.get("normal_conf")
     if pred_normal_conf is None:
         pred_normal_conf = torch.ones(pred_normals.shape[:-1], device=pred_normals.device, dtype=pred_normals.dtype)
 
-    prior_normals = _first_present(batch, "prior_normals", "prior_normal")
-    prior_mask = _first_present(batch, "prior_mask", "prior_masks")
+    target_normals = _first_present(batch, "teacher_normals", "teacher_normal", "prior_normals", "prior_normal")
+    target_mask = _first_present(batch, "teacher_mask", "teacher_masks", "prior_mask", "prior_masks")
     dummy_loss = _zero_loss_from_predictions({"normal": pred_normals})
 
-    if prior_normals is None or prior_mask is None:
+    if target_normals is None or target_mask is None:
         return {
             "loss_prior_normal_conf": dummy_loss,
             "loss_prior_normal_reg": dummy_loss,
             "loss_prior_normal": dummy_loss,
         }
 
-    prior_normals = _canonicalize_normal_map(prior_normals)
-    prior_mask = _canonicalize_mask(prior_mask)
+    target_normals = _canonicalize_normal_map(target_normals)
+    target_mask = _canonicalize_mask(target_mask)
 
     target_hw = pred_normals.shape[2:4]
-    prior_normals = _resize_spatial_batch(prior_normals, target_hw, mode="bilinear")
-    prior_mask = _resize_spatial_batch(prior_mask.float(), target_hw, mode="nearest") > 0.5
+    target_normals = _resize_spatial_batch(target_normals, target_hw, mode="bilinear")
+    target_mask = _resize_spatial_batch(target_mask.float(), target_hw, mode="nearest") > 0.5
 
     pred_normals = F.normalize(pred_normals, p=2, dim=-1, eps=1e-6)
-    prior_normals = F.normalize(prior_normals, p=2, dim=-1, eps=1e-6)
-    prior_normals = check_and_fix_inf_nan(prior_normals, "prior_normals")
+    target_normals = F.normalize(target_normals, p=2, dim=-1, eps=1e-6)
+    target_normals = check_and_fix_inf_nan(target_normals, "target_normals")
+
+    weight_map = torch.ones(target_mask.shape, device=pred_normals.device, dtype=pred_normals.dtype)
+    weight_map = _apply_roi_weight(weight_map, _first_present(batch, "head_roi_mask"), float(kwargs.get("head_roi_weight", 1.0)), target_hw)
+    weight_map = _apply_roi_weight(weight_map, _first_present(batch, "face_roi_mask"), float(kwargs.get("face_roi_weight", 1.0)), target_hw)
+    weight_map = _apply_roi_weight(weight_map, _first_present(batch, "hairline_mask"), float(kwargs.get("hairline_roi_weight", 1.0)), target_hw)
+    weight_map = _apply_roi_weight(weight_map, _first_present(batch, "ear_band_mask"), float(kwargs.get("ear_band_roi_weight", 1.0)), target_hw)
+    weight_map = weight_map * _make_boundary_weight(target_mask, float(kwargs.get("boundary_boost", 1.0)))
 
     valid = (
-        prior_mask
-        & torch.isfinite(prior_normals).all(dim=-1)
+        target_mask
+        & torch.isfinite(target_normals).all(dim=-1)
         & torch.isfinite(pred_normals).all(dim=-1)
-        & (prior_normals.norm(dim=-1) > 0.5)
+        & (target_normals.norm(dim=-1) > 0.5)
     )
     if valid.sum() < 100:
         return {
@@ -463,28 +527,330 @@ def compute_prior_normal_loss(predictions, batch, gamma=1.0, alpha=0.0, valid_ra
             "loss_prior_normal": dummy_loss,
         }
 
-    dot = torch.sum(pred_normals[valid] * prior_normals[valid], dim=-1)
+    dot = torch.sum(pred_normals[valid] * target_normals[valid], dim=-1)
     dot = torch.clamp(dot, -1.0 + 1e-6, 1.0 - 1e-6)
-    loss_reg = 1.0 - dot
-    loss_reg = check_and_fix_inf_nan(loss_reg, "loss_prior_normal_reg")
+    effective_weight = weight_map[valid].clamp(min=1e-6)
+    weight_denom = effective_weight.sum().clamp(min=1.0)
+    loss_reg_map = check_and_fix_inf_nan(1.0 - dot, "loss_prior_normal_reg")
 
-    conf = pred_normal_conf[valid].clamp(min=1e-6)
-    loss_conf = gamma * loss_reg * conf - alpha * torch.log(conf)
-    loss_conf = check_and_fix_inf_nan(loss_conf, "loss_prior_normal_conf")
+    if supervise_conf:
+        conf = pred_normal_conf[valid].clamp(min=1e-6)
+        loss_conf_map = gamma * loss_reg_map * conf - alpha * torch.log(conf)
+        loss_conf_map = check_and_fix_inf_nan(loss_conf_map, "loss_prior_normal_conf")
+    else:
+        loss_conf_map = None
 
-    if valid_range > 0 and loss_conf.numel() > 0:
-        loss_conf = filter_by_quantile(loss_conf, valid_range)
-    if valid_range > 0 and loss_reg.numel() > 0:
-        loss_reg = filter_by_quantile(loss_reg, valid_range)
+    conf_weight = effective_weight
+    reg_weight = effective_weight
+    if valid_range > 0:
+        if loss_conf_map is not None:
+            loss_conf_map, conf_weight = _filter_loss_and_weight_by_quantile(loss_conf_map, effective_weight, valid_range)
+        loss_reg_map, reg_weight = _filter_loss_and_weight_by_quantile(loss_reg_map, effective_weight, valid_range)
 
-    loss_conf = loss_conf.mean() if loss_conf.numel() > 0 else dummy_loss
-    loss_reg = loss_reg.mean() if loss_reg.numel() > 0 else dummy_loss
+    conf_weight_denom = conf_weight.sum().clamp(min=1.0)
+    reg_weight_denom = reg_weight.sum().clamp(min=1.0)
+    loss_conf = ((loss_conf_map * conf_weight).sum() / conf_weight_denom) if loss_conf_map is not None and loss_conf_map.numel() > 0 else dummy_loss
+    loss_reg = ((loss_reg_map * reg_weight).sum() / reg_weight_denom) if loss_reg_map.numel() > 0 else dummy_loss
     total_loss = loss_conf + loss_reg
     return {
         "loss_prior_normal_conf": loss_conf,
         "loss_prior_normal_reg": loss_reg,
         "loss_prior_normal": total_loss,
+        "loss_prior_normal_weight_mean": effective_weight.mean() if effective_weight.numel() > 0 else dummy_loss,
     }
+
+
+def compute_prior_point_normal_loss(
+    predictions,
+    batch,
+    gamma=1.0,
+    alpha=0.0,
+    valid_range=-1,
+    consistency_weight=0.5,
+    supervise_conf=True,
+    **kwargs,
+):
+    pred_points = predictions["world_points"]
+    pred_points_conf = predictions.get("world_points_conf")
+    if pred_points_conf is None:
+        pred_points_conf = torch.ones(pred_points.shape[:-1], device=pred_points.device, dtype=pred_points.dtype)
+
+    teacher_normals = _first_present(batch, "teacher_normals", "teacher_normal", "prior_normals", "prior_normal")
+    teacher_mask = _first_present(batch, "teacher_mask", "teacher_masks", "prior_mask", "prior_masks")
+    extrinsics = batch.get("extrinsics")
+    dummy_loss = _zero_loss_from_predictions({"world_points": pred_points})
+
+    if teacher_normals is None or teacher_mask is None or extrinsics is None:
+        return {
+            "loss_prior_point_normal_conf": dummy_loss,
+            "loss_prior_point_normal_reg": dummy_loss,
+            "loss_prior_point_normal_consistency": dummy_loss,
+            "loss_prior_point_normal": dummy_loss,
+        }
+
+    teacher_normals = _canonicalize_normal_map(teacher_normals)
+    teacher_mask = _canonicalize_mask(teacher_mask)
+
+    target_hw = pred_points.shape[2:4]
+    teacher_normals = _resize_spatial_batch(teacher_normals, target_hw, mode="bilinear")
+    teacher_mask = _resize_spatial_batch(teacher_mask.float(), target_hw, mode="nearest") > 0.5
+
+    weight_map = torch.ones(teacher_mask.shape, device=pred_points.device, dtype=pred_points.dtype)
+    weight_map = _apply_roi_weight(weight_map, _first_present(batch, "head_roi_mask"), float(kwargs.get("head_roi_weight", 1.0)), target_hw)
+    weight_map = _apply_roi_weight(weight_map, _first_present(batch, "face_roi_mask"), float(kwargs.get("face_roi_weight", 1.0)), target_hw)
+    weight_map = _apply_roi_weight(weight_map, _first_present(batch, "hairline_mask"), float(kwargs.get("hairline_roi_weight", 1.0)), target_hw)
+    weight_map = _apply_roi_weight(weight_map, _first_present(batch, "ear_band_mask"), float(kwargs.get("ear_band_roi_weight", 1.0)), target_hw)
+    weight_map = weight_map * _make_boundary_weight(teacher_mask, float(kwargs.get("boundary_boost", 1.0)))
+
+    bb, ss, hh, ww, _ = pred_points.shape
+    flat_mask = teacher_mask.reshape(bb * ss, hh, ww)
+    flat_points = pred_points.reshape(bb * ss, hh, ww, 3)
+    flat_points = check_and_fix_inf_nan(flat_points, "pred_points_for_normal")
+
+    pred_point_normals_world, pred_point_valids = point_map_to_normal(flat_points, flat_mask)
+    extrinsic_rot = extrinsics[..., :3, :3].to(device=pred_points.device, dtype=pred_points.dtype).reshape(bb * ss, 3, 3)
+    pred_point_normals_cam = _rotate_world_normals_to_camera(pred_point_normals_world, extrinsic_rot)
+    # Our point-map cross-product winding produces camera-space normals with the
+    # opposite sign of the teacher/predicted normal convention. Flip once here
+    # so the point-normal supervision reinforces, rather than inverts, head/face
+    # surfaces.
+    pred_point_normals_cam = -pred_point_normals_cam
+    pred_point_normals_cam = F.normalize(pred_point_normals_cam, p=2, dim=-1, eps=1e-6)
+
+    teacher_normals = F.normalize(teacher_normals, p=2, dim=-1, eps=1e-6)
+    teacher_normals = check_and_fix_inf_nan(teacher_normals, "teacher_normals_for_point")
+    teacher_normals = teacher_normals.reshape(bb * ss, hh, ww, 3)
+    teacher_normals = teacher_normals.unsqueeze(0).expand_as(pred_point_normals_cam)
+
+    effective_weight = weight_map.reshape(bb * ss, hh, ww).unsqueeze(0).expand(pred_point_normals_cam.shape[:-1])
+    point_conf = pred_points_conf.reshape(bb * ss, hh, ww).unsqueeze(0).expand(pred_point_normals_cam.shape[:-1]).clamp(min=1e-6)
+
+    valid = (
+        pred_point_valids
+        & flat_mask.unsqueeze(0)
+        & torch.isfinite(pred_point_normals_cam).all(dim=-1)
+        & torch.isfinite(teacher_normals).all(dim=-1)
+        & (teacher_normals.norm(dim=-1) > 0.5)
+    )
+    if valid.sum() < 100:
+        return {
+            "loss_prior_point_normal_conf": dummy_loss,
+            "loss_prior_point_normal_reg": dummy_loss,
+            "loss_prior_point_normal_consistency": dummy_loss,
+            "loss_prior_point_normal": dummy_loss,
+        }
+
+    dot = torch.sum(pred_point_normals_cam[valid] * teacher_normals[valid], dim=-1)
+    dot = torch.clamp(dot, -1.0 + 1e-6, 1.0 - 1e-6)
+    reg_map = check_and_fix_inf_nan(1.0 - dot, "loss_prior_point_normal_reg")
+    if supervise_conf:
+        conf_map = gamma * reg_map * point_conf[valid] - alpha * torch.log(point_conf[valid])
+        conf_map = check_and_fix_inf_nan(conf_map, "loss_prior_point_normal_conf")
+    else:
+        conf_map = None
+    weight_valid = effective_weight[valid].clamp(min=1e-6)
+
+    if valid_range > 0:
+        if conf_map is not None:
+            conf_map, conf_weight = _filter_loss_and_weight_by_quantile(conf_map, weight_valid, valid_range)
+        else:
+            conf_weight = weight_valid
+        reg_map, reg_weight = _filter_loss_and_weight_by_quantile(reg_map, weight_valid, valid_range)
+    else:
+        conf_weight = weight_valid
+        reg_weight = weight_valid
+
+    conf_weight_denom = conf_weight.sum().clamp(min=1.0)
+    reg_weight_denom = reg_weight.sum().clamp(min=1.0)
+    loss_conf = ((conf_map * conf_weight).sum() / conf_weight_denom) if conf_map is not None and conf_map.numel() > 0 else dummy_loss
+    loss_reg = ((reg_map * reg_weight).sum() / reg_weight_denom) if reg_map.numel() > 0 else dummy_loss
+
+    loss_consistency = dummy_loss
+    if float(consistency_weight) > 0.0 and "normal" in predictions:
+        pred_normal_head = F.normalize(predictions["normal"], p=2, dim=-1, eps=1e-6)
+        pred_normal_head = pred_normal_head.reshape(bb * ss, hh, ww, 3)
+        avg_point_normals_cam, avg_point_valid = _average_point_normals(pred_point_normals_cam, pred_point_valids)
+        normal_valid = (
+            avg_point_valid
+            & flat_mask
+            & torch.isfinite(pred_normal_head).all(dim=-1)
+            & torch.isfinite(avg_point_normals_cam).all(dim=-1)
+            & (avg_point_normals_cam.norm(dim=-1) > 0.5)
+        )
+        if normal_valid.sum() >= 100:
+            consistency_dot = torch.sum(pred_normal_head[normal_valid] * avg_point_normals_cam[normal_valid], dim=-1)
+            consistency_dot = torch.clamp(consistency_dot, -1.0 + 1e-6, 1.0 - 1e-6)
+            consistency_map = check_and_fix_inf_nan(1.0 - consistency_dot, "loss_prior_point_normal_consistency")
+            consistency_weight_map = weight_map.reshape(bb * ss, hh, ww)[normal_valid].clamp(min=1e-6)
+            if valid_range > 0:
+                consistency_map, consistency_weight_map = _filter_loss_and_weight_by_quantile(
+                    consistency_map,
+                    consistency_weight_map,
+                    valid_range,
+                )
+            if consistency_map.numel() > 0:
+                loss_consistency = (consistency_map * consistency_weight_map).sum() / consistency_weight_map.sum().clamp(min=1.0)
+
+    total_loss = loss_conf + loss_reg + float(consistency_weight) * loss_consistency
+    return {
+        "loss_prior_point_normal_conf": loss_conf,
+        "loss_prior_point_normal_reg": loss_reg,
+        "loss_prior_point_normal_consistency": loss_consistency,
+        "loss_prior_point_normal": total_loss,
+    }
+
+
+def compute_prior_depth_normal_consistency_loss(
+    predictions,
+    batch,
+    consistency_weight=0.5,
+    valid_range=-1,
+    orientation="unoriented",
+    min_depth=1e-4,
+    **kwargs,
+):
+    pred_depth = predictions["depth"]
+    pred_normals = predictions["normal"]
+    intrinsics = batch.get("intrinsics")
+    teacher_mask = _first_present(batch, "teacher_mask", "teacher_masks", "prior_mask", "prior_masks")
+    dummy_loss = _zero_loss_from_predictions({"depth": pred_depth, "normal": pred_normals})
+
+    if intrinsics is None:
+        return {
+            "loss_prior_depth_normal_consistency": dummy_loss,
+            "loss_prior_depth_normal": dummy_loss,
+        }
+
+    pred_depth = _canonicalize_depth_map(pred_depth)
+    pred_normals = _canonicalize_normal_map(pred_normals)
+
+    target_hw = pred_depth.shape[2:4]
+    if pred_normals.shape[2:4] != target_hw:
+        pred_normals = _resize_spatial_batch(pred_normals, target_hw, mode="bilinear")
+
+    if teacher_mask is None:
+        teacher_mask = torch.isfinite(pred_depth[..., 0]) & (pred_depth[..., 0] > float(min_depth))
+    else:
+        teacher_mask = _canonicalize_mask(teacher_mask)
+        teacher_mask = _resize_spatial_batch(teacher_mask.float(), target_hw, mode="nearest") > 0.5
+
+    weight_map = torch.ones(teacher_mask.shape, device=pred_depth.device, dtype=pred_depth.dtype)
+    weight_map = _apply_roi_weight(weight_map, _first_present(batch, "head_roi_mask"), float(kwargs.get("head_roi_weight", 1.0)), target_hw)
+    weight_map = _apply_roi_weight(weight_map, _first_present(batch, "face_roi_mask"), float(kwargs.get("face_roi_weight", 1.0)), target_hw)
+    weight_map = _apply_roi_weight(weight_map, _first_present(batch, "hairline_mask"), float(kwargs.get("hairline_roi_weight", 1.0)), target_hw)
+    weight_map = _apply_roi_weight(weight_map, _first_present(batch, "ear_band_mask"), float(kwargs.get("ear_band_roi_weight", 1.0)), target_hw)
+    weight_map = weight_map * _make_boundary_weight(teacher_mask, float(kwargs.get("boundary_boost", 1.0)))
+
+    batch_size, seq_len, height, width, _ = pred_depth.shape
+    flat_depth = pred_depth.reshape(batch_size * seq_len, height, width, 1)
+    flat_mask = teacher_mask.reshape(batch_size * seq_len, height, width)
+    flat_weight = weight_map.reshape(batch_size * seq_len, height, width)
+    flat_normals = F.normalize(pred_normals.reshape(batch_size * seq_len, height, width, 3), p=2, dim=-1, eps=1e-6)
+    flat_intrinsics = intrinsics.to(device=pred_depth.device, dtype=pred_depth.dtype).reshape(batch_size * seq_len, 3, 3)
+
+    depth_points_cam = _depth_map_to_camera_point_map(flat_depth, flat_intrinsics, min_depth=float(min_depth))
+    depth_normals_cam, depth_normal_valids = point_map_to_normal(depth_points_cam, flat_mask)
+    depth_normals_cam = F.normalize(depth_normals_cam, p=2, dim=-1, eps=1e-6)
+    avg_depth_normals_cam, avg_depth_normal_valid = _average_point_normals(depth_normals_cam, depth_normal_valids)
+
+    valid = (
+        avg_depth_normal_valid
+        & flat_mask
+        & torch.isfinite(flat_normals).all(dim=-1)
+        & torch.isfinite(avg_depth_normals_cam).all(dim=-1)
+        & (avg_depth_normals_cam.norm(dim=-1) > 0.5)
+        & torch.isfinite(flat_depth[..., 0])
+        & (flat_depth[..., 0] > float(min_depth))
+    )
+    if valid.sum() < 100:
+        return {
+            "loss_prior_depth_normal_consistency": dummy_loss,
+            "loss_prior_depth_normal": dummy_loss,
+        }
+
+    dot = torch.sum(flat_normals[valid] * avg_depth_normals_cam[valid], dim=-1)
+    if str(orientation).lower() in {"unoriented", "unsigned", "abs", "absolute"}:
+        dot = dot.abs()
+    dot = torch.clamp(dot, -1.0 + 1e-6, 1.0 - 1e-6)
+    consistency_map = check_and_fix_inf_nan(1.0 - dot, "loss_prior_depth_normal_consistency")
+    consistency_weight_map = flat_weight[valid].clamp(min=1e-6)
+
+    if valid_range > 0:
+        consistency_map, consistency_weight_map = _filter_loss_and_weight_by_quantile(
+            consistency_map,
+            consistency_weight_map,
+            valid_range,
+        )
+    if consistency_map.numel() == 0:
+        loss_consistency = dummy_loss
+    else:
+        loss_consistency = (consistency_map * consistency_weight_map).sum() / consistency_weight_map.sum().clamp(min=1.0)
+    total_loss = float(consistency_weight) * loss_consistency
+    return {
+        "loss_prior_depth_normal_consistency": loss_consistency,
+        "loss_prior_depth_normal": total_loss,
+    }
+
+
+def _apply_roi_weight(base_weight, roi_mask, roi_weight, target_hw):
+    if roi_mask is None or roi_weight <= 1.0:
+        return base_weight
+    roi_mask = _canonicalize_mask(roi_mask)
+    roi_mask = _resize_spatial_batch(roi_mask.float().to(device=base_weight.device), target_hw, mode="nearest") > 0.5
+    roi_mask = roi_mask.to(device=base_weight.device, dtype=base_weight.dtype)
+    return base_weight * (1.0 + roi_mask * (float(roi_weight) - 1.0))
+
+
+def _make_prior_roi_weight_map(batch, target_mask, target_hw, device, dtype, **kwargs):
+    weight_map = torch.ones(target_mask.shape, device=device, dtype=dtype)
+    active = False
+
+    for mask_key, weight_key in (
+        ("head_roi_mask", "head_roi_weight"),
+        ("face_roi_mask", "face_roi_weight"),
+        ("hairline_mask", "hairline_roi_weight"),
+        ("ear_band_mask", "ear_band_roi_weight"),
+    ):
+        roi_weight = float(kwargs.get(weight_key, 1.0))
+        roi_mask = _first_present(batch, mask_key)
+        if roi_mask is None or roi_weight <= 1.0:
+            continue
+        active = True
+        weight_map = _apply_roi_weight(weight_map, roi_mask, roi_weight, target_hw)
+
+    boundary_boost = float(kwargs.get("boundary_boost", 1.0))
+    if boundary_boost > 1.0:
+        active = True
+        boundary_weight = _make_boundary_weight(target_mask, boundary_boost).to(device=device, dtype=dtype)
+        weight_map = weight_map * boundary_weight
+
+    return weight_map if active else None
+
+
+def _make_boundary_weight(mask, boundary_boost, kernel_size=7):
+    if boundary_boost <= 1.0:
+        return torch.ones(mask.shape, device=mask.device, dtype=torch.float32)
+    if mask.ndim != 4:
+        raise ValueError(f"Expected mask [B, S, H, W], got {mask.shape}")
+    flat = mask.reshape(-1, 1, mask.shape[-2], mask.shape[-1]).float()
+    padding = kernel_size // 2
+    dilated = F.max_pool2d(flat, kernel_size=kernel_size, stride=1, padding=padding)
+    eroded = -F.max_pool2d(-flat, kernel_size=kernel_size, stride=1, padding=padding)
+    boundary = ((dilated - eroded) > 0.0).float()
+    weighted = 1.0 + boundary * (float(boundary_boost) - 1.0)
+    return weighted.reshape(mask.shape[0], mask.shape[1], mask.shape[2], mask.shape[3])
+
+
+def _filter_loss_and_weight_by_quantile(loss_tensor, weight_tensor, valid_range, min_elements=1000, hard_max=100):
+    loss_tensor = loss_tensor.clamp(max=hard_max)
+    if loss_tensor.numel() <= min_elements:
+        return loss_tensor, weight_tensor
+    quantile_thresh = torch_quantile(loss_tensor.detach(), valid_range)
+    quantile_thresh = min(quantile_thresh, hard_max)
+    quantile_mask = loss_tensor < quantile_thresh
+    if quantile_mask.sum() > min_elements:
+        return loss_tensor[quantile_mask], weight_tensor[quantile_mask]
+    return loss_tensor, weight_tensor
 
 
 def _first_present(batch, *keys):
@@ -492,6 +858,20 @@ def _first_present(batch, *keys):
         if key in batch and batch[key] is not None:
             return batch[key]
     return None
+
+
+def _rotate_world_normals_to_camera(normals, rotation_mats):
+    return torch.einsum("bij,kbhwj->kbhwi", rotation_mats, normals)
+
+
+def _average_point_normals(normals, valids, eps=1e-6):
+    weights = valids.float().unsqueeze(-1)
+    summed = (normals * weights).sum(dim=0)
+    denom = weights.sum(dim=0).clamp(min=1.0)
+    averaged = summed / denom
+    averaged = F.normalize(averaged, p=2, dim=-1, eps=eps)
+    valid = valids.any(dim=0)
+    return averaged, valid
 
 
 def _zero_loss_from_predictions(predictions):
@@ -567,7 +947,7 @@ def _resize_spatial_batch(tensor, target_hw, mode="bilinear"):
     raise ValueError(f"Expected 4D or 5D tensor for spatial resize, got {tensor.shape}")
 
 
-def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0, alpha=0.2, valid_range=-1):
+def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0, alpha=0.2, valid_range=-1, weight_map=None, supervise_conf=True):
     """
     Core regression loss function with confidence weighting and optional gradient loss.
     
@@ -584,6 +964,7 @@ def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0,
         gamma: Weight for confidence loss
         alpha: Weight for confidence regularization
         valid_range: Quantile range for outlier filtering
+        weight_map: Optional per-pixel loss weights, shape (B, S, H, W)
     
     Returns:
         loss_conf: Confidence-weighted loss
@@ -594,6 +975,12 @@ def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0,
     gradient_loss_fn = gradient_loss_fn or ""
     if conf is None:
         conf = torch.ones(pred.shape[:-1], dtype=pred.dtype, device=pred.device)
+    effective_weight = None
+    if weight_map is not None:
+        if weight_map.shape != mask.shape:
+            raise ValueError(f"Expected weight map shape {mask.shape}, got {weight_map.shape}")
+        weight_map = weight_map.to(device=pred.device, dtype=pred.dtype)
+        effective_weight = weight_map[mask].clamp(min=1e-6)
 
     # Compute L2 distance between predicted and ground truth points
     loss_reg = torch.norm(gt[mask] - pred[mask], dim=-1)
@@ -601,8 +988,11 @@ def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0,
 
     # Confidence-weighted loss: gamma * loss * conf - alpha * log(conf)
     # This encourages the model to be confident on easy examples and less confident on hard ones
-    loss_conf = gamma * loss_reg * conf[mask] - alpha * torch.log(conf[mask])
-    loss_conf = check_and_fix_inf_nan(loss_conf, "loss_conf")
+    if supervise_conf:
+        loss_conf = gamma * loss_reg * conf[mask] - alpha * torch.log(conf[mask])
+        loss_conf = check_and_fix_inf_nan(loss_conf, "loss_conf")
+    else:
+        loss_conf = (0.0 * pred).mean().reshape(1)
         
     # Initialize gradient loss
     loss_grad = 0
@@ -610,6 +1000,8 @@ def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0,
     # Prepare confidence for gradient loss if needed
     if "conf" in gradient_loss_fn:
         to_feed_conf = conf.reshape(bb*ss, hh, ww)
+        if not supervise_conf:
+            to_feed_conf = to_feed_conf.detach()
     else:
         to_feed_conf = None
 
@@ -636,23 +1028,37 @@ def regression_loss(pred, gt, mask, conf=None, gradient_loss_fn=None, gamma=1.0,
 
     # Process confidence-weighted loss
     if loss_conf.numel() > 0:
-        # Filter out outliers using quantile-based thresholding
-        if valid_range>0:
-            loss_conf = filter_by_quantile(loss_conf, valid_range)
+        if effective_weight is not None:
+            conf_weight = effective_weight
+            if valid_range>0:
+                loss_conf, conf_weight = _filter_loss_and_weight_by_quantile(loss_conf, conf_weight, valid_range)
+            loss_conf = check_and_fix_inf_nan(loss_conf, f"loss_conf_depth")
+            loss_conf = (loss_conf * conf_weight).sum() / conf_weight.sum().clamp(min=1.0)
+        else:
+            # Filter out outliers using quantile-based thresholding
+            if valid_range>0:
+                loss_conf = filter_by_quantile(loss_conf, valid_range)
 
-        loss_conf = check_and_fix_inf_nan(loss_conf, f"loss_conf_depth")
-        loss_conf = loss_conf.mean()
+            loss_conf = check_and_fix_inf_nan(loss_conf, f"loss_conf_depth")
+            loss_conf = loss_conf.mean()
     else:
         loss_conf = (0.0 * pred).mean()
 
     # Process regular regression loss
     if loss_reg.numel() > 0:
-        # Filter out outliers using quantile-based thresholding
-        if valid_range>0:
-            loss_reg = filter_by_quantile(loss_reg, valid_range)
+        if effective_weight is not None:
+            reg_weight = effective_weight
+            if valid_range>0:
+                loss_reg, reg_weight = _filter_loss_and_weight_by_quantile(loss_reg, reg_weight, valid_range)
+            loss_reg = check_and_fix_inf_nan(loss_reg, f"loss_reg_depth")
+            loss_reg = (loss_reg * reg_weight).sum() / reg_weight.sum().clamp(min=1.0)
+        else:
+            # Filter out outliers using quantile-based thresholding
+            if valid_range>0:
+                loss_reg = filter_by_quantile(loss_reg, valid_range)
 
-        loss_reg = check_and_fix_inf_nan(loss_reg, f"loss_reg_depth")
-        loss_reg = loss_reg.mean()
+            loss_reg = check_and_fix_inf_nan(loss_reg, f"loss_reg_depth")
+            loss_reg = loss_reg.mean()
     else:
         loss_reg = (0.0 * pred).mean()
 
@@ -854,6 +1260,38 @@ def point_map_to_normal(point_map, mask, eps=1e-6):
         normals = F.normalize(normals, p=2, dim=-1, eps=eps)
 
     return normals, valids
+
+
+def _depth_map_to_camera_point_map(depth_map, intrinsics, min_depth=1e-4):
+    if depth_map.ndim == 4 and depth_map.shape[-1] == 1:
+        depth_values = depth_map[..., 0]
+    elif depth_map.ndim == 3:
+        depth_values = depth_map
+    else:
+        raise ValueError(f"Expected depth map with shape [B, H, W] or [B, H, W, 1], got {depth_map.shape}")
+
+    depth_values = check_and_fix_inf_nan(depth_values, "pred_depth_for_depth_normal").clamp(min=float(min_depth))
+    view_count, height, width = depth_values.shape
+    device = depth_values.device
+    dtype = depth_values.dtype
+
+    pixel_y, pixel_x = torch.meshgrid(
+        torch.arange(height, device=device, dtype=dtype),
+        torch.arange(width, device=device, dtype=dtype),
+        indexing="ij",
+    )
+    pixel_x = pixel_x.unsqueeze(0).expand(view_count, -1, -1)
+    pixel_y = pixel_y.unsqueeze(0).expand(view_count, -1, -1)
+
+    focal_x = intrinsics[:, 0, 0].clamp(min=1e-6).view(view_count, 1, 1)
+    focal_y = intrinsics[:, 1, 1].clamp(min=1e-6).view(view_count, 1, 1)
+    center_x = intrinsics[:, 0, 2].view(view_count, 1, 1)
+    center_y = intrinsics[:, 1, 2].view(view_count, 1, 1)
+
+    camera_x = (pixel_x - center_x) * depth_values / focal_x
+    camera_y = (pixel_y - center_y) * depth_values / focal_y
+    camera_z = depth_values
+    return torch.stack([camera_x, camera_y, camera_z], dim=-1)
 
 
 def filter_by_quantile(loss_tensor, valid_range, min_elements=1000, hard_max=100):

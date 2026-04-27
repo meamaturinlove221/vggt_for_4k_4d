@@ -1,0 +1,48 @@
+defaults:
+  - 4k4d_prior_case
+  - _self_
+
+exp_name: 4k4d_prior_case_strongfusion
+limit_train_batches: 150
+max_epochs: 6
+
+data:
+  train:
+    common_config:
+      prior_pose_noise:
+        enabled: True
+        prob: 0.7
+        cam_xyz_std: 0.015
+        cam_xyz_global_std: 0.008
+        scale_std: 0.015
+        normal_std: 0.04
+        visibility_dropout: 0.08
+        spatial_shift_std_px: 1.5
+        max_spatial_shift_px: 4
+
+loss:
+  human_prior:
+    weight: 0.2
+    depth:
+      gamma: 1.0
+      alpha: 0.0
+      gradient_loss_fn: null
+      valid_range: 0.98
+    point:
+      gamma: 1.2
+      alpha: 0.0
+      gradient_loss_fn: null
+      valid_range: 0.98
+    normal:
+      gamma: 1.5
+      alpha: 0.0
+      valid_range: 0.98
+
+model:
+  human_prior_hidden_dim: 192
+  human_prior_gate_init: 0.15
+  human_prior_multi_scale_factors: [1, 2, 4, 8]
+  human_prior_enable_input_fusion: True
+  human_prior_enable_frame_fusion: True
+  human_prior_enable_global_fusion: True
+  human_prior_enable_summary_fusion: True

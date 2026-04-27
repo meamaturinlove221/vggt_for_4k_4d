@@ -248,6 +248,18 @@ class DNA4K4DPseudoDataset(BaseDataset):
             case["prior_points"] = targets["prior_points"].astype(np.float32)
         if "prior_normals" in targets.files:
             case["prior_normals"] = targets["prior_normals"].astype(np.float32)
+        if "teacher_normals" in targets.files:
+            case["teacher_normals"] = targets["teacher_normals"].astype(np.float32)
+        if "teacher_mask" in targets.files:
+            case["teacher_mask"] = targets["teacher_mask"].astype(bool)
+        if "head_roi_mask" in targets.files:
+            case["head_roi_mask"] = targets["head_roi_mask"].astype(bool)
+        if "face_roi_mask" in targets.files:
+            case["face_roi_mask"] = targets["face_roi_mask"].astype(bool)
+        if "hairline_mask" in targets.files:
+            case["hairline_mask"] = targets["hairline_mask"].astype(bool)
+        if "ear_band_mask" in targets.files:
+            case["ear_band_mask"] = targets["ear_band_mask"].astype(bool)
 
         self._case_cache[seq_name] = case
         return case
@@ -352,5 +364,17 @@ class DNA4K4DPseudoDataset(BaseDataset):
             batch["prior_points"] = [case["prior_points"][idx] for idx in ids]
         if "prior_normals" in case:
             batch["prior_normals"] = [case["prior_normals"][idx] for idx in ids]
+        if "teacher_normals" in case:
+            batch["teacher_normals"] = [case["teacher_normals"][idx] for idx in ids]
+        if "teacher_mask" in case:
+            batch["teacher_mask"] = [case["teacher_mask"][idx] for idx in ids]
+        if "head_roi_mask" in case:
+            batch["head_roi_mask"] = [case["head_roi_mask"][idx] for idx in ids]
+        if "face_roi_mask" in case:
+            batch["face_roi_mask"] = [case["face_roi_mask"][idx] for idx in ids]
+        if "hairline_mask" in case:
+            batch["hairline_mask"] = [case["hairline_mask"][idx] for idx in ids]
+        if "ear_band_mask" in case:
+            batch["ear_band_mask"] = [case["ear_band_mask"][idx] for idx in ids]
 
         return batch

@@ -1,0 +1,19 @@
+defaults:
+  - 4k4d_prior_case_sparseproto_humancrop_pointnormal_r3_faceboost
+  - _self_
+
+exp_name: 4k4d_prior_case_sparseproto_humancrop_depthnormal_coupled_r1
+
+loss:
+  human_prior:
+    weight: 0.40
+    depth_normal:
+      consistency_weight: 0.40
+      valid_range: 0.98
+      orientation: unoriented
+      min_depth: 0.0001
+      head_roi_weight: 2.5
+      face_roi_weight: 4.0
+      hairline_roi_weight: 4.5
+      ear_band_roi_weight: 2.5
+      boundary_boost: 3.25

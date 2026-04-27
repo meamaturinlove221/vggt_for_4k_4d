@@ -53,7 +53,7 @@ def _resolve_base_requirements() -> list[str]:
 APP_NAME = os.environ.get("VGGT_MODAL_TRAIN_APP_NAME", "vggt-4k4d-train")
 DATA_VOLUME_NAME = os.environ.get("VGGT_MODAL_DATA_VOLUME", "vggt-4k4d-data")
 OUTPUT_VOLUME_NAME = os.environ.get("VGGT_MODAL_OUTPUT_VOLUME", "vggt-4k4d-output")
-GPU_SPEC = os.environ.get("VGGT_MODAL_GPU", "A100-40GB")
+GPU_SPEC = os.environ.get("VGGT_MODAL_GPU", "A100-80GB")
 CPU_COUNT = float(os.environ.get("VGGT_MODAL_CPU", "8"))
 MEMORY_MB = int(os.environ.get("VGGT_MODAL_MEMORY_MB", str(96 * 1024)))
 TIMEOUT_SEC = int(os.environ.get("VGGT_MODAL_TIMEOUT_SEC", str(12 * 60 * 60)))
@@ -117,6 +117,7 @@ class TrainingConfig:
     exp_name: str = "4k4d_prior_case"
     pretrained_repo: str = "facebook/VGGT-1B"
     pretrained_filename: str = "model.pt"
+    pretrained_volume_subpath: str = ""
     max_epochs: int = 5
     limit_train_batches: int = 100
     limit_val_batches: int = 10
@@ -151,6 +152,24 @@ def _remote_data_path(subpath: str) -> Path:
     return Path(str(REMOTE_DATA_DIR / _normalize_subpath(subpath)))
 
 
+def _remote_output_path(subpath: str) -> Path:
+    return Path(str(REMOTE_OUTPUT_DIR / _normalize_subpath(subpath)))
+
+
+def _resolve_remote_volume_checkpoint(subpath: str) -> Path:
+    normalized = _normalize_subpath(subpath)
+    data_candidate = _remote_data_path(normalized)
+    if data_candidate.is_file():
+        return data_candidate
+    output_candidate = _remote_output_path(normalized)
+    if output_candidate.is_file():
+        return output_candidate
+    raise FileNotFoundError(
+        "Remote pretrained checkpoint not found in either data or output volume: "
+        f"data={data_candidate} output={output_candidate}"
+    )
+
+
 def _resolve_output_root(case_subdirs: list[str], output_subdir: str) -> Path:
     if output_subdir.strip():
         return Path(str(REMOTE_OUTPUT_DIR / _normalize_subpath(output_subdir)))
@@ -178,6 +197,18 @@ def _upload_case_dir(local_dir: Path, remote_subdir: str) -> str:
             rel = path.relative_to(local_dir).as_posix()
             batch.put_file(str(path), f"{remote_subdir}/{rel}")
     return remote_subdir
+
+
+def _upload_single_file(local_path: Path, remote_subpath: str) -> str:
+    local_path = local_path.expanduser().resolve()
+    if not local_path.is_file():
+        raise FileNotFoundError(f"File not found: {local_path}")
+
+    remote_subpath = _normalize_subpath(remote_subpath)
+    print(f"[modal-train] upload file: {local_path} -> {DATA_VOLUME_NAME}:{remote_subpath}")
+    with data_volume.batch_upload(force=True) as batch:
+        batch.put_file(str(local_path), remote_subpath)
+    return remote_subpath
 
 
 def _download_volume_dir(remote_subdir: str, local_dir: Path) -> None:
@@ -337,18 +368,21 @@ def run_remote_vggt_training(cfg_json: str) -> dict:
     output_root.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    pretrained_dir = Path(str(REMOTE_DATA_DIR / "pretrained" / cfg.pretrained_repo.replace("/", "__")))
-    pretrained_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = pretrained_dir / cfg.pretrained_filename
-    if not ckpt_path.exists():
-        downloaded = hf_hub_download(
-            repo_id=cfg.pretrained_repo,
-            filename=cfg.pretrained_filename,
-            local_dir=pretrained_dir,
-            local_dir_use_symlinks=False,
-        )
-        ckpt_path = Path(downloaded)
-        data_volume.commit()
+    if cfg.pretrained_volume_subpath.strip():
+        ckpt_path = _resolve_remote_volume_checkpoint(cfg.pretrained_volume_subpath)
+    else:
+        pretrained_dir = Path(str(REMOTE_DATA_DIR / "pretrained" / cfg.pretrained_repo.replace("/", "__")))
+        pretrained_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_path = pretrained_dir / cfg.pretrained_filename
+        if not ckpt_path.exists():
+            downloaded = hf_hub_download(
+                repo_id=cfg.pretrained_repo,
+                filename=cfg.pretrained_filename,
+                local_dir=pretrained_dir,
+                local_dir_use_symlinks=False,
+            )
+            ckpt_path = Path(downloaded)
+            data_volume.commit()
 
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(_find_free_port())
@@ -404,6 +438,7 @@ def run_remote_vggt_training(cfg_json: str) -> dict:
             "case_subdirs": cfg.case_subdirs,
             "case_roots": [root.as_posix() for root in case_roots],
             "pretrained_repo": cfg.pretrained_repo,
+            "pretrained_volume_subpath": cfg.pretrained_volume_subpath,
             "pretrained_checkpoint": ckpt_path.as_posix(),
             "output_root": output_root.as_posix(),
             "output_subdir": output_root.relative_to(Path(str(REMOTE_OUTPUT_DIR))).as_posix(),
@@ -457,6 +492,7 @@ def run_cases(
     exp_name: str = "4k4d_prior_case",
     pretrained_repo: str = "facebook/VGGT-1B",
     pretrained_filename: str = "model.pt",
+    pretrained_volume_subpath: str = "",
     max_epochs: int = 5,
     limit_train_batches: int = 100,
     limit_val_batches: int = 10,
@@ -476,6 +512,7 @@ def run_cases(
         exp_name=exp_name,
         pretrained_repo=pretrained_repo,
         pretrained_filename=pretrained_filename,
+        pretrained_volume_subpath=pretrained_volume_subpath,
         max_epochs=max_epochs,
         limit_train_batches=limit_train_batches,
         limit_val_batches=limit_val_batches,
@@ -510,6 +547,9 @@ def run_cases_from_local(
     exp_name: str = "4k4d_prior_case",
     pretrained_repo: str = "facebook/VGGT-1B",
     pretrained_filename: str = "model.pt",
+    pretrained_local_path: str = "",
+    pretrained_remote_subpath: str = "",
+    pretrained_volume_subpath: str = "",
     max_epochs: int = 5,
     limit_train_batches: int = 100,
     limit_val_batches: int = 10,
@@ -531,6 +571,18 @@ def run_cases_from_local(
     for local_dir in local_dirs:
         remote_subdirs.append(_upload_case_dir(local_dir, f"{remote_case_root}/{local_dir.name}"))
 
+    resolved_pretrained_volume_subpath = _normalize_subpath(pretrained_volume_subpath) if pretrained_volume_subpath.strip() else ""
+    if pretrained_local_path.strip() and resolved_pretrained_volume_subpath:
+        raise ValueError("Use either pretrained_local_path or pretrained_volume_subpath, not both.")
+    if pretrained_local_path.strip():
+        local_checkpoint = Path(pretrained_local_path).expanduser().resolve()
+        remote_checkpoint_subpath = (
+            _normalize_subpath(pretrained_remote_subpath)
+            if pretrained_remote_subpath.strip()
+            else f"pretrained_local/{local_checkpoint.name}"
+        )
+        resolved_pretrained_volume_subpath = _upload_single_file(local_checkpoint, remote_checkpoint_subpath)
+
     cfg = TrainingConfig(
         case_subdirs=remote_subdirs,
         output_subdir=output_subdir,
@@ -538,6 +590,7 @@ def run_cases_from_local(
         exp_name=exp_name,
         pretrained_repo=pretrained_repo,
         pretrained_filename=pretrained_filename,
+        pretrained_volume_subpath=resolved_pretrained_volume_subpath,
         max_epochs=max_epochs,
         limit_train_batches=limit_train_batches,
         limit_val_batches=limit_val_batches,

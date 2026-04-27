@@ -1,0 +1,18 @@
+defaults:
+  - 4k4d_prior_case_sparseproto_humancrop_teachergeom_teachernormal_roi_depthpoint_r1
+  - _self_
+
+exp_name: 4k4d_prior_case_sparseproto_humancrop_teachergeom_teachernormal_roi_combo_r1
+
+loss:
+  human_prior:
+    point_normal:
+      gamma: 1.0
+      alpha: 0.0
+      valid_range: 0.98
+      consistency_weight: 0.6
+      head_roi_weight: 2.25
+      face_roi_weight: 3.5
+      hairline_roi_weight: 4.0
+      ear_band_roi_weight: 2.25
+      boundary_boost: 3.0

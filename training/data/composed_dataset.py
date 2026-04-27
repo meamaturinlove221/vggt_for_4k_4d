@@ -175,6 +175,12 @@ class ComposedDataset(Dataset, ABC):
             "prior_points": np.float32,
             "prior_normals": np.float32,
             "prior_cam_points": np.float32,
+            "teacher_normals": np.float32,
+            "teacher_mask": bool,
+            "head_roi_mask": bool,
+            "face_roi_mask": bool,
+            "hairline_mask": bool,
+            "ear_band_mask": bool,
         }
 
         for key, dtype in optional_tensor_specs.items():
@@ -187,8 +193,13 @@ class ComposedDataset(Dataset, ABC):
                 sample["prior_maps"] = tensor
             elif key == "prior_summary_tokens":
                 sample["prior_summary_tokens"] = tensor.to(torch.get_default_dtype())
-            elif key in {"prior_mask", "prior_masks"}:
-                sample["prior_mask"] = tensor.bool()
+            elif key in {"prior_mask", "prior_masks", "teacher_mask", "head_roi_mask", "face_roi_mask", "hairline_mask", "ear_band_mask"}:
+                if key in {"prior_mask", "prior_masks"}:
+                    sample["prior_mask"] = tensor.bool()
+                else:
+                    sample[key] = tensor.bool()
+            elif key in {"teacher_normals"}:
+                sample[key] = tensor.to(torch.get_default_dtype())
             elif key in {"prior_depth", "prior_depths"}:
                 sample["prior_depths"] = tensor.to(torch.get_default_dtype())
             else:

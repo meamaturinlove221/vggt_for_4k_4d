@@ -1,0 +1,34 @@
+{
+  "predictions_npz": "D:\\vggt\\vggt-main\\output\\modal_results\\20260421_6views_preprocess_crop_softmatte_v2_b40\\predictions.npz",
+  "scene_dir": "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\0012_11_frame0000_6views_sparseproto_human_crop_softmatte",
+  "output_dir": "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\softmatte\\face",
+  "point_source": "world_points",
+  "human_only": true,
+  "roi": "face",
+  "summary": {
+    "valid_points_before_conf": 252877,
+    "conf_threshold": 1.000073790550232,
+    "points_after_conf": 151734,
+    "points_written": 151734
+  },
+  "roi_summary": {
+    "roi": "face",
+    "head_cut_y": 0.11023350045084951,
+    "points_after_head_cut": 39451,
+    "x_lo": -0.05131767317652702,
+    "x_hi": -0.004242062568664551,
+    "z_lo": 1.1034736037254333,
+    "z_hi": 1.2034947872161865,
+    "y_lo": 0.15806587785482407,
+    "points_after_roi": 15127
+  },
+  "ply_path": "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\softmatte\\face\\pointcloud_open3d.ply",
+  "screenshots": [
+    "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\softmatte\\face\\front.png",
+    "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\softmatte\\face\\side.png",
+    "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\softmatte\\face\\top.png",
+    "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\softmatte\\face\\iso.png",
+    "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\softmatte\\face\\head_close.png",
+    "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\softmatte\\face\\face_close.png"
+  ]
+}

@@ -1,0 +1,5 @@
+defaults:
+  - 4k4d_prior_case_sparseproto_humancrop_pointnormal_r1
+  - _self_
+
+exp_name: 4k4d_prior_case_sparseproto_humancrop_pointnormal_r2

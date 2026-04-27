@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+from io import BytesIO
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 
@@ -182,6 +183,7 @@ def _download_volume_dir(remote_subdir: str, local_dir: Path, concurrency: int |
     local_dir = local_dir.expanduser().resolve()
     local_dir.mkdir(parents=True, exist_ok=True)
     remote_prefix = Path(remote_subdir)
+    files_downloaded = 0
 
     for entry in output_volume.listdir(remote_subdir, recursive=True):
         rel_path = Path(entry.path)
@@ -196,11 +198,29 @@ def _download_volume_dir(remote_subdir: str, local_dir: Path, concurrency: int |
         if entry.type != modal.volume.FileEntryType.FILE:
             continue
         dest_path.parent.mkdir(parents=True, exist_ok=True)
-        with dest_path.open("wb") as handle:
-            if concurrency is not None and concurrency > 0:
-                output_volume._read_file_into_fileobj(entry.path, handle, concurrency=concurrency)
-            else:
-                output_volume.read_file_into_fileobj(entry.path, handle)
+        last_error = None
+        for attempt in range(1, 6):
+            tmp_path = dest_path.with_suffix(dest_path.suffix + f".download{attempt}.tmp")
+            try:
+                with tmp_path.open("wb") as handle:
+                    if concurrency is not None and concurrency > 0:
+                        output_volume._read_file_into_fileobj(entry.path, handle, concurrency=concurrency)
+                    else:
+                        output_volume.read_file_into_fileobj(entry.path, handle)
+                tmp_path.replace(dest_path)
+                files_downloaded += 1
+                last_error = None
+                break
+            except Exception as exc:  # noqa: BLE001 - Modal volume reads can fail transiently.
+                last_error = exc
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                time.sleep(min(2 ** attempt, 20))
+        if last_error is not None:
+            raise RuntimeError(f"Failed to download {entry.path} after retries") from last_error
+    print(f"[modal-4k4d] downloaded {files_downloaded} files from {remote_subdir} to {local_dir}")
 
 
 def _write_prediction_chunks(output_dir: Path, arrays: dict, chunk_views: int) -> dict:
@@ -266,6 +286,19 @@ def _write_prediction_chunks(output_dir: Path, arrays: dict, chunk_views: int) -
     return manifest
 
 
+def _load_prediction_arrays_from_output_subdir(output_subdir: str) -> dict:
+    import numpy as np
+
+    output_subdir = _normalize_subpath(output_subdir)
+    output_root = _remote_output_path(output_subdir)
+    predictions_path = output_root / "predictions.npz"
+    if not predictions_path.is_file():
+        raise FileNotFoundError(f"Remote predictions not found: {predictions_path}")
+
+    with np.load(predictions_path, allow_pickle=False) as loaded:
+        return {key: np.array(loaded[key]) for key in loaded.files}
+
+
 def _reassemble_prediction_chunks(local_chunk_dir: Path, output_path: Path) -> dict:
     import numpy as np
 
@@ -304,6 +337,136 @@ def _reassemble_prediction_chunks(local_chunk_dir: Path, output_path: Path) -> d
         "num_keys": len(output_shapes),
         "output_shapes": output_shapes,
     }
+
+
+def _preprocess_remote_mask(mask_path: Path, target_size: int):
+    import numpy as np
+    from PIL import Image
+
+    img = Image.open(mask_path).convert("L")
+    width, height = img.size
+    if width >= height:
+        new_width = target_size
+        new_height = round(height * (new_width / width) / 14) * 14
+    else:
+        new_height = target_size
+        new_width = round(width * (new_height / height) / 14) * 14
+
+    img = img.resize((new_width, new_height), Image.Resampling.NEAREST)
+    arr = np.asarray(img, dtype=np.uint8)
+    canvas = np.zeros((target_size, target_size), dtype=np.uint8)
+    top = (target_size - new_height) // 2
+    left = (target_size - new_width) // 2
+    canvas[top : top + new_height, left : left + new_width] = arr
+    return canvas
+
+
+def _load_remote_mask_stack(scene_subdir: str, target_size: int):
+    import numpy as np
+
+    scene_dir = _remote_data_path(scene_subdir)
+    mask_dir = scene_dir / "masks"
+    if not mask_dir.is_dir():
+        return None
+    mask_paths = sorted(path for path in mask_dir.iterdir() if path.is_file())
+    if not mask_paths:
+        return None
+    masks = [_preprocess_remote_mask(path, target_size=target_size) for path in mask_paths]
+    return np.stack(masks, axis=0)
+
+
+def _build_filtered_points(
+    world_points,
+    world_points_conf,
+    masks,
+    *,
+    conf_percentile: float,
+):
+    import numpy as np
+
+    points = world_points.reshape(-1, 3)
+    conf = world_points_conf.reshape(-1)
+    valid = np.isfinite(points).all(axis=1) & np.isfinite(conf) & (conf > 0)
+    if masks is not None:
+        valid &= masks.reshape(-1) > 0
+
+    if not np.any(valid):
+        raise RuntimeError("No valid points after filtering.")
+
+    conf_valid = conf[valid]
+    conf_threshold = float(np.percentile(conf_valid, conf_percentile))
+    keep = valid & (conf >= conf_threshold)
+    if not np.any(keep):
+        keep = valid
+    return points[keep], {
+        "valid_points_before_conf": int(valid.sum()),
+        "conf_threshold": conf_threshold,
+        "points_after_conf": int(keep.sum()),
+    }
+
+
+def _apply_roi_filter(points, roi: str):
+    import numpy as np
+
+    if roi == "full":
+        return points, {"roi": roi, "points_after_roi": int(len(points))}
+
+    if len(points) < 32:
+        return points, {"roi": roi, "fallback": "too_few_points", "points_after_roi": int(len(points))}
+
+    # Keep ROI selection consistent with the Open3D render tooling: smaller
+    # world-space y appears higher on screen because the viewer uses up=(0,-1,0).
+    height_like = -points[:, 1]
+    head_percentile = 78.0 if roi == "head" else 74.0
+    head_cut = float(np.percentile(height_like, head_percentile))
+    head_mask = height_like >= head_cut
+    if int(head_mask.sum()) < 512:
+        relaxed_cut = float(np.percentile(height_like, 68.0))
+        head_mask = height_like >= relaxed_cut
+        head_cut = relaxed_cut
+
+    roi_mask = head_mask
+    summary = {
+        "roi": roi,
+        "vertical_axis": "-y_is_up",
+        "head_cut_height_like": head_cut,
+        "points_after_head_cut": int(head_mask.sum()),
+    }
+
+    if roi == "face":
+        head_points = points[head_mask]
+        if len(head_points) >= 256:
+            x_lo, x_hi = np.percentile(head_points[:, 0], [20.0, 80.0])
+            z_lo, z_hi = np.percentile(head_points[:, 2], [15.0, 85.0])
+            head_height_like = -head_points[:, 1]
+            height_lo = float(np.percentile(head_height_like, 25.0))
+            face_mask = (
+                head_mask
+                & (points[:, 0] >= float(x_lo))
+                & (points[:, 0] <= float(x_hi))
+                & (points[:, 2] >= float(z_lo))
+                & (points[:, 2] <= float(z_hi))
+                & (height_like >= height_lo)
+            )
+            if int(face_mask.sum()) >= 128:
+                roi_mask = face_mask
+                summary.update(
+                    {
+                        "x_lo": float(x_lo),
+                        "x_hi": float(x_hi),
+                        "z_lo": float(z_lo),
+                        "z_hi": float(z_hi),
+                        "face_height_like_lo": height_lo,
+                    }
+                )
+            else:
+                summary["fallback"] = "face_mask_too_small"
+        else:
+            summary["fallback"] = "head_mask_too_small"
+
+    filtered_points = points[roi_mask]
+    summary["points_after_roi"] = int(len(filtered_points))
+    return filtered_points, summary
 
 
 def _to_numpy(tensor):
@@ -522,16 +685,9 @@ def run_remote_vggt_inference(cfg_json: str) -> dict:
     },
 )
 def export_saved_prediction_chunks_remote(output_subdir: str, chunk_views: int = 5) -> dict:
-    import numpy as np
-
     output_subdir = _normalize_subpath(output_subdir)
     output_root = _remote_output_path(output_subdir)
-    predictions_path = output_root / "predictions.npz"
-    if not predictions_path.is_file():
-        raise FileNotFoundError(f"Remote predictions not found: {predictions_path}")
-
-    with np.load(predictions_path, allow_pickle=False) as loaded:
-        arrays = {key: np.array(loaded[key]) for key in loaded.files}
+    arrays = _load_prediction_arrays_from_output_subdir(output_subdir)
 
     chunk_dir = output_root / f"predictions_chunks_v{int(chunk_views)}"
     manifest = _write_prediction_chunks(chunk_dir, arrays, chunk_views=int(chunk_views))
@@ -542,6 +698,107 @@ def export_saved_prediction_chunks_remote(output_subdir: str, chunk_views: int =
         "chunk_subdir": chunk_subdir,
         "chunk_dir_name": chunk_dir.name,
         "manifest": manifest,
+    }
+
+
+@app.function(
+    image=INFER_IMAGE,
+    cpu=2,
+    memory=8192,
+    timeout=TIMEOUT_SEC,
+    volumes={
+        REMOTE_OUTPUT_DIR.as_posix(): output_volume,
+    },
+)
+def export_prediction_chunk_bytes_remote(output_subdir: str, start: int, end: int) -> bytes:
+    import numpy as np
+
+    arrays = _load_prediction_arrays_from_output_subdir(output_subdir)
+    num_views = None
+    for value in arrays.values():
+        if isinstance(value, np.ndarray) and value.ndim > 0:
+            num_views = int(value.shape[0])
+            break
+    if num_views is None:
+        raise ValueError("Could not infer num_views from predictions payload.")
+
+    start = max(0, int(start))
+    end = min(num_views, int(end))
+    if end <= start:
+        raise ValueError(f"Invalid chunk range: start={start}, end={end}, num_views={num_views}")
+
+    chunk_arrays = {}
+    for name, value in arrays.items():
+        if isinstance(value, np.ndarray) and value.ndim > 0 and int(value.shape[0]) == num_views:
+            chunk_arrays[name] = value[start:end]
+        else:
+            chunk_arrays[name] = value
+
+    buffer = BytesIO()
+    np.savez_compressed(buffer, **chunk_arrays)
+    return buffer.getvalue()
+
+
+@app.function(
+    image=INFER_IMAGE,
+    cpu=1,
+    memory=2048,
+    timeout=TIMEOUT_SEC,
+    volumes={
+        REMOTE_OUTPUT_DIR.as_posix(): output_volume,
+    },
+)
+def read_output_summary_remote(output_subdir: str) -> dict:
+    output_subdir = _normalize_subpath(output_subdir)
+    output_root = _remote_output_path(output_subdir)
+    summary_path = output_root / "summary.json"
+    if not summary_path.is_file():
+        raise FileNotFoundError(f"Remote summary not found: {summary_path}")
+    return json.loads(summary_path.read_text(encoding="utf-8"))
+
+
+@app.function(
+    image=INFER_IMAGE,
+    cpu=2,
+    memory=8192,
+    timeout=TIMEOUT_SEC,
+    volumes={
+        REMOTE_DATA_DIR.as_posix(): data_volume,
+        REMOTE_OUTPUT_DIR.as_posix(): output_volume,
+    },
+)
+def summarize_prediction_roi_remote(
+    output_subdir: str,
+    scene_subdir: str,
+    conf_percentile: float = 40.0,
+) -> dict:
+    import numpy as np
+
+    arrays = _load_prediction_arrays_from_output_subdir(output_subdir)
+    world_points = np.asarray(arrays["world_points"], dtype=np.float32)
+    world_points_conf = np.asarray(arrays["world_points_conf"], dtype=np.float32)
+    target_size = int(world_points.shape[1])
+    masks = _load_remote_mask_stack(scene_subdir, target_size=target_size)
+
+    points, filter_summary = _build_filtered_points(
+        world_points,
+        world_points_conf,
+        masks,
+        conf_percentile=float(conf_percentile),
+    )
+
+    _, full_summary = _apply_roi_filter(points, "full")
+    _, head_summary = _apply_roi_filter(points, "head")
+    _, face_summary = _apply_roi_filter(points, "face")
+
+    return {
+        "output_subdir": _normalize_subpath(output_subdir),
+        "scene_subdir": _normalize_subpath(scene_subdir),
+        "conf_percentile": float(conf_percentile),
+        "filter_summary": filter_summary,
+        "full_roi": full_summary,
+        "head_roi": head_summary,
+        "face_roi": face_summary,
     }
 
 
@@ -565,6 +822,7 @@ def run_scene(
     hf_repo: str = "facebook/VGGT-1B",
     checkpoint_relpath: str = "",
     download_local_dir: str = "",
+    skip_download: bool = False,
 ) -> None:
     cfg = InferenceConfig(
         scene_subdir=scene_subdir,
@@ -578,7 +836,9 @@ def run_scene(
     summary = run_remote_vggt_inference.remote(cfg.to_json())
     print("[modal-4k4d] remote summary:")
     print(json.dumps(summary, indent=2, ensure_ascii=False))
-    if download_local_dir.strip():
+    if skip_download:
+        print("[modal-4k4d] skip_download=True; artifacts remain on the output volume")
+    elif download_local_dir.strip():
         local_dir = Path(download_local_dir).expanduser().resolve()
         _download_volume_dir(summary["output_subdir"], local_dir)
         print(f"[modal-4k4d] downloaded artifacts to {local_dir}")
@@ -593,6 +853,7 @@ def run_scene_from_local(
     hf_repo: str = "facebook/VGGT-1B",
     checkpoint_relpath: str = "",
     download_local_dir: str = "",
+    skip_download: bool = False,
 ) -> None:
     local_dir = Path(local_scene_dir).expanduser().resolve()
     if not remote_scene_subdir.strip():
@@ -610,6 +871,9 @@ def run_scene_from_local(
     summary = run_remote_vggt_inference.remote(cfg.to_json())
     print("[modal-4k4d] remote summary:")
     print(json.dumps(summary, indent=2, ensure_ascii=False))
+    if skip_download:
+        print("[modal-4k4d] skip_download=True; artifacts remain on the output volume")
+        return
     if download_local_dir.strip():
         local_dir = Path(download_local_dir).expanduser().resolve()
     else:
@@ -660,3 +924,130 @@ def download_prediction_chunks(
         assembled = _reassemble_prediction_chunks(chunk_local_dir, local_dir / "predictions.npz")
         print("[modal-4k4d] reassembled predictions:")
         print(json.dumps(assembled, indent=2, ensure_ascii=False))
+
+
+@app.local_entrypoint()
+def download_prediction_chunks_rpc(
+    remote_output_subdir: str,
+    local_output_dir: str = "",
+    chunk_views: int = 1,
+    overwrite: bool = False,
+    resume_existing: bool = True,
+    max_chunk_retries: int = 3,
+) -> None:
+    import numpy as np
+    import time
+    import zipfile
+
+    remote_output_subdir = _normalize_subpath(remote_output_subdir)
+    if local_output_dir.strip():
+        local_dir = Path(local_output_dir).expanduser().resolve()
+    else:
+        local_dir = REPO_ROOT / "output" / "modal_results" / Path(remote_output_subdir).name
+
+    if overwrite and local_dir.exists():
+        import shutil
+
+        shutil.rmtree(local_dir)
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_payload = export_saved_prediction_chunks_remote.remote(
+        output_subdir=remote_output_subdir,
+        chunk_views=max(1, int(chunk_views)),
+    )
+    chunk_local_dir = local_dir / manifest_payload["chunk_dir_name"]
+    chunk_local_dir.mkdir(parents=True, exist_ok=True)
+    (chunk_local_dir / "manifest.json").write_text(
+        json.dumps(manifest_payload["manifest"], indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    summary = read_output_summary_remote.remote(remote_output_subdir)
+    (local_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    downloaded_chunks = []
+    skipped_chunks = []
+    invalid_existing_chunks = []
+    per_view_keys = list(manifest_payload["manifest"].get("per_view_keys", []))
+
+    def _existing_chunk_is_valid(path: Path, chunk_info: dict) -> bool:
+        if not path.is_file():
+            return False
+        expected_size = int(chunk_info.get("size_bytes", -1))
+        if expected_size > 0 and path.stat().st_size != expected_size:
+            return False
+        try:
+            with zipfile.ZipFile(path) as zip_file:
+                if zip_file.testzip() is not None:
+                    return False
+            with np.load(path, allow_pickle=False) as chunk_data:
+                for key in per_view_keys:
+                    _ = chunk_data[key].shape
+            return True
+        except Exception:
+            return False
+
+    for chunk in manifest_payload["manifest"]["chunks"]:
+        chunk_path = chunk_local_dir / chunk["file"]
+        if resume_existing and _existing_chunk_is_valid(chunk_path, chunk):
+            skipped_chunks.append(chunk["file"])
+            continue
+        if chunk_path.exists():
+            invalid_existing_chunks.append(chunk["file"])
+        last_error = None
+        for attempt in range(1, max(1, int(max_chunk_retries)) + 1):
+            try:
+                chunk_bytes = export_prediction_chunk_bytes_remote.remote(
+                    output_subdir=remote_output_subdir,
+                    start=int(chunk["start"]),
+                    end=int(chunk["end"]),
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+                print(
+                    f"[modal-4k4d] chunk download failed "
+                    f"{chunk['file']} attempt {attempt}/{max_chunk_retries}: {exc}"
+                )
+                if attempt < max(1, int(max_chunk_retries)):
+                    time.sleep(min(30, 2 * attempt))
+        else:
+            raise RuntimeError(f"Failed to download {chunk['file']}") from last_error
+        chunk_path.write_bytes(chunk_bytes)
+        downloaded_chunks.append(chunk["file"])
+
+    assembled = _reassemble_prediction_chunks(chunk_local_dir, local_dir / "predictions.npz")
+    print("[modal-4k4d] rpc chunk manifest:")
+    print(json.dumps(manifest_payload, indent=2, ensure_ascii=False))
+    print("[modal-4k4d] rpc chunk resume:")
+    print(
+        json.dumps(
+            {
+                "resume_existing": bool(resume_existing),
+                "max_chunk_retries": int(max_chunk_retries),
+                "skipped_chunks": skipped_chunks,
+                "invalid_existing_chunks": invalid_existing_chunks,
+                "downloaded_chunks": downloaded_chunks,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+    print("[modal-4k4d] rpc summary:")
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    print("[modal-4k4d] rpc assembled predictions:")
+    print(json.dumps(assembled, indent=2, ensure_ascii=False))
+
+
+@app.local_entrypoint()
+def summarize_prediction_roi(
+    remote_output_subdir: str,
+    scene_subdir: str,
+    conf_percentile: float = 40.0,
+) -> None:
+    summary = summarize_prediction_roi_remote.remote(
+        output_subdir=remote_output_subdir,
+        scene_subdir=scene_subdir,
+        conf_percentile=conf_percentile,
+    )
+    print(json.dumps(summary, indent=2, ensure_ascii=False))

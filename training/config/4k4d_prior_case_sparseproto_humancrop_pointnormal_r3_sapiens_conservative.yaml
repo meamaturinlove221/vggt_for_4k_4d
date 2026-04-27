@@ -1,0 +1,26 @@
+defaults:
+  - 4k4d_prior_case_sparseproto_humancrop_pointnormal_r3_faceboost
+  - _self_
+
+exp_name: 4k4d_prior_case_sparseproto_humancrop_pointnormal_r3_sapiens_conservative
+
+loss:
+  human_prior:
+    weight: 0.22
+    normal:
+      gamma: 0.65
+      head_roi_weight: 1.6
+      face_roi_weight: 2.0
+      hairline_roi_weight: 2.2
+      ear_band_roi_weight: 1.5
+      boundary_boost: 1.6
+    point_normal:
+      gamma: 1.15
+      alpha: 0.15
+      valid_range: 0.98
+      consistency_weight: 1.0
+      head_roi_weight: 2.2
+      face_roi_weight: 3.2
+      hairline_roi_weight: 3.5
+      ear_band_roi_weight: 2.0
+      boundary_boost: 2.4

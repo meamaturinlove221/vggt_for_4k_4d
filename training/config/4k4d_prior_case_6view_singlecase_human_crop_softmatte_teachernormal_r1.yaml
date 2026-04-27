@@ -1,0 +1,34 @@
+defaults:
+  - 4k4d_prior_case_6view_singlecase_human_crop_softmatte_overfit_b40
+  - _self_
+
+exp_name: 4k4d_prior_case_6view_singlecase_human_crop_softmatte_teachernormal_r1
+
+loss:
+  human_prior:
+    normal:
+      head_roi_weight: 1.75
+      face_roi_weight: 2.5
+      hairline_roi_weight: 3.0
+      ear_band_roi_weight: 1.75
+      boundary_boost: 2.5
+
+data:
+  train:
+    dataset:
+      dataset_configs:
+        - _target_: data.datasets.dna4k4d_pseudo.DNA4K4DPseudoDataset
+          split: train
+          len_train: 200
+          len_test: 20
+          case_roots:
+            - D:/vggt/vggt-main/output/training_cases/0012_11_frame0000_6views_preprocess_crop_softmatte_teachernormal_r1
+  val:
+    dataset:
+      dataset_configs:
+        - _target_: data.datasets.dna4k4d_pseudo.DNA4K4DPseudoDataset
+          split: test
+          len_train: 200
+          len_test: 20
+          case_roots:
+            - D:/vggt/vggt-main/output/training_cases/0012_11_frame0000_6views_preprocess_crop_softmatte_teachernormal_r1

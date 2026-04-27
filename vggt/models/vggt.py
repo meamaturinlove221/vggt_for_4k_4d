@@ -30,6 +30,10 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         human_prior_hidden_dim=64,
         human_prior_gate_init=0.0,
         human_prior_multi_scale_factors=(1,),
+        human_prior_enable_input_fusion=True,
+        human_prior_enable_frame_fusion=True,
+        human_prior_enable_global_fusion=True,
+        human_prior_enable_summary_fusion=True,
     ):
         super().__init__()
 
@@ -42,6 +46,10 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             human_prior_hidden_dim=human_prior_hidden_dim,
             human_prior_gate_init=human_prior_gate_init,
             human_prior_multi_scale_factors=human_prior_multi_scale_factors,
+            human_prior_enable_input_fusion=human_prior_enable_input_fusion,
+            human_prior_enable_frame_fusion=human_prior_enable_frame_fusion,
+            human_prior_enable_global_fusion=human_prior_enable_global_fusion,
+            human_prior_enable_summary_fusion=human_prior_enable_summary_fusion,
         )
 
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None

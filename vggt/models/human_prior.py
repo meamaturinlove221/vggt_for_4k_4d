@@ -92,6 +92,10 @@ class HumanPriorAdapter(nn.Module):
         hidden_dim: int = 64,
         gate_init: float = 0.0,
         multi_scale_factors: Sequence[int] | None = None,
+        enable_input_fusion: bool = True,
+        enable_frame_fusion: bool = True,
+        enable_global_fusion: bool = True,
+        enable_summary_fusion: bool = True,
     ) -> None:
         super().__init__()
 
@@ -102,6 +106,10 @@ class HumanPriorAdapter(nn.Module):
         self.summary_in_channels = summary_in_channels
         self.embed_dim = embed_dim
         self.depth = depth
+        self.enable_input_fusion = bool(enable_input_fusion)
+        self.enable_frame_fusion = bool(enable_frame_fusion)
+        self.enable_global_fusion = bool(enable_global_fusion)
+        self.enable_summary_fusion = bool(enable_summary_fusion)
         normalized_scale_factors = []
         for factor in (multi_scale_factors or (1,)):
             factor = max(1, int(factor))
@@ -225,12 +233,18 @@ class HumanPriorAdapter(nn.Module):
         return prior_tokens
 
     def fuse_input_tokens(self, patch_tokens: torch.Tensor, prior_tokens: torch.Tensor) -> torch.Tensor:
+        if not self.enable_input_fusion:
+            return patch_tokens
         return self.input_fusion(patch_tokens, prior_tokens)
 
     def fuse_frame_tokens(self, patch_tokens: torch.Tensor, prior_tokens: torch.Tensor, layer_idx: int) -> torch.Tensor:
+        if not self.enable_frame_fusion:
+            return patch_tokens
         return self.frame_fusions[layer_idx](patch_tokens, prior_tokens)
 
     def fuse_global_tokens(self, patch_tokens: torch.Tensor, prior_tokens: torch.Tensor, layer_idx: int) -> torch.Tensor:
+        if not self.enable_global_fusion:
+            return patch_tokens
         return self.global_fusions[layer_idx](patch_tokens, prior_tokens)
 
     def project_summary_tokens(self, summary_tokens: torch.Tensor) -> torch.Tensor:
@@ -256,6 +270,8 @@ class HumanPriorAdapter(nn.Module):
         summary_tokens: torch.Tensor,
         layer_idx: int,
     ) -> torch.Tensor:
+        if not self.enable_summary_fusion:
+            return patch_tokens
         return self.global_summary_fusions[layer_idx](patch_tokens, summary_tokens)
 
     def forward(self, prior_maps: torch.Tensor, target_hw: Tuple[int, int]) -> torch.Tensor:

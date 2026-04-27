@@ -1,0 +1,42 @@
+defaults:
+  - 4k4d_prior_case_sparseproto_humancrop_pointnormal_r3_faceboost
+  - _self_
+
+exp_name: 4k4d_prior_case_sparseproto_humancrop_pointnormal_r5_geoonly
+
+loss:
+  human_prior:
+    weight: 0.20
+    depth:
+      gamma: 0.0
+      alpha: 0.0
+      supervise_conf: false
+      gradient_loss_fn: null
+      valid_range: 0.98
+    point:
+      gamma: 0.0
+      alpha: 0.0
+      supervise_conf: false
+      gradient_loss_fn: null
+      valid_range: 0.98
+    normal:
+      gamma: 0.0
+      alpha: 0.0
+      supervise_conf: false
+      valid_range: 0.98
+      head_roi_weight: 2.0
+      face_roi_weight: 3.0
+      hairline_roi_weight: 3.2
+      ear_band_roi_weight: 1.8
+      boundary_boost: 2.2
+    point_normal:
+      gamma: 0.0
+      alpha: 0.0
+      supervise_conf: false
+      valid_range: 0.98
+      consistency_weight: 0.5
+      head_roi_weight: 2.0
+      face_roi_weight: 3.0
+      hairline_roi_weight: 3.2
+      ear_band_roi_weight: 1.8
+      boundary_boost: 2.2

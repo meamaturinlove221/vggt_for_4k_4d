@@ -1,0 +1,335 @@
+{
+  "generated_at": "2026-04-22T01:50:47",
+  "generator": "D:\\vggt\\vggt-main\\tools\\build_mentor_overfit_eval_pack.py",
+  "scope": "existing outputs only",
+  "output_dir": "D:\\vggt\\vggt-main\\reports\\mentor_overfit_eval_pack_20260422",
+  "report_path": "D:\\vggt\\vggt-main\\reports\\20260422_mentor_overfit_eval_pack.md",
+  "summary": {
+    "generated_at": "2026-04-22T01:50:47",
+    "branches": [
+      {
+        "branch": "crop",
+        "compare_dir": "D:\\vggt\\vggt-main\\output\\modal_results\\20260422_crop_trained_vs_untrained_compare",
+        "comparison_summary_path": "D:\\vggt\\vggt-main\\output\\modal_results\\20260422_crop_trained_vs_untrained_compare\\comparison_summary.json",
+        "aligned_diff_csv_path": "D:\\vggt\\vggt-main\\output\\modal_results\\20260422_crop_trained_vs_untrained_compare\\aligned_diff_summary_vs_baseline.csv",
+        "baseline_label": "crop_untrained",
+        "trained_label": "crop_trained",
+        "depth_mae": 0.04701504111289978,
+        "world_points_l2_mean": 0.09864649176597595,
+        "normal_angle_mean_deg": 59.567771911621094,
+        "translation_l2_mean": 0.010953511111438274,
+        "depth_conf_mae": 24.356828689575195,
+        "world_points_conf_mae": 23.587862014770508,
+        "baseline_depth_conf_fg_mean": 1.0000974359191914,
+        "trained_depth_conf_fg_mean": 39.826139769443124,
+        "baseline_world_points_conf_fg_mean": 1.023362008900566,
+        "trained_world_points_conf_fg_mean": 34.09894278205942,
+        "baseline_face_points": 11523,
+        "trained_face_points": 10952,
+        "baseline_face_z_span": 0.10252718925476079,
+        "trained_face_z_span": 0.07665741443634033,
+        "baseline_face_x_span": 0.049617646652041,
+        "trained_face_x_span": 0.05894375126808882,
+        "baseline_face_y_lo": 0.14848418533802032,
+        "trained_face_y_lo": 0.1052001342177391,
+        "baseline_face_summary_path": "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\crop\\face\\open3d_summary.json",
+        "trained_face_summary_path": "D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\crop_trained\\face\\open3d_summary.json",
+        "baseline_face_summary": {
+          "predictions_npz": "D:\\vggt\\vggt-main\\output\\modal_results\\20260421_6views_preprocess_crop_b40\\predictions.npz",
+          "scene_dir": "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\0012_11_frame0000_6views_sparseproto_human_crop",
+          "output_dir": "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\crop\\face",
+          "point_source": "world_points",
+          "human_only": true,
+          "roi": "face",
+          "summary": {
+            "valid_points_before_conf": 185130,
+            "conf_threshold": 1.0000925064086914,
+            "points_after_conf": 111094,
+            "points_written": 111094
+          },
+          "roi_summary": {
+            "roi": "face",
+            "head_cut_y": 0.09992719233036036,
+            "points_after_head_cut": 28885,
+            "x_lo": -0.04932736903429031,
+            "x_hi": 0.0002902776177506912,
+            "z_lo": 1.0776641607284545,
+            "z_hi": 1.1801913499832153,
+            "y_lo": 0.14848418533802032,
+            "points_after_roi": 11523
+          },
+          "ply_path": "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\crop\\face\\pointcloud_open3d.ply",
+          "screenshots": [
+            "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\crop\\face\\front.png",
+            "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\crop\\face\\side.png",
+            "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\crop\\face\\top.png",
+            "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\crop\\face\\iso.png",
+            "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\crop\\face\\head_close.png",
+            "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\crop\\face\\face_close.png"
+          ]
+        },
+        "trained_face_summary": {
+          "predictions_npz": "D:\\vggt\\vggt-main\\output\\modal_results\\20260422_crop_trained_eval\\predictions.npz",
+          "scene_dir": "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\0012_11_frame0000_6views_sparseproto_human_crop",
+          "output_dir": "D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\crop_trained\\face",
+          "point_source": "world_points",
+          "human_only": true,
+          "roi": "face",
+          "summary": {
+            "valid_points_before_conf": 185130,
+            "conf_threshold": 32.03609848022461,
+            "points_after_conf": 111078,
+            "points_written": 111078
+          },
+          "roi_summary": {
+            "roi": "face",
+            "head_cut_y": 0.08357707694172858,
+            "points_after_head_cut": 28881,
+            "x_lo": -0.04489477723836899,
+            "x_hi": 0.01404897402971983,
+            "z_lo": 1.0371888875961304,
+            "z_hi": 1.1138463020324707,
+            "y_lo": 0.1052001342177391,
+            "points_after_roi": 10952
+          },
+          "ply_path": "D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\crop_trained\\face\\pointcloud_open3d.ply",
+          "screenshots": [
+            "D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\crop_trained\\face\\front.png",
+            "D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\crop_trained\\face\\side.png",
+            "D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\crop_trained\\face\\top.png",
+            "D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\crop_trained\\face\\iso.png",
+            "D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\crop_trained\\face\\head_close.png",
+            "D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\crop_trained\\face\\face_close.png"
+          ]
+        },
+        "face_point_delta": -571,
+        "face_z_span_delta": -0.025869774818420455,
+        "face_z_span_change_ratio": -0.2523211160518497,
+        "depth_conf_fg_ratio": 39.822259650969755,
+        "world_points_conf_fg_ratio": 33.320508759840635
+      },
+      {
+        "branch": "softmatte",
+        "compare_dir": "D:\\vggt\\vggt-main\\output\\modal_results\\20260422_softmatte_trained_vs_untrained_compare",
+        "comparison_summary_path": "D:\\vggt\\vggt-main\\output\\modal_results\\20260422_softmatte_trained_vs_untrained_compare\\comparison_summary.json",
+        "aligned_diff_csv_path": "D:\\vggt\\vggt-main\\output\\modal_results\\20260422_softmatte_trained_vs_untrained_compare\\aligned_diff_summary_vs_baseline.csv",
+        "baseline_label": "softmatte_untrained",
+        "trained_label": "softmatte_trained",
+        "depth_mae": 0.036135490983724594,
+        "world_points_l2_mean": 0.08573620766401291,
+        "normal_angle_mean_deg": 59.26738739013672,
+        "translation_l2_mean": 0.01357242465019226,
+        "depth_conf_mae": 25.964296340942383,
+        "world_points_conf_mae": 24.831676483154297,
+        "baseline_depth_conf_fg_mean": 1.000291616523018,
+        "trained_depth_conf_fg_mean": 34.730090371266314,
+        "baseline_world_points_conf_fg_mean": 1.0314087039687236,
+        "trained_world_points_conf_fg_mean": 30.17391733364313,
+        "baseline_face_points": 15127,
+        "trained_face_points": 14068,
+        "baseline_face_z_span": 0.10002118349075317,
+        "trained_face_z_span": 0.07973315715789808,
+        "baseline_face_x_span": 0.04707561060786247,
+        "trained_face_x_span": 0.08139454424381257,
+        "baseline_face_y_lo": 0.15806587785482407,
+        "trained_face_y_lo": 0.06753154844045639,
+        "baseline_face_summary_path": "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\softmatte\\face\\open3d_summary.json",
+        "trained_face_summary_path": "D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\softmatte_trained\\face\\open3d_summary.json",
+        "baseline_face_summary": {
+          "predictions_npz": "D:\\vggt\\vggt-main\\output\\modal_results\\20260421_6views_preprocess_crop_softmatte_v2_b40\\predictions.npz",
+          "scene_dir": "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\0012_11_frame0000_6views_sparseproto_human_crop_softmatte",
+          "output_dir": "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\softmatte\\face",
+          "point_source": "world_points",
+          "human_only": true,
+          "roi": "face",
+          "summary": {
+            "valid_points_before_conf": 252877,
+            "conf_threshold": 1.000073790550232,
+            "points_after_conf": 151734,
+            "points_written": 151734
+          },
+          "roi_summary": {
+            "roi": "face",
+            "head_cut_y": 0.11023350045084951,
+            "points_after_head_cut": 39451,
+            "x_lo": -0.05131767317652702,
+            "x_hi": -0.004242062568664551,
+            "z_lo": 1.1034736037254333,
+            "z_hi": 1.2034947872161865,
+            "y_lo": 0.15806587785482407,
+            "points_after_roi": 15127
+          },
+          "ply_path": "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\softmatte\\face\\pointcloud_open3d.ply",
+          "screenshots": [
+            "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\softmatte\\face\\front.png",
+            "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\softmatte\\face\\side.png",
+            "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\softmatte\\face\\top.png",
+            "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\softmatte\\face\\iso.png",
+            "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\softmatte\\face\\head_close.png",
+            "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\softmatte\\face\\face_close.png"
+          ]
+        },
+        "trained_face_summary": {
+          "predictions_npz": "D:\\vggt\\vggt-main\\output\\modal_results\\20260422_softmatte_trained_eval\\predictions.npz",
+          "scene_dir": "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\0012_11_frame0000_6views_sparseproto_human_crop_softmatte",
+          "output_dir": "\\\\?\\D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\softmatte_trained\\face",
+          "point_source": "world_points",
+          "human_only": true,
+          "roi": "face",
+          "summary": {
+            "valid_points_before_conf": 252877,
+            "conf_threshold": 27.69576301574707,
+            "points_after_conf": 151726,
+            "points_written": 151726
+          },
+          "roi_summary": {
+            "roi": "face",
+            "head_cut_y": 0.04476374201476574,
+            "points_after_head_cut": 39449,
+            "x_lo": -0.04231048077344894,
+            "x_hi": 0.039084063470363625,
+            "z_lo": 1.0047866821289062,
+            "z_hi": 1.0845198392868043,
+            "y_lo": 0.06753154844045639,
+            "points_after_roi": 14068
+          },
+          "ply_path": "\\\\?\\D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\softmatte_trained\\face\\pointcloud_open3d.ply",
+          "screenshots": [
+            "\\\\?\\D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\softmatte_trained\\face\\front.png",
+            "\\\\?\\D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\softmatte_trained\\face\\side.png",
+            "\\\\?\\D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\softmatte_trained\\face\\top.png",
+            "\\\\?\\D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\softmatte_trained\\face\\iso.png",
+            "\\\\?\\D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\softmatte_trained\\face\\head_close.png",
+            "\\\\?\\D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\softmatte_trained\\face\\face_close.png"
+          ]
+        },
+        "face_point_delta": -1059,
+        "face_z_span_delta": -0.02028802633285509,
+        "face_z_span_change_ratio": -0.20283729530885516,
+        "depth_conf_fg_ratio": 34.71996545566083,
+        "world_points_conf_fg_ratio": 29.255054002877717
+      }
+    ]
+  },
+  "copied_assets": [
+    {
+      "category": "baseline_panels",
+      "description": "Preprocess ablation face ROI comparison across full/crop/hardmask/softmatte",
+      "source_path": "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\compare_face_roi_variants.png",
+      "copied_path": "D:\\vggt\\vggt-main\\reports\\mentor_overfit_eval_pack_20260422\\assets\\preprocess\\compare_face_roi_variants.png",
+      "relative_output_path": "assets/preprocess/compare_face_roi_variants.png"
+    },
+    {
+      "category": "crop_compare",
+      "description": "Crop branch aligned depth preview versus crop_untrained baseline",
+      "source_path": "D:\\vggt\\vggt-main\\output\\modal_results\\20260422_crop_trained_vs_untrained_compare\\preview_sheets\\depth_aligned_to_crop_untrained.png",
+      "copied_path": "D:\\vggt\\vggt-main\\reports\\mentor_overfit_eval_pack_20260422\\assets\\crop_compare\\depth_aligned_to_crop_untrained.png",
+      "relative_output_path": "assets/crop_compare/depth_aligned_to_crop_untrained.png"
+    },
+    {
+      "category": "crop_compare",
+      "description": "Crop branch aligned point confidence preview versus crop_untrained baseline",
+      "source_path": "D:\\vggt\\vggt-main\\output\\modal_results\\20260422_crop_trained_vs_untrained_compare\\preview_sheets\\point_conf_aligned_to_crop_untrained.png",
+      "copied_path": "D:\\vggt\\vggt-main\\reports\\mentor_overfit_eval_pack_20260422\\assets\\crop_compare\\point_conf_aligned_to_crop_untrained.png",
+      "relative_output_path": "assets/crop_compare/point_conf_aligned_to_crop_untrained.png"
+    },
+    {
+      "category": "crop_open3d",
+      "description": "Crop trained face ROI close render",
+      "source_path": "D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\crop_trained\\face\\face_close.png",
+      "copied_path": "D:\\vggt\\vggt-main\\reports\\mentor_overfit_eval_pack_20260422\\assets\\crop_open3d\\face_close.png",
+      "relative_output_path": "assets/crop_open3d/face_close.png"
+    },
+    {
+      "category": "crop_open3d",
+      "description": "Crop trained face ROI side render",
+      "source_path": "D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\crop_trained\\face\\side.png",
+      "copied_path": "D:\\vggt\\vggt-main\\reports\\mentor_overfit_eval_pack_20260422\\assets\\crop_open3d\\side.png",
+      "relative_output_path": "assets/crop_open3d/side.png"
+    },
+    {
+      "category": "softmatte_compare",
+      "description": "Softmatte branch aligned depth preview versus softmatte_untrained baseline",
+      "source_path": "D:\\vggt\\vggt-main\\output\\modal_results\\20260422_softmatte_trained_vs_untrained_compare\\preview_sheets\\depth_aligned_to_softmatte_untrained.png",
+      "copied_path": "D:\\vggt\\vggt-main\\reports\\mentor_overfit_eval_pack_20260422\\assets\\softmatte_compare\\depth_aligned_to_softmatte_untrained.png",
+      "relative_output_path": "assets/softmatte_compare/depth_aligned_to_softmatte_untrained.png"
+    },
+    {
+      "category": "softmatte_compare",
+      "description": "Softmatte branch aligned point confidence preview versus softmatte_untrained baseline",
+      "source_path": "D:\\vggt\\vggt-main\\output\\modal_results\\20260422_softmatte_trained_vs_untrained_compare\\preview_sheets\\point_conf_aligned_to_softmatte_untrained.png",
+      "copied_path": "D:\\vggt\\vggt-main\\reports\\mentor_overfit_eval_pack_20260422\\assets\\softmatte_compare\\point_conf_aligned_to_softmatte_untrained.png",
+      "relative_output_path": "assets/softmatte_compare/point_conf_aligned_to_softmatte_untrained.png"
+    },
+    {
+      "category": "softmatte_open3d",
+      "description": "Softmatte trained face ROI close render",
+      "source_path": "D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\softmatte_trained\\face\\face_close.png",
+      "copied_path": "D:\\vggt\\vggt-main\\reports\\mentor_overfit_eval_pack_20260422\\assets\\softmatte_open3d\\face_close.png",
+      "relative_output_path": "assets/softmatte_open3d/face_close.png"
+    },
+    {
+      "category": "softmatte_open3d",
+      "description": "Softmatte trained face ROI side render",
+      "source_path": "D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\softmatte_trained\\face\\side.png",
+      "copied_path": "D:\\vggt\\vggt-main\\reports\\mentor_overfit_eval_pack_20260422\\assets\\softmatte_open3d\\side.png",
+      "relative_output_path": "assets/softmatte_open3d/side.png"
+    },
+    {
+      "category": "evidence",
+      "description": "Crop trained vs untrained comparison summary JSON",
+      "source_path": "D:\\vggt\\vggt-main\\output\\modal_results\\20260422_crop_trained_vs_untrained_compare\\comparison_summary.json",
+      "copied_path": "D:\\vggt\\vggt-main\\reports\\mentor_overfit_eval_pack_20260422\\evidence\\crop_trained_vs_untrained\\comparison_summary.json",
+      "relative_output_path": "evidence/crop_trained_vs_untrained/comparison_summary.json"
+    },
+    {
+      "category": "evidence",
+      "description": "Crop trained vs untrained aligned diff summary CSV",
+      "source_path": "D:\\vggt\\vggt-main\\output\\modal_results\\20260422_crop_trained_vs_untrained_compare\\aligned_diff_summary_vs_baseline.csv",
+      "copied_path": "D:\\vggt\\vggt-main\\reports\\mentor_overfit_eval_pack_20260422\\evidence\\crop_trained_vs_untrained\\aligned_diff_summary_vs_baseline.csv",
+      "relative_output_path": "evidence/crop_trained_vs_untrained/aligned_diff_summary_vs_baseline.csv"
+    },
+    {
+      "category": "evidence",
+      "description": "Softmatte trained vs untrained comparison summary JSON",
+      "source_path": "D:\\vggt\\vggt-main\\output\\modal_results\\20260422_softmatte_trained_vs_untrained_compare\\comparison_summary.json",
+      "copied_path": "D:\\vggt\\vggt-main\\reports\\mentor_overfit_eval_pack_20260422\\evidence\\softmatte_trained_vs_untrained\\comparison_summary.json",
+      "relative_output_path": "evidence/softmatte_trained_vs_untrained/comparison_summary.json"
+    },
+    {
+      "category": "evidence",
+      "description": "Softmatte trained vs untrained aligned diff summary CSV",
+      "source_path": "D:\\vggt\\vggt-main\\output\\modal_results\\20260422_softmatte_trained_vs_untrained_compare\\aligned_diff_summary_vs_baseline.csv",
+      "copied_path": "D:\\vggt\\vggt-main\\reports\\mentor_overfit_eval_pack_20260422\\evidence\\softmatte_trained_vs_untrained\\aligned_diff_summary_vs_baseline.csv",
+      "relative_output_path": "evidence/softmatte_trained_vs_untrained/aligned_diff_summary_vs_baseline.csv"
+    },
+    {
+      "category": "evidence",
+      "description": "Crop trained face ROI Open3D summary JSON",
+      "source_path": "D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\crop_trained\\face\\open3d_summary.json",
+      "copied_path": "D:\\vggt\\vggt-main\\reports\\mentor_overfit_eval_pack_20260422\\evidence\\open3d\\crop_trained_face_open3d_summary.json",
+      "relative_output_path": "evidence/open3d/crop_trained_face_open3d_summary.json"
+    },
+    {
+      "category": "evidence",
+      "description": "Crop untrained face ROI Open3D summary JSON",
+      "source_path": "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\crop\\face\\open3d_summary.json",
+      "copied_path": "D:\\vggt\\vggt-main\\reports\\mentor_overfit_eval_pack_20260422\\evidence\\open3d\\crop_untrained_face_open3d_summary.json",
+      "relative_output_path": "evidence/open3d/crop_untrained_face_open3d_summary.json"
+    },
+    {
+      "category": "evidence",
+      "description": "Softmatte trained face ROI Open3D summary JSON",
+      "source_path": "D:\\vggt\\vggt-main\\output\\overfit_trained_eval_20260422\\open3d_compare\\softmatte_trained\\face\\open3d_summary.json",
+      "copied_path": "D:\\vggt\\vggt-main\\reports\\mentor_overfit_eval_pack_20260422\\evidence\\open3d\\softmatte_trained_face_open3d_summary.json",
+      "relative_output_path": "evidence/open3d/softmatte_trained_face_open3d_summary.json"
+    },
+    {
+      "category": "evidence",
+      "description": "Softmatte untrained face ROI Open3D summary JSON",
+      "source_path": "D:\\vggt\\vggt-main\\output\\preprocess_ablation_20260421\\open3d_compare\\softmatte\\face\\open3d_summary.json",
+      "copied_path": "D:\\vggt\\vggt-main\\reports\\mentor_overfit_eval_pack_20260422\\evidence\\open3d\\softmatte_untrained_face_open3d_summary.json",
+      "relative_output_path": "evidence/open3d/softmatte_untrained_face_open3d_summary.json"
+    }
+  ]
+}

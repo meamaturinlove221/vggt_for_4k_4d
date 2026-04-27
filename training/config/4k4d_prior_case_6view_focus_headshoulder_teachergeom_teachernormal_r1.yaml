@@ -1,0 +1,25 @@
+defaults:
+  - 4k4d_prior_case_6view_focus_humancrop_teachernormal_r2
+  - _self_
+
+exp_name: 4k4d_prior_case_6view_focus_headshoulder_teachergeom_teachernormal_r1
+
+data:
+  train:
+    dataset:
+      dataset_configs:
+        - _target_: data.datasets.dna4k4d_pseudo.DNA4K4DPseudoDataset
+          split: train
+          len_train: 200
+          len_test: 20
+          case_roots:
+            - D:/vggt/vggt-main/output/training_cases/0012_11_frame0000_6views_sparseproto_headshoulder_teachernormal_r1
+  val:
+    dataset:
+      dataset_configs:
+        - _target_: data.datasets.dna4k4d_pseudo.DNA4K4DPseudoDataset
+          split: test
+          len_train: 200
+          len_test: 20
+          case_roots:
+            - D:/vggt/vggt-main/output/training_cases/0012_11_frame0000_6views_sparseproto_headshoulder_teachernormal_r1

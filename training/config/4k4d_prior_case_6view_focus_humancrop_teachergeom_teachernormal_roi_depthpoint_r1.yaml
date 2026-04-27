@@ -1,0 +1,20 @@
+defaults:
+  - 4k4d_prior_case_6view_focus_humancrop_teachergeom_teachernormal_r1
+  - _self_
+
+exp_name: 4k4d_prior_case_6view_focus_humancrop_teachergeom_teachernormal_roi_depthpoint_r1
+
+loss:
+  human_prior:
+    depth:
+      head_roi_weight: 2.5
+      face_roi_weight: 4.0
+      hairline_roi_weight: 4.5
+      ear_band_roi_weight: 2.5
+      boundary_boost: 3.25
+    point:
+      head_roi_weight: 2.5
+      face_roi_weight: 4.0
+      hairline_roi_weight: 4.5
+      ear_band_roi_weight: 2.5
+      boundary_boost: 3.25

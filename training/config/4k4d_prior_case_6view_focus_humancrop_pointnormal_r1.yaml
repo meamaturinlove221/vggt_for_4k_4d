@@ -1,0 +1,19 @@
+defaults:
+  - 4k4d_prior_case_6view_focus_humancrop_teachernormal_r1
+  - _self_
+
+exp_name: 4k4d_prior_case_6view_focus_humancrop_pointnormal_r1
+
+loss:
+  human_prior:
+    weight: 0.28
+    point_normal:
+      gamma: 1.0
+      alpha: 0.0
+      valid_range: 0.98
+      consistency_weight: 0.75
+      head_roi_weight: 2.0
+      face_roi_weight: 3.25
+      hairline_roi_weight: 3.75
+      ear_band_roi_weight: 2.0
+      boundary_boost: 3.0

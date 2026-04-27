@@ -1,0 +1,47 @@
+defaults:
+  - 4k4d_prior_case_6view_focus_strongfusion
+  - _self_
+
+exp_name: 4k4d_prior_case_6view_focus_humancrop_teachernormal_r2
+
+data:
+  train:
+    common_config:
+      prior_pose_noise:
+        enabled: True
+        prob: 0.45
+        cam_xyz_std: 0.008
+        cam_xyz_global_std: 0.004
+        scale_std: 0.008
+        normal_std: 0.015
+        visibility_dropout: 0.03
+        spatial_shift_std_px: 1.0
+        max_spatial_shift_px: 2
+    dataset:
+      dataset_configs:
+        - _target_: data.datasets.dna4k4d_pseudo.DNA4K4DPseudoDataset
+          split: train
+          len_train: 200
+          len_test: 20
+          case_roots:
+            - D:/vggt/vggt-main/output/training_cases/0012_11_frame0000_6views_sparseproto_humancrop_teachernormal_r1
+  val:
+    dataset:
+      dataset_configs:
+        - _target_: data.datasets.dna4k4d_pseudo.DNA4K4DPseudoDataset
+          split: test
+          len_train: 200
+          len_test: 20
+          case_roots:
+            - D:/vggt/vggt-main/output/training_cases/0012_11_frame0000_6views_sparseproto_humancrop_teachernormal_r1
+
+loss:
+  human_prior:
+    weight: 0.4
+    normal:
+      gamma: 2.25
+      head_roi_weight: 2.5
+      face_roi_weight: 4.0
+      hairline_roi_weight: 4.5
+      ear_band_roi_weight: 2.5
+      boundary_boost: 3.25
