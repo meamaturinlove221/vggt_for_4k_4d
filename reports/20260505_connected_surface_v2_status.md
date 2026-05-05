@@ -1664,3 +1664,62 @@ modeled facial relief or articulated hand geometry. The next non-redundant step
 must introduce semantic surface correspondences or a learned surface-token
 decoder; this result is still a strict fail.
 ```
+
+The audit now also exports a connected semantic correspondence payload:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_v24_outer_triangle_rgbgrad_allfaces_smoke2_t64_step5/landmark_semantic_pull_audit/semantic_correspondence_payload.npz
+```
+
+This payload records which connected mesh vertices were repeatedly closest to
+each semantic landmark group. It is not a teacher; it is only a weak
+correspondence diagnostic. The concentration is itself a warning signal:
+
+```text
+face.mouth: unique_vertices 7, total_assignments 88, top_count_ratio 0.50
+face.central_nose: unique_vertices 9, total_assignments 68, top_count_ratio 0.25
+right_hand.index: unique_vertices 16, total_assignments 20, top_count_ratio 0.20
+left_hand.middle: unique_vertices 7, total_assignments 16, top_count_ratio 0.50
+```
+
+I added optional optimizer support for this payload:
+
+```text
+--semantic-landmark-payload
+--semantic-face-landmark-weight
+--semantic-hand-landmark-weight
+--semantic-landmark-bidir-weight
+--semantic-landmark-min-vertices
+```
+
+Smoke run:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_v25_semantic_correspondence_surfel_smoke2_t96_step2
+```
+
+Results:
+
+```text
+initial_iou.mean = 0.776249
+optimized_iou.mean = 0.776509
+iou_delta = +0.000260
+target_recall_delta = 0.000000
+semantic_face_loss: 0.145027 -> 0.144852
+semantic_hand_loss: 0.050673 -> 0.050476
+semantic face views: 2
+semantic hand views: 2
+semantic hand matches: 4
+```
+
+Conclusion:
+
+```text
+Semantic correspondence loss is now executable and produces nonzero, slightly
+decreasing face/hand terms. However, the surface quality does not meaningfully
+change in this smoke, and it remains diagnostic only. This confirms the next
+blocker is not simply "loss absent"; the connected carrier still lacks enough
+learned / optimizable capacity to turn mouth, nose, fingers, hairline, and
+clothing into a mentor-pass surface. Do not scale this by only increasing
+semantic weights.
+```

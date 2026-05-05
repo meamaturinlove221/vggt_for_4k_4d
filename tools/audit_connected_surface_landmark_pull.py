@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -216,6 +217,7 @@ def add_nearest_part_stats(stats: dict[str, Any], candidate_ids: np.ndarray, par
     }
     stats["unique_nearest_vertices"] = unique_count
     stats["nearest_unique_ratio"] = float(unique_count / max(1, int(nearest.shape[0])))
+    stats["nearest_global_vertex_ids"] = nearest.astype(np.int64).tolist()
     return nearest
 
 
@@ -251,6 +253,45 @@ def append_group_means(accumulator: dict[str, list[float]], prefix: str, grouped
 
 def summarize_group_means(accumulator: dict[str, list[float]]) -> dict[str, Any]:
     return {group_name: summarize(values) for group_name, values in sorted(accumulator.items())}
+
+
+def accumulate_semantic_vertices(
+    accumulator: dict[str, Counter[int]],
+    prefix: str,
+    grouped: dict[str, Any],
+) -> None:
+    for group_name, stats in grouped.items():
+        ids = stats.get("nearest_global_vertex_ids")
+        if not ids:
+            continue
+        counter = accumulator.setdefault(f"{prefix}{group_name}", Counter())
+        counter.update(int(idx) for idx in ids)
+
+
+def write_semantic_correspondence_payload(
+    output_path: Path,
+    semantic_vertex_counts: dict[str, Counter[int]],
+) -> dict[str, Any]:
+    arrays: dict[str, Any] = {}
+    summary: dict[str, Any] = {}
+    for group_name in sorted(semantic_vertex_counts):
+        counter = semantic_vertex_counts[group_name]
+        items = sorted(counter.items(), key=lambda item: (-item[1], item[0]))
+        ids = np.asarray([idx for idx, _count in items], dtype=np.int64)
+        counts = np.asarray([count for _idx, count in items], dtype=np.int64)
+        key = group_name.replace(".", "__")
+        arrays[f"{key}__ids"] = ids
+        arrays[f"{key}__counts"] = counts
+        total = int(counts.sum()) if counts.size else 0
+        summary[group_name] = {
+            "unique_vertices": int(ids.size),
+            "total_assignments": total,
+            "top_count": int(counts[0]) if counts.size else 0,
+            "top_count_ratio": float(counts[0] / max(1, total)) if counts.size else 0.0,
+        }
+    arrays["group_names"] = np.asarray(sorted(semantic_vertex_counts), dtype=str)
+    np.savez_compressed(output_path, **arrays)
+    return summary
 
 
 def save_overlay(
@@ -339,6 +380,7 @@ def main() -> int:
     hand_lm_mean: list[float] = []
     face_group_means: dict[str, list[float]] = {}
     hand_group_means: dict[str, list[float]] = {}
+    semantic_vertex_counts: dict[str, Counter[int]] = {}
     hand_wrong_side = 0
     hand_matches = 0
     duplicate_side_views = 0
@@ -388,6 +430,7 @@ def main() -> int:
                     width,
                 )
                 append_group_means(face_group_means, "", face_groups)
+                accumulate_semantic_vertices(semantic_vertex_counts, "face.", face_groups)
                 stats["semantic_groups"] = face_groups
                 view_row["face_pull"] = stats
 
@@ -436,6 +479,7 @@ def main() -> int:
                     width,
                 )
                 append_group_means(hand_group_means, f"{side}.", hand_groups)
+                accumulate_semantic_vertices(semantic_vertex_counts, f"{side}.", hand_groups)
                 stats["semantic_groups"] = hand_groups
                 hand_rows.append({"hand_index": int(hand_idx), **stats})
             if len(matched_sides_this_view) >= 2 and len(set(matched_sides_this_view)) < len(matched_sides_this_view):
@@ -447,6 +491,12 @@ def main() -> int:
         face_detector.close()
     if hand_detector is not None and hasattr(hand_detector, "close"):
         hand_detector.close()
+
+    semantic_payload_path = out / "semantic_correspondence_payload.npz"
+    semantic_correspondence_summary = write_semantic_correspondence_payload(
+        semantic_payload_path,
+        semantic_vertex_counts,
+    )
 
     summary = {
         "task": "connected_surface_landmark_pull_audit",
@@ -469,6 +519,8 @@ def main() -> int:
         "hand_lm_to_mesh_mean_px": summarize(hand_lm_mean),
         "face_semantic_group_lm_to_mesh_mean_px": summarize_group_means(face_group_means),
         "hand_semantic_group_lm_to_mesh_mean_px": summarize_group_means(hand_group_means),
+        "semantic_correspondence_payload": semantic_payload_path,
+        "semantic_correspondence_summary": semantic_correspondence_summary,
         "hand_matches": int(hand_matches),
         "hand_wrong_side_proxy": int(hand_wrong_side),
         "hand_duplicate_side_views": int(duplicate_side_views),
@@ -495,6 +547,8 @@ def main() -> int:
         f"- hand lm->mesh mean px: `{summary['hand_lm_to_mesh_mean_px']}`",
         f"- face semantic group lm->mesh mean px: `{summary['face_semantic_group_lm_to_mesh_mean_px']}`",
         f"- hand semantic group lm->mesh mean px: `{summary['hand_semantic_group_lm_to_mesh_mean_px']}`",
+        f"- semantic correspondence payload: `{str(semantic_payload_path).replace(chr(92), '/')}`",
+        f"- semantic correspondence summary: `{semantic_correspondence_summary}`",
         f"- hand matches: `{hand_matches}`",
         f"- hand duplicate-side views: `{duplicate_side_views}`",
         f"- overlays: `{[str(p).replace(chr(92), '/') for p in overlays]}`",
@@ -516,6 +570,7 @@ def main() -> int:
                         "hand_lm_to_mesh_mean_px",
                         "face_semantic_group_lm_to_mesh_mean_px",
                         "hand_semantic_group_lm_to_mesh_mean_px",
+                        "semantic_correspondence_payload",
                         "overlays",
                     )
                 }

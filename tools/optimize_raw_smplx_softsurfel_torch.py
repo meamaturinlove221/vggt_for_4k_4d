@@ -67,6 +67,60 @@ PART_ALIASES = {
     "lower": 5,
 }
 
+FACE_LANDMARK_GROUPS = {
+    "face_oval": [
+        10,
+        338,
+        297,
+        332,
+        284,
+        251,
+        389,
+        356,
+        454,
+        323,
+        361,
+        288,
+        397,
+        365,
+        379,
+        378,
+        400,
+        377,
+        152,
+        148,
+        176,
+        149,
+        150,
+        136,
+        172,
+        58,
+        132,
+        93,
+        234,
+        127,
+        162,
+        21,
+        54,
+        103,
+        67,
+        109,
+    ],
+    "central_nose": [1, 2, 4, 5, 6, 19, 45, 94, 97, 98, 129, 168, 195, 197, 275, 326, 327],
+    "left_eye": [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246],
+    "right_eye": [263, 249, 390, 373, 374, 380, 381, 382, 362, 398, 384, 385, 386, 387, 388, 466],
+    "mouth": [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308],
+}
+
+HAND_LANDMARK_GROUPS = {
+    "palm": [0, 1, 5, 9, 13, 17],
+    "thumb": [1, 2, 3, 4],
+    "index": [5, 6, 7, 8],
+    "middle": [9, 10, 11, 12],
+    "ring": [13, 14, 15, 16],
+    "pinky": [17, 18, 19, 20],
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -353,6 +407,19 @@ def parse_args() -> argparse.Namespace:
             "from matching both detections to the same connected hand side."
         ),
     )
+    parser.add_argument(
+        "--semantic-landmark-payload",
+        type=Path,
+        help=(
+            "Optional diagnostic payload from audit_connected_surface_landmark_pull.py. "
+            "When used with semantic landmark weights, face/hand landmark subgroups are "
+            "matched only to their audited connected-vertex correspondences."
+        ),
+    )
+    parser.add_argument("--semantic-face-landmark-weight", type=float, default=0.0)
+    parser.add_argument("--semantic-hand-landmark-weight", type=float, default=0.0)
+    parser.add_argument("--semantic-landmark-bidir-weight", type=float, default=0.05)
+    parser.add_argument("--semantic-landmark-min-vertices", type=int, default=3)
     parser.add_argument("--hand-landmark-min-points", type=int, default=12)
     parser.add_argument("--hand-landmark-min-confidence", type=float, default=0.02)
     parser.add_argument(
@@ -467,6 +534,33 @@ def parse_part_id_spec(spec: str) -> list[int]:
         else:
             out.append(int(value))
     return sorted(set(out))
+
+
+def load_semantic_landmark_payload(
+    payload_path: Path | None,
+    *,
+    vertex_count: int,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    if payload_path is None:
+        return {}
+    path = payload_path.expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Semantic landmark payload not found: {path}")
+    out: dict[str, torch.Tensor] = {}
+    with np.load(path, allow_pickle=False) as payload:
+        if "group_names" not in payload.files:
+            raise ValueError(f"{path} does not contain group_names")
+        for raw_name in payload["group_names"].astype(str).tolist():
+            name = str(raw_name)
+            array_key = name.replace(".", "__") + "__ids"
+            if array_key not in payload.files:
+                continue
+            ids = np.asarray(payload[array_key], dtype=np.int64)
+            ids = ids[(ids >= 0) & (ids < int(vertex_count))]
+            if ids.size:
+                out[name] = torch.from_numpy(np.unique(ids).astype(np.int64)).to(device=device)
+    return out
 
 
 def image_edge_distance(rgb: np.ndarray, mask: np.ndarray, low: float, high: float, mask_dilate: int) -> tuple[np.ndarray, dict[str, Any]]:
@@ -1706,6 +1800,122 @@ def hand_landmark_projection_loss(
     }
 
 
+def semantic_landmark_projection_losses(
+    vertices: torch.Tensor,
+    semantic_ids: dict[str, torch.Tensor],
+    view_payloads: list[dict[str, Any]],
+    height: int,
+    width: int,
+    *,
+    bidirectional_weight: float,
+    min_vertices: int,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    if not semantic_ids:
+        zero = vertices.sum() * 0.0
+        return zero, zero, {"enabled": False, "reason": "no_semantic_payload"}
+
+    scale = float(max(height, width))
+
+    def projected_vertices(vertex_ids: torch.Tensor, payload: dict[str, Any]) -> torch.Tensor | None:
+        if vertex_ids.numel() < int(min_vertices):
+            return None
+        selected = vertices.index_select(0, vertex_ids)
+        uv, z, _ = project_points(selected, payload["world_to_cam"], payload["intrinsic"])
+        valid = (
+            (z > 1e-5)
+            & (uv[:, 0] >= 0.0)
+            & (uv[:, 0] <= width - 1)
+            & (uv[:, 1] >= 0.0)
+            & (uv[:, 1] <= height - 1)
+        )
+        if int(valid.float().sum().detach().cpu()) < int(min_vertices):
+            return None
+        return uv[valid] / scale
+
+    def subset_landmarks(landmarks: torch.Tensor, indices: list[int]) -> torch.Tensor | None:
+        usable = [idx for idx in indices if 0 <= int(idx) < int(landmarks.shape[0])]
+        if not usable:
+            return None
+        index_t = torch.as_tensor(usable, dtype=torch.long, device=landmarks.device)
+        return landmarks.index_select(0, index_t)[:, :2] / scale
+
+    def chamfer(landmarks_xy: torch.Tensor, uv_valid: torch.Tensor) -> torch.Tensor:
+        dists = torch.cdist(landmarks_xy, uv_valid)
+        return dists.min(dim=1).values.mean() + float(bidirectional_weight) * dists.min(dim=0).values.mean()
+
+    face_losses: list[torch.Tensor] = []
+    hand_losses: list[torch.Tensor] = []
+    face_terms: dict[str, int] = {name: 0 for name in FACE_LANDMARK_GROUPS}
+    hand_terms: dict[str, int] = {}
+    face_views = 0
+    hand_views = 0
+    hand_matches = 0
+    for payload in view_payloads:
+        view_face_used = False
+        landmarks = payload.get("face_landmarks_t")
+        if landmarks is not None and landmarks.numel() > 0:
+            for group_name, group_indices in FACE_LANDMARK_GROUPS.items():
+                ids = semantic_ids.get(f"face.{group_name}")
+                if ids is None:
+                    continue
+                landmarks_xy = subset_landmarks(landmarks, group_indices)
+                uv_valid = projected_vertices(ids, payload)
+                if landmarks_xy is None or uv_valid is None:
+                    continue
+                face_losses.append(chamfer(landmarks_xy, uv_valid))
+                face_terms[group_name] = face_terms.get(group_name, 0) + 1
+                view_face_used = True
+        if view_face_used:
+            face_views += 1
+
+        hand_sets = payload.get("hand_landmarks_t") or []
+        if hand_sets:
+            view_hand_used = False
+            for hand_landmarks in hand_sets:
+                best: tuple[torch.Tensor, str, int] | None = None
+                for side in ("left_hand", "right_hand"):
+                    side_losses: list[torch.Tensor] = []
+                    side_terms = 0
+                    for group_name, group_indices in HAND_LANDMARK_GROUPS.items():
+                        ids = semantic_ids.get(f"{side}.{group_name}")
+                        if ids is None:
+                            continue
+                        landmarks_xy = subset_landmarks(hand_landmarks, group_indices)
+                        uv_valid = projected_vertices(ids, payload)
+                        if landmarks_xy is None or uv_valid is None:
+                            continue
+                        side_losses.append(chamfer(landmarks_xy, uv_valid))
+                        side_terms += 1
+                    if side_losses:
+                        side_loss = torch.stack(side_losses).mean()
+                        if best is None or float(side_loss.detach().cpu()) < float(best[0].detach().cpu()):
+                            best = (side_loss, side, side_terms)
+                if best is None:
+                    continue
+                best_loss, side, side_terms = best
+                hand_losses.append(best_loss)
+                hand_terms[side] = hand_terms.get(side, 0) + int(side_terms)
+                hand_matches += 1
+                view_hand_used = True
+            if view_hand_used:
+                hand_views += 1
+
+    zero = vertices.sum() * 0.0
+    face_loss = torch.stack(face_losses).mean() if face_losses else zero
+    hand_loss = torch.stack(hand_losses).mean() if hand_losses else zero
+    return face_loss, hand_loss, {
+        "enabled": True,
+        "payload_groups": sorted(semantic_ids.keys()),
+        "face_views": float(face_views),
+        "face_terms": face_terms,
+        "hand_views": float(hand_views),
+        "hand_matches": float(hand_matches),
+        "hand_terms": hand_terms,
+        "face_reason": None if face_losses else "no_usable_semantic_face_terms",
+        "hand_reason": None if hand_losses else "no_usable_semantic_hand_terms",
+    }
+
+
 def compute_mask_metrics(rendered: np.ndarray, target: np.ndarray) -> dict[str, Any]:
     rendered = np.asarray(rendered, dtype=bool)
     target = np.asarray(target, dtype=bool)
@@ -2527,6 +2737,11 @@ def main() -> int:
         requested_device = "cpu"
     device = torch.device(requested_device)
     height = width = int(args.target_size)
+    semantic_landmark_ids = load_semantic_landmark_payload(
+        args.semantic_landmark_payload,
+        vertex_count=int(base_vertices_np.shape[0]),
+        device=device,
+    )
     view_payloads: list[dict[str, Any]] = []
     face_mp_module = None
     face_detector = None
@@ -2892,6 +3107,15 @@ def main() -> int:
             min_points=int(args.hand_landmark_min_points),
             unique_side=bool(args.hand_landmark_unique_side),
         )
+        semantic_face_landmark_loss, semantic_hand_landmark_loss, semantic_landmark_meta = semantic_landmark_projection_losses(
+            vertices=vertices,
+            semantic_ids=semantic_landmark_ids,
+            view_payloads=view_payloads,
+            height=height,
+            width=width,
+            bidirectional_weight=float(args.semantic_landmark_bidir_weight),
+            min_vertices=int(args.semantic_landmark_min_vertices),
+        )
         image_edge_loss, image_edge_meta = vertex_image_edge_loss(
             vertices=vertices,
             vertex_ids=image_edge_vertex_ids_t,
@@ -2928,6 +3152,8 @@ def main() -> int:
             + float(args.hair_boundary_weight) * hair_boundary_loss
             + float(args.face_landmark_weight) * face_landmark_loss
             + float(args.hand_landmark_weight) * hand_landmark_loss
+            + float(args.semantic_face_landmark_weight) * semantic_face_landmark_loss
+            + float(args.semantic_hand_landmark_weight) * semantic_hand_landmark_loss
             + float(args.image_edge_weight) * image_edge_loss
             + float(args.triangle_rgb_weight) * triangle_rgb_loss
             + float(args.triangle_gradient_weight) * triangle_gradient_loss
@@ -2960,6 +3186,9 @@ def main() -> int:
                     "face_landmark_meta": face_landmark_meta,
                     "hand_landmark_loss": float(hand_landmark_loss.detach().cpu()),
                     "hand_landmark_meta": hand_landmark_meta,
+                    "semantic_face_landmark_loss": float(semantic_face_landmark_loss.detach().cpu()),
+                    "semantic_hand_landmark_loss": float(semantic_hand_landmark_loss.detach().cpu()),
+                    "semantic_landmark_meta": semantic_landmark_meta,
                     "image_edge_loss": float(image_edge_loss.detach().cpu()),
                     "image_edge_meta": image_edge_meta,
                     "triangle_rgb_loss": float(triangle_rgb_loss.detach().cpu()),
@@ -3153,6 +3382,21 @@ def main() -> int:
             "They are not triangulated and do not create a hand teacher patch."
         ),
     }
+    semantic_landmark_stats = {
+        "payload": args.semantic_landmark_payload,
+        "payload_group_count": int(len(semantic_landmark_ids)),
+        "payload_groups": sorted(semantic_landmark_ids.keys()),
+        "face_weight": float(args.semantic_face_landmark_weight),
+        "hand_weight": float(args.semantic_hand_landmark_weight),
+        "bidirectional_weight": float(args.semantic_landmark_bidir_weight),
+        "min_vertices": int(args.semantic_landmark_min_vertices),
+        "last_meta": history[-1].get("semantic_landmark_meta") if history else None,
+        "note": (
+            "Semantic landmarks reuse an audit payload of connected vertex correspondences. "
+            "They are optional diagnostics for under-specified face/hand Chamfer terms, not "
+            "teacher surfaces and not a cloud unlock."
+        ),
+    }
     image_edge_stats = {
         "weight": float(args.image_edge_weight),
         "part_ids": [int(v) for v in image_edge_part_ids],
@@ -3247,6 +3491,7 @@ def main() -> int:
         "part_target_stats": part_target_stats,
         "face_landmarks": face_landmark_stats,
         "hand_landmarks": hand_landmark_stats,
+        "semantic_landmarks": semantic_landmark_stats,
         "image_edges": image_edge_stats,
         "triangle_rgb": triangle_rgb_stats,
         "hairline_free_offset": hairline_free_stats,
@@ -3316,6 +3561,9 @@ def main() -> int:
         f"- hand landmark unique-side: `{bool(args.hand_landmark_unique_side)}`",
         f"- hand landmark detected views: `{hand_landmark_stats['detected_views']}/{hand_landmark_stats['selected_views']}`",
         f"- hand landmark detected hands: `{hand_landmark_stats['detected_hands']}`",
+        f"- semantic landmark payload groups: `{semantic_landmark_stats['payload_group_count']}`",
+        f"- semantic face/hand landmark weights: `{float(args.semantic_face_landmark_weight)}` / `{float(args.semantic_hand_landmark_weight)}`",
+        f"- semantic landmark last meta: `{json_ready(semantic_landmark_stats['last_meta'])}`",
         f"- image edge weight: `{float(args.image_edge_weight)}`",
         f"- image edge part ids: `{image_edge_stats['part_ids']}`",
         f"- image edge usable views: `{image_edge_stats['usable_views']}/{image_edge_stats['selected_views']}`",
