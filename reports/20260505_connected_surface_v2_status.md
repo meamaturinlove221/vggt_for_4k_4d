@@ -706,6 +706,51 @@ connected-mesh rasterizer/visibility backend, preferably accelerated, rather
 than further tuning surfel splat weights, landmark weights, support thresholds,
 or r-candidates.
 
+## Local Accelerated Rasterizer Feasibility
+
+Local environment check:
+
+```text
+base python: Python 3.13.5, torch 2.9.0+cu126
+base cuda warning: RTX 5080 / sm_120 is not supported by that torch build
+
+g3splat python: Python 3.10.19, torch 2.9.1+cu130
+g3splat cuda_available = true
+GPU = NVIDIA GeForce RTX 5080
+```
+
+The `g3splat` environment is the only reasonable local GPU Python for this
+surface work. However:
+
+```text
+nvdiffrast installed = false
+pytorch3d installed = false
+kaolin installed = false
+pip index nvdiffrast = no matching distribution
+pip index pytorch3d = no matching distribution
+pip index kaolin = only kaolin 0.1
+cl compiler in PATH = false
+nvcc = CUDA 13.1
+```
+
+Interpretation:
+
+The next method-level step should use an actual accelerated differentiable
+rasterizer, but this local Windows environment does not currently expose a
+ready wheel or compiler path for `nvdiffrast` / `pytorch3d` / modern `kaolin`.
+Therefore it is valid to keep the CPU triangle renderer as a small correctness
+smoke, but it should not be brute-force scaled into 60-view training loops. A
+proper next implementation needs either:
+
+```text
+1. a prepared environment with nvdiffrast / PyTorch3D / Kaolin working on RTX 5080;
+2. a small custom CUDA extension compiled in a verified Visual Studio + CUDA path;
+3. or a cloud/local Linux environment after strict local design gates justify it.
+```
+
+This does not unblock cloud training; it only identifies the missing renderer
+backend required to move beyond proxy soft-splat objectives.
+
 ## Decision
 
 Do not:

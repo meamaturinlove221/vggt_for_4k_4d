@@ -2629,10 +2629,10 @@ def main() -> int:
         },
         "rasterized_surface_targets": export_summary,
         "current_blocker": (
-            "This is a CPU small-resolution soft surfel surface smoke. It adds differentiable "
-            "soft mask rendering, multi-view RGB consistency, and part-aware residual limits, "
-            "but it is not a full soft triangle renderer, not a strict-passing teacher, and "
-            "not a mentor candidate. It must not unblock cloud."
+            f"This is a CPU small-resolution raw surface smoke using the {str(args.renderer)} renderer. "
+            "It adds differentiable soft mask rendering, multi-view RGB consistency, and part-aware "
+            "residual limits, but it is not a production connected-surface backend, not a "
+            "strict-passing teacher, and not a mentor candidate. It must not unblock cloud."
         ),
         "next_required_action": (
             "Scale the renderer carefully, add true visibility/depth ordering and surface-to-view "
