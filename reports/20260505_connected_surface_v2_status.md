@@ -468,6 +468,80 @@ This confirms the current raw-image v2 carrier can be optimized locally, but it
 still lacks the surface representation/objective needed for a strict-passing
 head/face/hair teacher.
 
+## Connected Face Landmark Weak-Loss Diagnostic
+
+To avoid reviving the previously frozen floating MediaPipe face-patch route, the
+optimizer was extended with an optional weak 2D landmark reprojection loss:
+
+```text
+--face-landmarker-task
+--face-landmark-weight
+--face-landmark-bidir-weight
+--face-landmark-min-points
+```
+
+Important constraint:
+
+```text
+MediaPipe landmarks are not triangulated and no face patch is created.
+They only weakly constrain the already-connected SMPL-X / hybrid face vertices.
+```
+
+The base Python 3.13 environment does not provide `mediapipe`; the local
+`g3splat` environment does, so the landmark smoke was run with:
+
+```text
+D:\anaconda\envs\g3splat\python.exe
+```
+
+Short detection smoke:
+
+```text
+output/normal_line_multiview_20260505/landmark_loss_detect_stride10_smoke6_t96_step1
+```
+
+Detected face landmarks:
+
+```text
+detected views = 4 / 6
+mean inside-mask ratio = 0.8922594142259415
+face landmark vertex count = 943
+```
+
+This proves the 2D signal can be attached to the connected face mesh without
+constructing a floating teacher patch.
+
+The actual 40-step freeze-global diagnostic was:
+
+```text
+output/normal_line_multiview_20260505/smoothcap_face_landmark_freezeglobal_40step6_stride10_t96_s4000
+```
+
+Metrics:
+
+```text
+initial mean IoU = 0.7700232863426208
+optimized mean IoU = 0.7612533569335938
+IoU delta = -0.0087699294090271
+initial target recall = 0.8914699554443359
+optimized target recall = 0.8518168330192566
+target recall delta = -0.039653122425079346
+```
+
+Losses did move:
+
+```text
+face landmark loss: 0.10886478424072266 -> 0.10491538792848587
+photometric consistency: 0.12081477046012878 -> 0.11680746078491211
+hair boundary loss: 0.023661160841584206 -> 0.018935473635792732
+```
+
+But the hard rasterized metrics regressed, and the visual overlays remain a
+template-like connected shell rather than a modeled human face/head/hair
+surface. Therefore this is a negative diagnostic, not a teacher and not a
+candidate. Do not continue by tuning the landmark weight: the failure mode is
+representation/objective mismatch, not a missing scalar weight.
+
 ## Decision
 
 Do not:
@@ -478,6 +552,7 @@ cloud upload
 cloud train
 turn this into an r-candidate
 continue tuning offsets/support/threshold/view count
+continue tuning landmark loss weights
 ```
 
 Next non-redundant step:

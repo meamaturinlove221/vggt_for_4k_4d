@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_DIR = Path(__file__).resolve().parent
@@ -174,6 +174,35 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--face-landmarker-task",
+        type=Path,
+        help=(
+            "Optional MediaPipe FaceLandmarker task. When combined with --face-landmark-weight, "
+            "2D landmarks weakly constrain only the connected SMPL-X face vertices. This is a "
+            "raw-image diagnostic, not a floating face-patch teacher."
+        ),
+    )
+    parser.add_argument(
+        "--face-landmark-weight",
+        type=float,
+        default=0.0,
+        help="Weight for the connected-face projected landmark Chamfer loss. Disabled by default.",
+    )
+    parser.add_argument(
+        "--face-landmark-bidir-weight",
+        type=float,
+        default=0.10,
+        help="Small projected-face-to-landmark term to avoid a one-way nearest-vertex shortcut.",
+    )
+    parser.add_argument(
+        "--face-landmark-pad",
+        type=int,
+        default=-1,
+        help="Head crop pad in target-size pixels for landmark detection; negative uses 8 percent of target size.",
+    )
+    parser.add_argument("--face-landmark-min-points", type=int, default=80)
+    parser.add_argument("--face-landmark-min-confidence", type=float, default=0.02)
+    parser.add_argument(
         "--extra-hairline-surfels",
         type=int,
         default=0,
@@ -277,6 +306,148 @@ def boundary_points(mask: np.ndarray, max_points: int) -> np.ndarray:
     count = min(int(max_points), xs.size)
     indices = np.linspace(0, xs.size - 1, count).round().astype(np.int64)
     return np.stack([xs[indices], ys[indices]], axis=1).astype(np.float32)
+
+
+def resolve_scene_path(scene_dir: Path, raw: str | Path) -> Path:
+    path = Path(str(raw))
+    if path.is_absolute():
+        return path
+    candidate = scene_dir / path
+    if candidate.exists():
+        return candidate
+    return path
+
+
+def mask_bbox(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    ys, xs = np.nonzero(np.asarray(mask, dtype=bool))
+    if xs.size == 0 or ys.size == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def clamp_image_box(
+    box: tuple[int, int, int, int],
+    height: int,
+    width: int,
+) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = box
+    x0 = max(0, min(int(width), int(x0)))
+    y0 = max(0, min(int(height), int(y0)))
+    x1 = max(x0 + 1, min(int(width), int(x1)))
+    y1 = max(y0 + 1, min(int(height), int(y1)))
+    return x0, y0, x1, y1
+
+
+def head_box_from_mask_simple(mask: np.ndarray) -> tuple[int, int, int, int] | None:
+    bbox = mask_bbox(mask)
+    if bbox is None:
+        return None
+    x0, y0, x1, y1 = bbox
+    body_h = max(1, y1 - y0)
+    body_w = max(1, x1 - x0)
+    head_h = max(18, int(round(body_h * 0.45)))
+    raw = (
+        x0 - max(3, int(round(body_w * 0.04))),
+        y0 - max(3, int(round(body_h * 0.02))),
+        x1 + max(3, int(round(body_w * 0.04))),
+        min(y1, y0 + head_h) + max(3, int(round(body_h * 0.02))),
+    )
+    return clamp_image_box(raw, mask.shape[0], mask.shape[1])
+
+
+def load_image_mask_for_detection(image_path: Path, mask_path: Path, target_size: int) -> tuple[Image.Image, np.ndarray]:
+    image = Image.open(image_path).convert("RGB")
+    if image.size != (target_size, target_size):
+        image = image.resize((target_size, target_size), Image.Resampling.BICUBIC)
+    mask_image = Image.open(mask_path).convert("L")
+    if mask_image.size != (target_size, target_size):
+        mask_image = mask_image.resize((target_size, target_size), Image.Resampling.NEAREST)
+    mask = (np.asarray(mask_image, dtype=np.uint8) > 127)
+    return image, mask
+
+
+def create_face_landmarker(task_path: Path, min_confidence: float) -> tuple[Any | None, Any | None, dict[str, Any]]:
+    task_path = task_path.expanduser().resolve()
+    meta: dict[str, Any] = {
+        "requested": True,
+        "task_path": str(task_path),
+        "available": False,
+        "reason": None,
+    }
+    if not task_path.is_file():
+        meta["reason"] = "task_file_missing"
+        return None, None, meta
+    try:
+        import mediapipe as mp  # type: ignore
+        from mediapipe.tasks import python as mp_python  # type: ignore
+        from mediapipe.tasks.python import vision as mp_vision  # type: ignore
+    except Exception as exc:  # pragma: no cover - depends on local optional package
+        meta["reason"] = f"mediapipe_import_failed: {type(exc).__name__}: {exc}"
+        return None, None, meta
+    options = mp_vision.FaceLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=str(task_path)),
+        output_face_blendshapes=False,
+        output_facial_transformation_matrixes=False,
+        num_faces=1,
+        min_face_detection_confidence=float(min_confidence),
+        min_face_presence_confidence=float(min_confidence),
+        min_tracking_confidence=float(min_confidence),
+    )
+    detector = mp_vision.FaceLandmarker.create_from_options(options)
+    meta.update({"available": True, "reason": None})
+    return mp, detector, meta
+
+
+def detect_face_landmarks_2d(
+    *,
+    mp_module: Any,
+    detector: Any,
+    image_path: Path,
+    mask_path: Path,
+    target_size: int,
+    pad: int,
+) -> tuple[np.ndarray | None, dict[str, Any], Image.Image]:
+    image, mask = load_image_mask_for_detection(image_path, mask_path, target_size)
+    head_box = head_box_from_mask_simple(mask)
+    meta: dict[str, Any] = {"detected": False, "head_box": None, "landmarks": 0, "inside_mask_ratio": 0.0}
+    if head_box is None:
+        meta["reason"] = "no_head_box"
+        return None, meta, image
+    x0, y0, x1, y1 = head_box
+    x0, y0, x1, y1 = clamp_image_box((x0 - pad, y0 - pad, x1 + pad, y1 + pad), target_size, target_size)
+    if x1 <= x0 + 12 or y1 <= y0 + 12:
+        meta.update({"reason": "tiny_head_box", "head_box": [x0, y0, x1, y1]})
+        return None, meta, image
+    crop = image.crop((x0, y0, x1, y1)).resize((512, 512), Image.Resampling.BICUBIC)
+    result = detector.detect(mp_module.Image(image_format=mp_module.ImageFormat.SRGB, data=np.asarray(crop)))
+    if not result.face_landmarks:
+        meta.update({"reason": "no_facemesh", "head_box": [x0, y0, x1, y1]})
+        return None, meta, image
+    coords = []
+    for lm in result.face_landmarks[0]:
+        coords.append([x0 + float(lm.x) * (x1 - x0), y0 + float(lm.y) * (y1 - y0), float(lm.z)])
+    coords_np = np.asarray(coords, dtype=np.float32)
+    xi = np.clip(np.rint(coords_np[:, 0]).astype(np.int32), 0, target_size - 1)
+    yi = np.clip(np.rint(coords_np[:, 1]).astype(np.int32), 0, target_size - 1)
+    inside = mask[yi, xi]
+    meta.update(
+        {
+            "detected": True,
+            "head_box": [x0, y0, x1, y1],
+            "landmarks": int(coords_np.shape[0]),
+            "inside_mask": int(inside.sum()),
+            "inside_mask_ratio": float(inside.mean()) if inside.size else 0.0,
+        }
+    )
+    return coords_np, meta, image
+
+
+def save_face_landmark_overlay(image: Image.Image, landmarks: np.ndarray, output_path: Path) -> None:
+    draw = image.copy()
+    drawer = ImageDraw.Draw(draw)
+    for x, y, _ in np.asarray(landmarks, dtype=np.float32):
+        drawer.ellipse((float(x) - 1.5, float(y) - 1.5, float(x) + 1.5, float(y) + 1.5), fill=(255, 32, 32))
+    draw.save(output_path)
 
 
 def coarse_part_target_masks(
@@ -729,6 +900,64 @@ def vertex_silhouette_boundary_loss(
     return stacked.mean(), {
         "visible_vertices": float(np.mean(visible_counts)) if visible_counts else 0.0,
         "views": float(len(losses)),
+    }
+
+
+def face_landmark_projection_loss(
+    vertices: torch.Tensor,
+    vertex_ids: torch.Tensor,
+    view_payloads: list[dict[str, Any]],
+    height: int,
+    width: int,
+    *,
+    bidirectional_weight: float,
+    min_points: int,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Weak 2D landmark constraint attached to the connected face mesh.
+
+    This intentionally does not triangulate or create a floating 3D face patch.
+    The only optimized geometry remains the connected surface vertices.
+    """
+
+    if vertex_ids.numel() == 0:
+        zero = vertices.sum() * 0.0
+        return zero, {"views": 0.0, "face_vertices": 0.0, "landmarks": 0.0, "reason": "no_face_vertices"}
+    selected = vertices.index_select(0, vertex_ids)
+    losses: list[torch.Tensor] = []
+    landmark_counts: list[float] = []
+    vertex_counts: list[float] = []
+    scale = float(max(height, width))
+    for payload in view_payloads:
+        landmarks = payload.get("face_landmarks_t")
+        if landmarks is None or landmarks.numel() < int(min_points) * 2:
+            continue
+        uv, z, _ = project_points(selected, payload["world_to_cam"], payload["intrinsic"])
+        valid = (
+            (z > 1e-5)
+            & (uv[:, 0] >= 0.0)
+            & (uv[:, 0] <= width - 1)
+            & (uv[:, 1] >= 0.0)
+            & (uv[:, 1] <= height - 1)
+        )
+        if int(valid.float().sum().detach().cpu()) < 8:
+            continue
+        uv_valid = uv[valid] / scale
+        landmarks_xy = landmarks[:, :2] / scale
+        dists = torch.cdist(landmarks_xy, uv_valid)
+        lm_to_mesh = dists.min(dim=1).values.mean()
+        mesh_to_lm = dists.min(dim=0).values.mean()
+        losses.append(lm_to_mesh + float(bidirectional_weight) * mesh_to_lm)
+        landmark_counts.append(float(landmarks_xy.shape[0]))
+        vertex_counts.append(float(uv_valid.shape[0]))
+    if not losses:
+        zero = vertices.sum() * 0.0
+        return zero, {"views": 0.0, "face_vertices": 0.0, "landmarks": 0.0, "reason": "no_usable_landmark_views"}
+    stacked = torch.stack(losses)
+    return stacked.mean(), {
+        "views": float(len(losses)),
+        "mean_face_vertices": float(np.mean(vertex_counts)) if vertex_counts else 0.0,
+        "mean_landmarks": float(np.mean(landmark_counts)) if landmark_counts else 0.0,
+        "reason": None,
     }
 
 
@@ -1446,6 +1675,7 @@ def main() -> int:
     faces_np = np.asarray(mesh["faces"], dtype=np.int32)
     normals_np = compute_vertex_normals(base_vertices_np, faces_np).astype(np.float32)
     vertex_parts_np = classify_vertex_parts(np.asarray(static_features["canonical_positions"], dtype=np.float32))
+    face_landmark_vertex_mask_np = vertex_parts_np == 3
     connected_template_summary: dict[str, Any] | None = None
     hair_outer_vertex_ids_np = np.zeros((0,), dtype=np.int64)
     if args.connected_template_payload:
@@ -1467,6 +1697,13 @@ def main() -> int:
                 template_base_count + 2 * hair_ring_count,
                 dtype=np.int64,
             )
+            if "face_front_vertex_mask" in payload.files:
+                template_face_mask = np.asarray(payload["face_front_vertex_mask"], dtype=bool)
+                face_landmark_vertex_mask_np = np.zeros((base_vertices_np.shape[0],), dtype=bool)
+                copy_count = min(template_face_mask.shape[0], face_landmark_vertex_mask_np.shape[0])
+                face_landmark_vertex_mask_np[:copy_count] = template_face_mask[:copy_count]
+            else:
+                face_landmark_vertex_mask_np = vertex_parts_np == 3
         normals_np = compute_vertex_normals(base_vertices_np, faces_np).astype(np.float32)
         connected_template_summary = {
             "payload": template_payload,
@@ -1479,6 +1716,8 @@ def main() -> int:
                 "It is not a teacher and does not permit cloud."
             ),
         }
+    if face_landmark_vertex_mask_np.shape[0] != base_vertices_np.shape[0] or int(face_landmark_vertex_mask_np.sum()) < 16:
+        face_landmark_vertex_mask_np = vertex_parts_np == 3
     part_limits_np, part_reg_weights_np = make_part_limits(vertex_parts_np, args)
     edges_np = unique_edges(faces_np)
 
@@ -1513,10 +1752,35 @@ def main() -> int:
     device = torch.device(requested_device)
     height = width = int(args.target_size)
     view_payloads: list[dict[str, Any]] = []
+    face_mp_module = None
+    face_detector = None
+    face_landmarker_meta: dict[str, Any] = {"requested": bool(args.face_landmarker_task), "available": False}
+    face_landmark_overlay_paths: list[Path] = []
+    face_landmark_rows: list[dict[str, Any]] = []
+    if args.face_landmarker_task is not None:
+        face_mp_module, face_detector, face_landmarker_meta = create_face_landmarker(
+            args.face_landmarker_task,
+            min_confidence=float(args.face_landmark_min_confidence),
+        )
+        if float(args.face_landmark_weight) > 0.0 and face_detector is None:
+            raise RuntimeError(
+                "Face landmark loss was requested, but the detector is unavailable: "
+                f"{face_landmarker_meta.get('reason')}"
+            )
+    face_landmark_pad = (
+        int(args.face_landmark_pad)
+        if int(args.face_landmark_pad) >= 0
+        else max(4, int(round(float(height) * 0.08)))
+    )
+    face_landmark_overlay_dir = output_dir / "face_landmark_overlays"
+    if face_detector is not None:
+        face_landmark_overlay_dir.mkdir(parents=True, exist_ok=True)
     for view_idx in selected_indices:
         view = views[view_idx]
         camera_id = str(view["camera_id"]).zfill(2)
         scene = load_scene_view(scene_dir, view_idx, (height, width))
+        image_path = resolve_scene_path(scene_dir, view["image_path"])
+        mask_path = resolve_scene_path(scene_dir, view["mask_path"])
         rgb_np = normalize_rgb(scene.rgb)
         mask_np = np.asarray(scene.mask, dtype=bool)
         intrinsic_np = align_intrinsics_for_loaded_scene_view(
@@ -1532,10 +1796,29 @@ def main() -> int:
             hairline_frac=float(args.hairline_target_frac),
             hand_side_frac=float(args.hand_side_target_frac),
         )
+        face_landmarks_np: np.ndarray | None = None
+        face_meta: dict[str, Any] = {"detected": False, "reason": "face_landmarker_disabled"}
+        if face_detector is not None and face_mp_module is not None:
+            face_landmarks_np, face_meta, face_image = detect_face_landmarks_2d(
+                mp_module=face_mp_module,
+                detector=face_detector,
+                image_path=image_path,
+                mask_path=mask_path,
+                target_size=height,
+                pad=face_landmark_pad,
+            )
+            if face_landmarks_np is not None and len(face_landmark_overlay_paths) < int(args.overlay_limit):
+                overlay_path = face_landmark_overlay_dir / f"view_{view_idx:02d}_cam{camera_id}_landmarks.png"
+                save_face_landmark_overlay(face_image, face_landmarks_np, overlay_path)
+                face_landmark_overlay_paths.append(overlay_path)
+        face_meta.update({"view_index": int(view_idx), "camera_id": camera_id})
+        face_landmark_rows.append(json_ready(face_meta))
         view_payloads.append(
             {
                 "view_index": int(view_idx),
                 "camera_id": camera_id,
+                "image_path": image_path,
+                "mask_path": mask_path,
                 "rgb": rgb_np,
                 "mask": mask_np,
                 "rgb_t": torch.from_numpy(rgb_np).permute(2, 0, 1)[None].to(device=device),
@@ -1551,8 +1834,17 @@ def main() -> int:
                 "world_to_cam": torch.from_numpy(world_to_cam_np).to(device=device),
                 "intrinsic_np": intrinsic_np,
                 "world_to_cam_np": world_to_cam_np,
+                "face_landmarks": face_landmarks_np,
+                "face_landmarks_t": (
+                    None
+                    if face_landmarks_np is None
+                    else torch.from_numpy(face_landmarks_np.astype(np.float32)).to(device=device)
+                ),
+                "face_landmark_meta": face_meta,
             }
         )
+    if face_detector is not None and hasattr(face_detector, "close"):
+        face_detector.close()
 
     base_vertices = torch.from_numpy(base_vertices_np).to(device=device)
     base_normals = torch.from_numpy(normals_np).to(device=device)
@@ -1567,6 +1859,7 @@ def main() -> int:
     center = torch.from_numpy(base_vertices_np.mean(axis=0, keepdims=True).astype(np.float32)).to(device=device)
     hairline_vertex_mask_t = torch.from_numpy((vertex_parts_np == 4).astype(np.float32))[:, None].to(device=device)
     hair_outer_vertex_ids_t = torch.from_numpy(hair_outer_vertex_ids_np.astype(np.int64)).to(device=device)
+    face_landmark_vertex_ids_t = torch.from_numpy(np.nonzero(face_landmark_vertex_mask_np)[0].astype(np.int64)).to(device=device)
 
     delta_t = torch.zeros(3, device=device, requires_grad=True)
     log_scale = torch.zeros(1, device=device, requires_grad=True)
@@ -1669,6 +1962,15 @@ def main() -> int:
             height=height,
             width=width,
         )
+        face_landmark_loss, face_landmark_meta = face_landmark_projection_loss(
+            vertices=vertices,
+            vertex_ids=face_landmark_vertex_ids_t,
+            view_payloads=view_payloads,
+            height=height,
+            width=width,
+            bidirectional_weight=float(args.face_landmark_bidir_weight),
+            min_points=int(args.face_landmark_min_points),
+        )
 
         if bool(args.freeze_global_transform):
             global_reg = delta_t.sum() * 0.0 + log_scale.sum() * 0.0
@@ -1688,6 +1990,7 @@ def main() -> int:
             + float(args.boundary_weight) * boundary_loss
             + float(args.part_recall_weight) * part_loss
             + float(args.hair_boundary_weight) * hair_boundary_loss
+            + float(args.face_landmark_weight) * face_landmark_loss
             + float(args.photo_weight) * photo_loss
             + global_reg
             + float(args.offset_reg) * offset_reg
@@ -1711,6 +2014,8 @@ def main() -> int:
                     "part_recall_meta": part_meta,
                     "hair_boundary_loss": float(hair_boundary_loss.detach().cpu()),
                     "hair_boundary_meta": hair_boundary_meta,
+                    "face_landmark_loss": float(face_landmark_loss.detach().cpu()),
+                    "face_landmark_meta": face_landmark_meta,
                     "photometric_consistency_loss": float(photo_loss.detach().cpu()),
                     "offset_reg": float(offset_reg.detach().cpu()),
                     "offset_smooth_reg": float(smooth_reg.detach().cpu()),
@@ -1820,6 +2125,32 @@ def main() -> int:
     surfel_part_ids_np = np.asarray(surfel_plan["part_ids"], dtype=np.int64)
     for part_id, part_name in PART_NAMES.items():
         surfel_part_stats[part_name] = int((surfel_part_ids_np == int(part_id)).sum())
+    face_landmark_detected = [row for row in face_landmark_rows if bool(row.get("detected"))]
+    face_landmark_stats = {
+        "detector": face_landmarker_meta,
+        "weight": float(args.face_landmark_weight),
+        "bidirectional_weight": float(args.face_landmark_bidir_weight),
+        "pad": int(face_landmark_pad),
+        "face_vertex_count": int(face_landmark_vertex_mask_np.sum()),
+        "detected_views": int(len(face_landmark_detected)),
+        "selected_views": int(len(view_payloads)),
+        "mean_landmarks": (
+            float(np.mean([float(row.get("landmarks", 0)) for row in face_landmark_detected]))
+            if face_landmark_detected
+            else 0.0
+        ),
+        "mean_inside_mask_ratio": (
+            float(np.mean([float(row.get("inside_mask_ratio", 0.0)) for row in face_landmark_detected]))
+            if face_landmark_detected
+            else 0.0
+        ),
+        "rows": face_landmark_rows,
+        "overlay_paths": face_landmark_overlay_paths,
+        "note": (
+            "These landmarks are used only as optional 2D weak constraints on the connected face mesh. "
+            "They are not triangulated and do not create a face teacher patch."
+        ),
+    }
 
     truthful_status = "raw_softsurfel_surface_smoke_complete_not_teacher_or_candidate"
     export_summary = None
@@ -1867,6 +2198,7 @@ def main() -> int:
         "part_stats": part_stats,
         "surfel_part_stats": surfel_part_stats,
         "part_target_stats": part_target_stats,
+        "face_landmarks": face_landmark_stats,
         "hairline_free_offset": hairline_free_stats,
         "extra_hairline": extra_hairline_summary,
         "optimization_history": history,
@@ -1924,6 +2256,9 @@ def main() -> int:
         f"- part recall weight: `{float(args.part_recall_weight)}`",
         f"- part target stats: `{json_ready(part_target_stats)}`",
         f"- hair boundary weight: `{float(args.hair_boundary_weight)}`",
+        f"- face landmark weight: `{float(args.face_landmark_weight)}`",
+        f"- face landmark detected views: `{face_landmark_stats['detected_views']}/{face_landmark_stats['selected_views']}`",
+        f"- face landmark vertex count: `{face_landmark_stats['face_vertex_count']}`",
         f"- extra hairline surfels: `{extra_hairline_summary.get('kept_points', 0)}`",
         f"- initial mean IoU: `{initial_iou['mean']}`",
         f"- optimized mean IoU: `{optimized_iou['mean']}`",
