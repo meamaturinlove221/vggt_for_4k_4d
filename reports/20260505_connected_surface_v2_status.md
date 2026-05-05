@@ -368,6 +368,60 @@ drops by about 3.5 points. This means the current soft-splat connected carrier
 still prefers a tighter template shell and does not form a mentor-valid raw
 surface. Do not continue scaling view count or surfel count as the next move.
 
+## Freeze-Global Transform Diagnostic
+
+The 6-view / 4000-surfel hair-boundary smoke ended with a global scale of about
+`0.953` and a non-trivial translation. This showed that the apparent IoU
+improvement was largely coming from shrinking/sliding the whole template shell,
+which directly conflicts with the full-body and hairline coverage requirement.
+
+The optimizer therefore gained an explicit `--freeze-global-transform` switch.
+With the same 6-view / 4000-surfel setup:
+
+```text
+output/normal_line_multiview_20260505/connected_surface_template_v2_0012_11_frame0000_smoothcap_hairboundary_freezeglobal_smoke6_t96_s4000
+```
+
+Metrics:
+
+```text
+initial mean IoU = 0.7700232863426208
+optimized mean IoU = 0.7720444798469543
+IoU delta = +0.002021193504333496
+initial target recall = 0.8914699554443359
+optimized target recall = 0.8888117671012878
+target recall delta = -0.0026581883430480957
+```
+
+Interpretation:
+
+Freezing the global transform prevents the bad hard-recall collapse, but it also
+removes nearly all of the previous IoU gain. That confirms the current
+soft-splat objective was mostly exploiting global template shrinkage rather than
+learning a better local human surface.
+
+The freeze-global export was also rasterized to original 6-view headshoulder and
+audited under a short output path to avoid an Open3D Windows long-path failure:
+
+```text
+output/surface_gate_freezeglobal_tmp
+```
+
+Strict teacher gate:
+
+```text
+overall numeric pass = false
+visual pass = false
+face_core pass = 2 / 6
+head_face pass = 2 / 6
+hairline pass = 0 / 6
+head pass = 2 / 6
+```
+
+Open3D still shows a template-like shell/cap rather than a normal human
+head/face/hair surface. This is not a teacher and does not unblock training or
+cloud.
+
 ## Decision
 
 Do not:

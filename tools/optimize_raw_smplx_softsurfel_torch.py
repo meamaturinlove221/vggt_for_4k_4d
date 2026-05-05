@@ -135,6 +135,15 @@ def parse_args() -> argparse.Namespace:
             "near the current rendered front depth in that view before its sampled RGB counts."
         ),
     )
+    parser.add_argument(
+        "--freeze-global-transform",
+        action="store_true",
+        help=(
+            "Keep the SMPL-X/global carrier scale and translation fixed. This is a local "
+            "upper-bound diagnostic to prevent the optimizer from improving IoU by shrinking "
+            "or sliding the entire template shell."
+        ),
+    )
     parser.add_argument("--translation-reg", type=float, default=0.05)
     parser.add_argument("--scale-reg", type=float, default=0.05)
     parser.add_argument("--offset-reg", type=float, default=0.35)
@@ -1563,7 +1572,7 @@ def main() -> int:
     log_scale = torch.zeros(1, device=device, requires_grad=True)
     normal_offsets = torch.zeros(base_vertices_np.shape[0], device=device, requires_grad=True)
     hairline_free_offsets = torch.zeros((base_vertices_np.shape[0], 3), device=device, requires_grad=True)
-    optimizer_params = [delta_t, log_scale, normal_offsets]
+    optimizer_params = [normal_offsets] if bool(args.freeze_global_transform) else [delta_t, log_scale, normal_offsets]
     if float(args.hairline_free_offset_limit) > 0.0:
         optimizer_params.append(hairline_free_offsets)
     optimizer = torch.optim.Adam(optimizer_params, lr=float(args.lr))
@@ -1574,7 +1583,10 @@ def main() -> int:
         bounded_offsets = torch.tanh(normal_offsets) * part_limits_t
         hairline_free = torch.tanh(hairline_free_offsets) * float(args.hairline_free_offset_limit)
         hairline_free = hairline_free * hairline_vertex_mask_t
-        vertices = center + torch.exp(log_scale).clamp(0.85, 1.15) * (base_vertices - center) + delta_t[None, :]
+        if bool(args.freeze_global_transform):
+            vertices = base_vertices
+        else:
+            vertices = center + torch.exp(log_scale).clamp(0.85, 1.15) * (base_vertices - center) + delta_t[None, :]
         vertices = vertices + base_normals * bounded_offsets[:, None]
         vertices = vertices + hairline_free
         surfels, surfel_normals = compute_surfels(vertices, faces_t, face_indices_t, barycentric_t)
@@ -1658,7 +1670,10 @@ def main() -> int:
             width=width,
         )
 
-        global_reg = float(args.translation_reg) * delta_t.square().sum() + float(args.scale_reg) * log_scale.square().sum()
+        if bool(args.freeze_global_transform):
+            global_reg = delta_t.sum() * 0.0 + log_scale.sum() * 0.0
+        else:
+            global_reg = float(args.translation_reg) * delta_t.square().sum() + float(args.scale_reg) * log_scale.square().sum()
         offset_values = bounded_offsets
         offset_reg = (part_reg_weights_t * offset_values.square()).mean()
         smooth_reg = (offset_values[edges_t[:, 0]] - offset_values[edges_t[:, 1]]).square().mean()
@@ -1712,7 +1727,10 @@ def main() -> int:
         final_offsets = torch.tanh(normal_offsets) * part_limits_t
         final_hairline_free = torch.tanh(hairline_free_offsets) * float(args.hairline_free_offset_limit)
         final_hairline_free = final_hairline_free * hairline_vertex_mask_t
-        optimized = center + torch.exp(log_scale).clamp(0.85, 1.15) * (base_vertices - center) + delta_t[None, :]
+        if bool(args.freeze_global_transform):
+            optimized = base_vertices
+        else:
+            optimized = center + torch.exp(log_scale).clamp(0.85, 1.15) * (base_vertices - center) + delta_t[None, :]
         optimized = optimized + base_normals * final_offsets[:, None]
         optimized = optimized + final_hairline_free
         optimized_np = optimized.detach().cpu().numpy().astype(np.float32)
@@ -1838,6 +1856,11 @@ def main() -> int:
             "camera_source": camera_source,
             "target_size": int(args.target_size),
         },
+        "global_transform": {
+            "freeze_global_transform": bool(args.freeze_global_transform),
+            "final_scale": float(torch.exp(log_scale.detach()).cpu().item()),
+            "final_translation": [float(v) for v in delta_t.detach().cpu().numpy().reshape(-1)],
+        },
         "config": vars(args),
         "part_names": PART_NAMES,
         "connected_template": connected_template_summary,
@@ -1893,6 +1916,7 @@ def main() -> int:
         f"- uses VGGT depth/point/normal: `False`",
         f"- creates teacher targets: `{bool(args.export_raster_targets)}`",
         f"- creates candidate predictions: `False`",
+        f"- freeze global transform: `{bool(args.freeze_global_transform)}`",
         f"- hairline free-offset enabled: `{hairline_free_stats['enabled']}`",
         f"- hairline free-offset p90: `{hairline_free_stats['p90_norm']}`",
         f"- balanced part surfels: `{bool(args.balanced_part_surfels)}`",
