@@ -77,6 +77,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--subdivision-levels", type=int, default=0)
+    parser.add_argument(
+        "--outer-layer-parts",
+        default="",
+        help=(
+            "Optional comma-separated part ids or names to duplicate as connected outer surface layers "
+            "before subdivision, e.g. 'hair,clothing'. This adds expressive carrier geometry for "
+            "non-SMPL hair/clothing without creating floating patches."
+        ),
+    )
+    parser.add_argument("--outer-layer-offset", type=float, default=0.025)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -387,6 +397,84 @@ def subdivide_selected_faces(
     }
 
 
+def add_connected_outer_layers(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    part_ids: np.ndarray,
+    face_front_mask: np.ndarray,
+    selected_parts: set[int],
+    *,
+    offset: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    vertices_np = np.asarray(vertices, dtype=np.float32)
+    faces_np = np.asarray(faces, dtype=np.int32)
+    part_ids_np = np.asarray(part_ids, dtype=np.int64)
+    face_front_np = np.asarray(face_front_mask, dtype=bool)
+    if float(offset) <= 0.0 or not selected_parts:
+        return vertices_np, faces_np, part_ids_np, face_front_np, {
+            "enabled": False,
+            "selected_parts": sorted(int(part) for part in selected_parts),
+            "offset": float(offset),
+            "new_vertices": 0,
+            "duplicated_faces": 0,
+            "stitch_faces": 0,
+        }
+
+    selected_vertex_mask = np.isin(part_ids_np, np.asarray(sorted(selected_parts), dtype=np.int64))
+    selected_face_mask = selected_vertex_mask[faces_np].all(axis=1)
+    selected_faces = faces_np[selected_face_mask]
+    if selected_faces.size == 0:
+        return vertices_np, faces_np, part_ids_np, face_front_np, {
+            "enabled": False,
+            "selected_parts": sorted(int(part) for part in selected_parts),
+            "offset": float(offset),
+            "new_vertices": 0,
+            "duplicated_faces": 0,
+            "stitch_faces": 0,
+            "reason": "no_all-selected_faces",
+        }
+
+    normals = compute_vertex_normals(vertices_np, faces_np).astype(np.float32)
+    used_vertices = np.unique(selected_faces.reshape(-1)).astype(np.int64)
+    old_to_new = {int(old): int(vertices_np.shape[0] + idx) for idx, old in enumerate(used_vertices.tolist())}
+    new_vertices = vertices_np[used_vertices] + float(offset) * normals[used_vertices]
+    duplicate_faces = np.asarray([[old_to_new[int(v)] for v in face] for face in selected_faces], dtype=np.int32)
+
+    edge_counts: dict[tuple[int, int], int] = {}
+    for face in selected_faces:
+        a, b, c = [int(v) for v in face.tolist()]
+        for u, v in ((a, b), (b, c), (c, a)):
+            key = (u, v) if u < v else (v, u)
+            edge_counts[key] = edge_counts.get(key, 0) + 1
+    stitch_faces: list[list[int]] = []
+    for (a, b), count in edge_counts.items():
+        if count != 1:
+            continue
+        na = old_to_new[int(a)]
+        nb = old_to_new[int(b)]
+        stitch_faces.append([int(a), int(b), int(nb)])
+        stitch_faces.append([int(a), int(nb), int(na)])
+    stitch_faces_np = np.asarray(stitch_faces, dtype=np.int32) if stitch_faces else np.zeros((0, 3), dtype=np.int32)
+
+    out_vertices = np.concatenate([vertices_np, new_vertices.astype(np.float32)], axis=0).astype(np.float32)
+    out_faces = np.concatenate([faces_np, duplicate_faces, stitch_faces_np], axis=0).astype(np.int32)
+    out_part_ids = np.concatenate([part_ids_np, part_ids_np[used_vertices]], axis=0).astype(np.int64)
+    out_face_front = np.concatenate([face_front_np, face_front_np[used_vertices]], axis=0).astype(bool)
+    return out_vertices, out_faces, out_part_ids, out_face_front, {
+        "enabled": True,
+        "selected_parts": sorted(int(part) for part in selected_parts),
+        "selected_part_names": [PART_NAMES[int(part)] for part in sorted(int(part) for part in selected_parts)],
+        "offset": float(offset),
+        "new_vertices": int(new_vertices.shape[0]),
+        "duplicated_faces": int(duplicate_faces.shape[0]),
+        "stitch_faces": int(stitch_faces_np.shape[0]),
+        "note": (
+            "Outer layers are connected duplicate surface sheets welded by boundary side faces. "
+            "They are carrier geometry only, not a teacher and not a visual pass."
+        ),
+    }
+
+
 def select_hair_ring(
     vertices: np.ndarray,
     normals: np.ndarray,
@@ -531,6 +619,10 @@ def write_report(path: Path, summary: dict[str, Any]) -> None:
         f"hair seam vertices = {summary['hair_cap']['ring_vertices']}",
         f"hair cap new vertices = {summary['hair_cap']['new_vertices']}",
         f"hair cap faces = {summary['hair_cap']['faces']}",
+        f"outer layer enabled = {summary['outer_layer']['enabled']}",
+        f"outer layer parts = {summary['outer_layer'].get('selected_part_names', [])}",
+        f"outer layer new vertices = {summary['outer_layer']['new_vertices']}",
+        f"outer layer faces = {summary['outer_layer']['duplicated_faces'] + summary['outer_layer']['stitch_faces']}",
         f"local subdivision enabled = {summary['subdivision']['enabled']}",
         f"local subdivision levels = {summary['subdivision']['levels']}",
         f"local subdivision parts = {summary['subdivision']['selected_part_names']}",
@@ -637,6 +729,16 @@ def main() -> int:
         ],
         axis=0,
     )
+    selected_outer_layer_parts = parse_subdivide_parts(args.outer_layer_parts)
+    outer_layer_summary: dict[str, Any]
+    hybrid_vertices, hybrid_faces, hybrid_part_ids, hybrid_face_front_mask, outer_layer_summary = add_connected_outer_layers(
+        hybrid_vertices,
+        hybrid_faces,
+        hybrid_part_ids,
+        hybrid_face_front_mask,
+        selected_outer_layer_parts,
+        offset=float(args.outer_layer_offset),
+    )
     selected_subdivide_parts = parse_subdivide_parts(args.subdivide_parts)
     subdivision_summary: dict[str, Any]
     hybrid_vertices, hybrid_faces, hybrid_part_ids, hybrid_face_front_mask, subdivision_summary = subdivide_selected_faces(
@@ -708,6 +810,8 @@ def main() -> int:
         left_hand_vertex_mask=region_masks["left_hand"].astype(bool),
         right_hand_vertex_mask=region_masks["right_hand"].astype(bool),
         lower_clothing_vertex_mask=region_masks["lower_clothing_proxy"].astype(bool),
+        outer_layer_selected_parts=np.asarray(outer_layer_summary["selected_parts"], dtype=np.int64),
+        outer_layer_offset=np.asarray([float(outer_layer_summary["offset"])], dtype=np.float32),
         subdivision_selected_parts=np.asarray(subdivision_summary["selected_parts"], dtype=np.int64),
         subdivision_levels=np.asarray([int(subdivision_summary["levels"])], dtype=np.int64),
     )
@@ -729,6 +833,7 @@ def main() -> int:
             "up_offset": float(args.hair_up_offset),
             "cap_height": float(args.hair_cap_height),
         },
+        "outer_layer": outer_layer_summary,
         "subdivision": subdivision_summary,
         "regions": regions,
         "thresholds": masks["thresholds"],

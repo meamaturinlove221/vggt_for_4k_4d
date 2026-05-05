@@ -1368,3 +1368,87 @@ surface just by adding appearance losses. The next method-level change must
 increase the surface representation itself, for example explicit connected
 outer garment / hair surface layers or a learned surface-token decoder. Do not
 spend more cycles only increasing triangle steps, weights, or face budgets.
+
+## Connected Surface v2.4 Outer Hair / Clothing Layer
+
+v2.4 implements the first representation-level change after the RGB/gradient
+objective: optional connected outer surface layers in the template builder.
+
+New builder arguments:
+
+```text
+--outer-layer-parts
+--outer-layer-offset
+```
+
+The outer layer duplicates selected connected part faces, offsets them along
+vertex normals, and welds the duplicate sheet back to the original surface with
+boundary side faces. It is carrier geometry only: no VGGT geometry is used and
+no teacher/candidate is produced.
+
+Template:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_template_v24_outer_hair_clothing_subdiv_facehairhandscloth
+```
+
+Carrier counts:
+
+```text
+base vertices = 10475
+base faces = 20908
+hybrid vertices = 39694
+hybrid faces = 79872
+outer layer parts = head_top_hairline, lower_clothing_proxy
+outer layer new vertices = 2798
+outer layer duplicated faces = 5580
+outer layer stitch faces = 282
+subdivision levels = 1
+subdivision parts = left_hand, right_hand, head_face, head_top_hairline, lower_clothing_proxy
+```
+
+Smoke run:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_v24_outer_imageedge_landmark_smoke6_t96_step20
+```
+
+Metrics:
+
+```text
+initial_iou.mean = 0.7711
+optimized_iou.mean = 0.7837
+iou_delta = +0.0126
+initial_target_recall.mean = 0.9495
+optimized_target_recall.mean = 0.9488
+target_recall_delta = -0.0008
+```
+
+Compared with v2.2, the outer layer gives much higher target coverage and the
+largest 2D IoU gain so far in this raw-image surface route. The Open3D result
+is also less broken as a full connected body carrier:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_v24_outer_imageedge_landmark_smoke6_t96_step20/open3d_review_full/solid_mesh/iso.png
+output/normal_line_multiview_20260506/connected_surface_v24_outer_imageedge_landmark_smoke6_t96_step20/open3d_review_full/solid_mesh/face_close.png
+output/normal_line_multiview_20260506/connected_surface_v24_outer_imageedge_landmark_smoke6_t96_step20/open3d_review_hands/solid_mesh/iso.png
+```
+
+Strict visual conclusion:
+
+```text
+v2.4 is still not a mentor-pass teacher. It improves the connected carrier and
+begins to express a head/hair and outer-clothing layer, but the surface remains
+template-driven. The face is not personalized enough, the hair layer is still a
+coarse cap, and hands remain weak/detail-poor. No original-6v strict teacher
+gate was run because Open3D visual precheck still fails.
+```
+
+Next non-redundant implication:
+
+The first outer-layer representation change is useful and should be preserved,
+but it is still hand-built geometry. The next step should not be another
+outer-layer offset/weight loop; it should either add a more targeted connected
+face/hair/hand surface parameterization or move to a learned surface-token
+decoder trained against a strict-passing dense target-frame surface. Cloud
+remains blocked.
