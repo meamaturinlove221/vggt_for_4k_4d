@@ -184,13 +184,91 @@ still missing, so it is not a strict teacher.
 
 ## Current Blockers
 
-1. Raw-camera surface is not yet bridged into the VGGT/reference prediction
-   depth/world protocol used by the current strict gate.
-2. Hairline coverage is still below the strict teacher threshold.
+1. Hairline coverage is still below the strict teacher threshold.
+2. The current global bridge is close but not strict enough: several views still
+   fail median depth residual (`>0.025m`) and view 3 has head/head_face coverage
+   and p90 depth residual failures.
 3. The renderer is a soft surfel smoke, not a true visibility/depth-ordered
    soft triangle renderer.
 4. No explicit Open3D visual review has passed.
 5. Full-body and hand strict candidate gates have not been run on this surface.
+
+## Protocol Bridge Diagnostic
+
+New tool:
+
+```text
+tools/audit_raw_surface_vggt_protocol_bridge.py
+```
+
+Run:
+
+```text
+output/normal_line_multiview_20260505/raw_softsurfel_surface_smoke6_t126_export6v/raw_to_vggt_protocol_bridge_headface
+```
+
+It estimates a single global similarity transform from the raw-camera surface
+target to the VGGT/reference prediction protocol using the `head_face` ROI. This
+is a diagnostic only; it is not a teacher pass.
+
+Estimated transform:
+
+```text
+scale = 0.5886290099
+det(rotation) ~= 1.0
+translation = [-0.0110, 0.1325, 1.0808]
+```
+
+Aggregate after bridge:
+
+| ROI | valid coverage | compatible coverage | residual p50 | residual p90 |
+| --- | ---: | ---: | ---: | ---: |
+| face_core | 0.8508 | 0.8385 | 0.0280 | 0.0414 |
+| head_face | 0.8596 | 0.7591 | 0.0313 | 0.0563 |
+| hairline | 0.6304 | 0.6255 | 0.0309 | 0.0388 |
+| head | 0.8596 | 0.7591 | 0.0313 | 0.0563 |
+
+Gate on transformed NPZ:
+
+```text
+numeric_pass = false
+visual_pass = false
+pass = false
+```
+
+Per-ROI transformed gate:
+
+```text
+face_core: 2 / 6 views pass
+head_face: 2 / 6 views pass
+hairline: 0 / 6 views pass
+head: 2 / 6 views pass
+```
+
+Meaning:
+
+- The raw/VGGT protocol mismatch is not a dead end: a global similarity transform
+  removes the previous roughly `2m` residual and brings most residuals close to
+  the current gate thresholds.
+- It is still not strict-passing. Hairline remains the hardest blocker, and the
+  median residual threshold is too tight for several views.
+- This supports continuing the raw-image surface backend route, but does not
+  permit cloud or teacher-supervised training.
+
+Extra fit comparison:
+
+```text
+fit_roi = face_core
+face_core compatible coverage = 0.8315
+head_face compatible coverage = 0.7077
+head_face residual p90 = 0.0657
+```
+
+Face-core-only bridge improves nothing overall and makes head/head_face worse.
+The current best non-cheating bridge remains a single global `head_face`-fit
+similarity. Per-view offsets or per-view threshold tuning should remain blocked
+because they would turn this into a protocol-fitting shortcut rather than a
+defensible surface bridge.
 
 ## Next Non-Wall Actions
 
@@ -198,9 +276,10 @@ Do not return to r-candidate threshold/confidence loops.
 
 Next actions should be:
 
-1. Add a truthful raw-camera to VGGT/reference protocol bridge diagnostic:
-   estimate whether a single similarity transform can align raw SMPL-X surface
-   depth to the chosen VGGT prediction protocol without destroying projection.
+1. Refine the bridge beyond a single global similarity only if it remains
+   geometrically meaningful and does not become a per-view cheat; test whether a
+   robust head/face weighted similarity or bounded affine scale explains the
+   remaining residuals.
 2. Improve hairline/head-top surface support using image boundary / mask-edge
    residuals rather than SMPL-X face/hair hard teacher.
 3. Add depth-ordered soft visibility or a soft triangle renderer, then rerun the
