@@ -775,6 +775,55 @@ important: the visual result is still a low-resolution SMPL-X-like template
 surface, not a normal-human Open3D surface with modeled face/hair/hands. This is
 therefore a renderer/backend direction signal, not a teacher pass.
 
+Attempting full all-face triangle rendering at `96px` with the current local GPU
+memory state failed with CUDA OOM, even with smaller chunks:
+
+```text
+output/normal_line_multiview_20260505/triangle_renderer_allfaces_cuda_smoke3_t96_step5_fchunk1024
+output/normal_line_multiview_20260505/triangle_renderer_allfaces_cuda_smoke3_t96_step5_chunk256
+```
+
+To avoid killing unrelated user GPU processes or brute-forcing memory, the next
+smoke used a deterministic `8000`-face budget:
+
+```text
+output/normal_line_multiview_20260505/triangle_renderer_budget8000_cuda_smoke3_t96_step5
+renderer = triangle
+triangle_render_face_budget = 8000
+views = 3
+steps = 5
+target size = 96
+global transform frozen = true
+```
+
+Metrics:
+
+```text
+initial mean IoU = 0.7690008282661438
+optimized mean IoU = 0.7756476402282715
+IoU delta = +0.0066468119621276855
+initial target recall = 0.8903587460517883
+optimized target recall = 0.8972101211547852
+target recall delta = +0.006851375102996826
+```
+
+Loss decreased monotonically:
+
+```text
+loss: 0.6194117069244385 -> 0.5563229918479919
+mask loss: 0.35480600595474243 -> 0.3121137320995331
+soft recall loss: 0.5641481876373291 -> 0.5190099477767944
+photometric consistency: 0.09914322942495346 -> 0.09848229587078094
+```
+
+Interpretation:
+
+The `96px` budgeted triangle smoke preserves the same non-collapsing direction,
+but sampled-face soft overlays remain speckled and the hard overlay is still
+only a coarse template silhouette. This is not enough for any teacher/candidate
+gate, but it is a stronger argument that future work should build or install a
+proper connected mesh rasterizer instead of continuing soft-splat proxy tuning.
+
 Interpretation:
 
 This is the first raw-surface diagnostic in this sequence where the optimized

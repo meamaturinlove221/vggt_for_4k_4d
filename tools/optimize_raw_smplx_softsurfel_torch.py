@@ -109,6 +109,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--triangle-face-chunk",
+        type=int,
+        default=256,
+        help="Number of faces processed per inner loop for --renderer triangle.",
+    )
+    parser.add_argument(
         "--depth-softness",
         type=float,
         default=0.0,
@@ -1959,6 +1965,7 @@ def save_soft_render_debug(
                     width=int(args.target_size),
                     pixel_chunk=int(args.render_pixel_chunk),
                     inside_softness=float(args.triangle_inside_softness),
+                    face_chunk=int(args.triangle_face_chunk),
                 )
             else:
                 render = render_soft_surfel_maps(
@@ -2299,6 +2306,7 @@ def main() -> int:
                     width=width,
                     pixel_chunk=int(args.render_pixel_chunk),
                     inside_softness=float(args.triangle_inside_softness),
+                    face_chunk=int(args.triangle_face_chunk),
                 )
             else:
                 render = render_soft_surfel_maps(
@@ -2644,6 +2652,7 @@ def main() -> int:
             "mode": str(args.renderer),
             "triangle_inside_softness": float(args.triangle_inside_softness),
             "triangle_render_face_budget": int(args.triangle_render_face_budget),
+            "triangle_face_chunk": int(args.triangle_face_chunk),
             "sampled_render_faces": int(render_face_indices_t.numel()),
             "note": (
                 "triangle mode is a connected-mesh visibility diagnostic. It is still not a production "
