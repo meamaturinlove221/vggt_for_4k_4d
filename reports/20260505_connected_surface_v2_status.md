@@ -422,6 +422,52 @@ Open3D still shows a template-like shell/cap rather than a normal human
 head/face/hair surface. This is not a teacher and does not unblock training or
 cloud.
 
+The same freeze-global setup was then run for 40 local optimization steps:
+
+```text
+output/normal_line_multiview_20260505/connected_surface_template_v2_0012_11_frame0000_smoothcap_hairboundary_freezeglobal_40step6_t96_s4000
+```
+
+Metrics:
+
+```text
+initial mean IoU = 0.7700232863426208
+optimized mean IoU = 0.7779861092567444
+IoU delta = +0.007962822914123535
+initial target recall = 0.8914699554443359
+optimized target recall = 0.8838089108467102
+target recall delta = -0.007661044597625732
+```
+
+Local residuals did move more than the 12-step smoke:
+
+```text
+hairline normal-offset mean = 0.004240455571562052
+hairline free-offset mean = 0.005870182067155838
+left/right hand mean offsets ~= 0.0027 - 0.0028
+```
+
+But after export + bridge + strict teacher gate:
+
+```text
+output/surface_40step_gate_tmp
+
+overall numeric pass = false
+visual pass = false
+face_core pass = 2 / 6
+head_face pass = 2 / 6
+hairline pass = 0 / 6
+head pass = 2 / 6
+```
+
+Interpretation:
+
+More local steps allow the connected cap and hands to move by a few millimeters,
+but the optimized result is still a template shell with an incomplete hairline.
+This confirms the current raw-image v2 carrier can be optimized locally, but it
+still lacks the surface representation/objective needed for a strict-passing
+head/face/hair teacher.
+
 ## Decision
 
 Do not:
