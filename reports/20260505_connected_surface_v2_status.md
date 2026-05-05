@@ -1620,3 +1620,47 @@ The hand-side ambiguity is no longer the main blocker. The next issue is lack of
 semantic correspondence inside each hand and face region. A stronger method
 would need per-finger / central-face correspondences or a learned surface-token
 decoder; simply increasing the unique-side landmark weight is a loop.
+
+## Semantic Landmark Pull Audit
+
+I extended the connected landmark audit to split MediaPipe landmarks into
+semantic groups. This remains diagnostic only: it produces no teacher, no
+candidate, and no cloud unlock.
+
+Run:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_v24_outer_triangle_rgbgrad_allfaces_smoke2_t64_step5/landmark_semantic_pull_audit
+```
+
+Face group pull, sorted by failure tail:
+
+```text
+mouth:        mean 10.84 px, p90 22.92 px, max 30.64 px
+central_nose: mean  9.02 px, p90 19.98 px, max 26.77 px
+face_oval:    mean  8.68 px, p90 18.39 px, max 24.21 px
+right_eye:    mean  7.91 px, p90 18.11 px, max 24.49 px
+left_eye:     mean  6.39 px, p90 14.98 px, max 19.49 px
+```
+
+Hand group pull shows the right hand has the largest failure tails:
+
+```text
+right_hand.index:  mean 5.23 px, p90 13.90 px, max 21.93 px
+right_hand.middle: mean 4.62 px, p90 12.21 px, max 19.20 px
+right_hand.thumb:  mean 4.68 px, p90 12.30 px, max 18.83 px
+right_hand.ring:   mean 4.25 px, p90 11.43 px, max 18.04 px
+right_hand.pinky:  mean 4.08 px, p90 11.02 px, max 17.43 px
+```
+
+Conclusion:
+
+```text
+The broad face/hand Chamfer loss is under-specified. The worst face failures are
+mouth and central nose, not just outer contour; the worst hand tails are
+per-finger on the right hand. This confirms that simple landmark weight
+increases are likely to pull the whole connected region rather than create
+modeled facial relief or articulated hand geometry. The next non-redundant step
+must introduce semantic surface correspondences or a learned surface-token
+decoder; this result is still a strict fail.
+```

@@ -42,6 +42,60 @@ PART_NAMES = {
     5: "lower_clothing_proxy",
 }
 
+FACE_LANDMARK_GROUPS = {
+    "face_oval": [
+        10,
+        338,
+        297,
+        332,
+        284,
+        251,
+        389,
+        356,
+        454,
+        323,
+        361,
+        288,
+        397,
+        365,
+        379,
+        378,
+        400,
+        377,
+        152,
+        148,
+        176,
+        149,
+        150,
+        136,
+        172,
+        58,
+        132,
+        93,
+        234,
+        127,
+        162,
+        21,
+        54,
+        103,
+        67,
+        109,
+    ],
+    "central_nose": [1, 2, 4, 5, 6, 19, 45, 94, 97, 98, 129, 168, 195, 197, 275, 326, 327],
+    "left_eye": [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246],
+    "right_eye": [263, 249, 390, 373, 374, 380, 381, 382, 362, 398, 384, 385, 386, 387, 388, 466],
+    "mouth": [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308],
+}
+
+HAND_LANDMARK_GROUPS = {
+    "palm": [0, 1, 5, 9, 13, 17],
+    "thumb": [1, 2, 3, 4],
+    "index": [5, 6, 7, 8],
+    "middle": [9, 10, 11, 12],
+    "ring": [13, 14, 15, 16],
+    "pinky": [17, 18, 19, 20],
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -153,6 +207,52 @@ def nearest_stats(landmarks_xy: np.ndarray, uv: np.ndarray, z: np.ndarray, heigh
     }
 
 
+def add_nearest_part_stats(stats: dict[str, Any], candidate_ids: np.ndarray, part_ids: np.ndarray) -> np.ndarray:
+    nearest_local = np.asarray(stats.pop("nearest_vertex_ids"), dtype=np.int64)
+    nearest = candidate_ids[nearest_local]
+    unique_count = int(np.unique(nearest).size)
+    stats["nearest_part_counts"] = {
+        PART_NAMES[int(pid)]: int((part_ids[nearest] == int(pid)).sum()) for pid in sorted(set(part_ids[nearest].tolist()))
+    }
+    stats["unique_nearest_vertices"] = unique_count
+    stats["nearest_unique_ratio"] = float(unique_count / max(1, int(nearest.shape[0])))
+    return nearest
+
+
+def landmark_group_stats(
+    landmarks: np.ndarray,
+    uv: np.ndarray,
+    z: np.ndarray,
+    candidate_ids: np.ndarray,
+    part_ids: np.ndarray,
+    groups: dict[str, list[int]],
+    height: int,
+    width: int,
+) -> dict[str, Any]:
+    grouped: dict[str, Any] = {}
+    count = int(landmarks.shape[0])
+    for group_name, raw_indices in groups.items():
+        indices = np.asarray([idx for idx in raw_indices if 0 <= int(idx) < count], dtype=np.int64)
+        if indices.size == 0:
+            grouped[group_name] = {"usable": False, "reason": "indices_out_of_range"}
+            continue
+        stats = nearest_stats(landmarks[indices, :2], uv, z, height, width)
+        if stats.get("usable"):
+            add_nearest_part_stats(stats, candidate_ids, part_ids)
+        grouped[group_name] = stats
+    return grouped
+
+
+def append_group_means(accumulator: dict[str, list[float]], prefix: str, grouped: dict[str, Any]) -> None:
+    for group_name, stats in grouped.items():
+        if stats.get("usable") and stats.get("lm_to_mesh_mean_px") is not None:
+            accumulator.setdefault(f"{prefix}{group_name}", []).append(float(stats["lm_to_mesh_mean_px"]))
+
+
+def summarize_group_means(accumulator: dict[str, list[float]]) -> dict[str, Any]:
+    return {group_name: summarize(values) for group_name, values in sorted(accumulator.items())}
+
+
 def save_overlay(
     image_path: Path,
     mask_path: Path,
@@ -237,6 +337,8 @@ def main() -> int:
     rows = []
     face_lm_mean: list[float] = []
     hand_lm_mean: list[float] = []
+    face_group_means: dict[str, list[float]] = {}
+    hand_group_means: dict[str, list[float]] = {}
     hand_wrong_side = 0
     hand_matches = 0
     duplicate_side_views = 0
@@ -269,15 +371,24 @@ def main() -> int:
             if face_lm is not None and face_lm.shape[0] > 0:
                 stats = nearest_stats(face_lm[:, :2], uv_all[face_ids], z_all[face_ids], height, width)
                 if stats.get("usable"):
-                    nearest = face_ids[np.asarray(stats.pop("nearest_vertex_ids"), dtype=np.int64)]
-                    stats["nearest_part_counts"] = {
-                        PART_NAMES[int(pid)]: int((part_ids[nearest] == int(pid)).sum()) for pid in sorted(set(part_ids[nearest].tolist()))
-                    }
+                    nearest = add_nearest_part_stats(stats, face_ids, part_ids)
                     face_lm_mean.append(float(stats["lm_to_mesh_mean_px"]))
                     if len(overlays) < int(args.overlay_limit):
                         overlay_path = overlay_dir / f"view_{view_idx:02d}_cam{camera_id}_face_pull.png"
                         save_overlay(image_path, mask_path, height, face_lm, uv_all, nearest, overlay_path)
                         overlays.append(overlay_path)
+                face_groups = landmark_group_stats(
+                    face_lm,
+                    uv_all[face_ids],
+                    z_all[face_ids],
+                    face_ids,
+                    part_ids,
+                    FACE_LANDMARK_GROUPS,
+                    height,
+                    width,
+                )
+                append_group_means(face_group_means, "", face_groups)
+                stats["semantic_groups"] = face_groups
                 view_row["face_pull"] = stats
 
         if hand_detector is not None and hand_mp is not None:
@@ -303,12 +414,9 @@ def main() -> int:
                     hand_rows.append({"hand_index": int(hand_idx), "usable": False})
                     continue
                 side, stats, ids = min(candidates, key=lambda item: float(item[1].get("lm_to_mesh_mean_px", 1e9)))
-                nearest = ids[np.asarray(stats.pop("nearest_vertex_ids"), dtype=np.int64)]
+                nearest = add_nearest_part_stats(stats, ids, part_ids)
                 stats["matched_side"] = side
                 matched_sides_this_view.append(side)
-                stats["nearest_part_counts"] = {
-                    PART_NAMES[int(pid)]: int((part_ids[nearest] == int(pid)).sum()) for pid in sorted(set(part_ids[nearest].tolist()))
-                }
                 hand_lm_mean.append(float(stats["lm_to_mesh_mean_px"]))
                 hand_matches += 1
                 if side not in stats["nearest_part_counts"]:
@@ -317,6 +425,18 @@ def main() -> int:
                     overlay_path = overlay_dir / f"view_{view_idx:02d}_cam{camera_id}_hand{hand_idx}_pull.png"
                     save_overlay(image_path, mask_path, height, hand_lm, uv_all, nearest, overlay_path)
                     overlays.append(overlay_path)
+                hand_groups = landmark_group_stats(
+                    hand_lm,
+                    uv_all[ids],
+                    z_all[ids],
+                    ids,
+                    part_ids,
+                    HAND_LANDMARK_GROUPS,
+                    height,
+                    width,
+                )
+                append_group_means(hand_group_means, f"{side}.", hand_groups)
+                stats["semantic_groups"] = hand_groups
                 hand_rows.append({"hand_index": int(hand_idx), **stats})
             if len(matched_sides_this_view) >= 2 and len(set(matched_sides_this_view)) < len(matched_sides_this_view):
                 duplicate_side_views += 1
@@ -347,6 +467,8 @@ def main() -> int:
         "hand_detector": hand_meta,
         "face_lm_to_mesh_mean_px": summarize(face_lm_mean),
         "hand_lm_to_mesh_mean_px": summarize(hand_lm_mean),
+        "face_semantic_group_lm_to_mesh_mean_px": summarize_group_means(face_group_means),
+        "hand_semantic_group_lm_to_mesh_mean_px": summarize_group_means(hand_group_means),
         "hand_matches": int(hand_matches),
         "hand_wrong_side_proxy": int(hand_wrong_side),
         "hand_duplicate_side_views": int(duplicate_side_views),
@@ -371,15 +493,36 @@ def main() -> int:
         f"- left/right hand vertices: `{left_ids.shape[0]}` / `{right_ids.shape[0]}`",
         f"- face lm->mesh mean px: `{summary['face_lm_to_mesh_mean_px']}`",
         f"- hand lm->mesh mean px: `{summary['hand_lm_to_mesh_mean_px']}`",
+        f"- face semantic group lm->mesh mean px: `{summary['face_semantic_group_lm_to_mesh_mean_px']}`",
+        f"- hand semantic group lm->mesh mean px: `{summary['hand_semantic_group_lm_to_mesh_mean_px']}`",
         f"- hand matches: `{hand_matches}`",
+        f"- hand duplicate-side views: `{duplicate_side_views}`",
         f"- overlays: `{[str(p).replace(chr(92), '/') for p in overlays]}`",
         "",
         "This is diagnostic only. It audits whether broad MediaPipe landmark losses",
-        "are likely to pull the intended connected vertices; it is not a teacher gate.",
+        "are likely to pull the intended connected vertices and which semantic",
+        "subregions are failing; it is not a teacher gate.",
         "",
     ]
     (out / "report.md").write_text("\n".join(report), encoding="utf-8")
-    print(json.dumps(json_ready({k: summary[k] for k in ("truthful_status", "face_lm_to_mesh_mean_px", "hand_lm_to_mesh_mean_px", "overlays")}), indent=2))
+    print(
+        json.dumps(
+            json_ready(
+                {
+                    k: summary[k]
+                    for k in (
+                        "truthful_status",
+                        "face_lm_to_mesh_mean_px",
+                        "hand_lm_to_mesh_mean_px",
+                        "face_semantic_group_lm_to_mesh_mean_px",
+                        "hand_semantic_group_lm_to_mesh_mean_px",
+                        "overlays",
+                    )
+                }
+            ),
+            indent=2,
+        )
+    )
     return 0
 
 
