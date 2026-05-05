@@ -1027,3 +1027,66 @@ registry_age_hours ~= 0
 This keeps the cloud guard current. Local cleanup removed stale artifacts but
 did not change the truthful result: no candidate or teacher currently satisfies
 the mentor strict gate.
+
+## Full-Body And Hand Hard Gate On Raw Surface Export
+
+After adding confidence maps to the raw surface raster export, the same
+triangle diagnostic mesh was also projected to the original 6-view human-crop
+full-body protocol:
+
+```text
+output/normal_line_multiview_20260505/triangle_renderer_budget8000_cuda_smoke3_t96_step5_export6v_fullbody/rasterized_surface_targets/rasterized_surface_targets.npz
+```
+
+Full-body / hand audit:
+
+```text
+output/normal_line_multiview_20260505/triangle_renderer_budget8000_cuda_smoke3_t96_step5_export6v_fullbody/fullbody_hand_audit/fullbody_hand_integrity_summary.json
+```
+
+Numeric result:
+
+```text
+points_after_conf = 165760
+largest_component_ratio = 1.0000
+full_body_gate.pass = true
+hand_gate.pass = false
+views_passing_hand_kept_ratio = 0
+views_with_compact_3d_hand_boxes = 0
+implausible_hand_boxes = 2
+per-view body gate = 5 / 6
+per-view hand gate = 0 / 6
+```
+
+Explicit Open3D / overlay review outputs:
+
+```text
+output/normal_line_multiview_20260505/triangle_renderer_budget8000_cuda_smoke3_t96_step5_export6v_fullbody/teacher_surface_fullbody_review/iso.png
+output/normal_line_multiview_20260505/triangle_renderer_budget8000_cuda_smoke3_t96_step5_export6v_fullbody/teacher_surface_hands_review/iso.png
+output/normal_line_multiview_20260505/triangle_renderer_budget8000_cuda_smoke3_t96_step5_export6v_fullbody/teacher_surface_hands_review/solid_mesh/iso.png
+output/normal_line_multiview_20260505/triangle_renderer_budget8000_cuda_smoke3_t96_step5_export6v_fullbody/fullbody_hand_audit/view_02_fullbody_hand_overlay.png
+```
+
+Manual visual conclusion:
+
+```text
+The full-body surface is connected enough to pass the numeric body continuity
+screen, but it is still a coarse SMPL-X-like template shell. The hands are not
+mentor-pass geometry: MediaPipe-visible hand views fail compact 3D hand-box
+checks, and Open3D still shows template fingers / hand support rather than
+reconstructed personal hand detail. The head top remains an artificial cap and
+the face remains template-like. This export is therefore not a strict teacher,
+not a candidate pass, and not cloud-eligible.
+```
+
+Interpretation:
+
+The raw-image connected surface route has produced a useful negative: body
+continuity can be made much less broken than old point-cloud candidates, but
+this alone is insufficient. The remaining blocker is not thresholding or point
+count; it is the lack of a learned / optimizable surface representation that
+can express true face, hairline, clothing, and hand details while staying
+attached to the body. Do not tune the current mesh to chase the hand gate. The
+next non-redundant method step is a part-aware connected surface backend with
+real raw-image photometric and boundary evidence, not another fullbody export
+or confidence change.

@@ -1860,6 +1860,7 @@ def export_raster_targets(
     worlds_np = np.stack(world_points, axis=0).astype(np.float32)
     normals_np = np.stack(normal_maps, axis=0).astype(np.float32)
     masks_np = np.stack(masks, axis=0).astype(bool)
+    conf_np = masks_np.astype(np.float32)
     intrinsics_np = np.stack(intrinsics, axis=0).astype(np.float32)
     extrinsics_np = np.stack(extrinsics, axis=0).astype(np.float32)
     npz_path = export_dir / "rasterized_surface_targets.npz"
@@ -1869,7 +1870,13 @@ def export_raster_targets(
         depth=depths_np[..., None],
         world_points=worlds_np,
         normals=normals_np,
+        normal=normals_np,
         teacher_mask=masks_np,
+        world_points_conf=conf_np,
+        point_conf=conf_np,
+        depth_conf=conf_np,
+        normal_conf=conf_np,
+        conf=conf_np,
         intrinsic=intrinsics_np,
         extrinsic=extrinsics_np,
         camera_ids=np.asarray(camera_ids),

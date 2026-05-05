@@ -449,7 +449,13 @@ def _save_open3d_camera_renders(
             float(intrinsic[index, 1, 2]),
         )
         camera_extrinsic = np.eye(4, dtype=np.float64)
-        camera_extrinsic[:3, :4] = extrinsic[index].astype(np.float64)
+        camera_pose = extrinsic[index].astype(np.float64)
+        if camera_pose.shape == (4, 4):
+            camera_extrinsic = camera_pose
+        elif camera_pose.shape == (3, 4):
+            camera_extrinsic[:3, :4] = camera_pose
+        else:
+            raise ValueError(f"unsupported camera extrinsic shape for view {index}: {camera_pose.shape}")
         params.extrinsic = camera_extrinsic
         try:
             ctr.convert_from_pinhole_camera_parameters(params, allow_arbitrary=True)
