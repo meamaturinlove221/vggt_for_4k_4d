@@ -1569,3 +1569,54 @@ landmark supervision correspondence-aware: enforce per-view left/right hand
 assignment uniqueness and split face landmarks into contour / central face /
 hairline regions before applying losses. Otherwise stronger weights will only
 pull broad vertex sets and can worsen template artifacts.
+
+## Unique-Side Hand Landmark Constraint
+
+The optimizer now supports an optional correspondence-aware hand term:
+
+```text
+--hand-landmark-unique-side
+```
+
+When multiple hands are detected in one view, this assigns at most one
+detection to `left_hand` and at most one to `right_hand` before accumulating the
+hand landmark loss. This directly addresses the landmark-pull audit failure
+where two views matched multiple detections to the same side.
+
+Smoke run:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_v24_outer_uniquehand_landmark_smoke6_t96_step12
+```
+
+Results:
+
+```text
+initial_iou.mean = 0.7711
+optimized_iou.mean = 0.7803
+iou_delta = +0.0092
+initial_target_recall.mean = 0.9495
+optimized_target_recall.mean = 0.9492
+target_recall_delta = -0.0004
+hand landmark views = 6
+hand landmark detections used = 9
+unique-side views = 3
+duplicate-side fallback views = 0
+```
+
+Conclusion:
+
+```text
+The unique-side hand constraint fixes a real ambiguity in the loss path and
+should remain available. It is still not sufficient for mentor-pass hands:
+Open3D-quality hand geometry remains governed by the underlying connected
+surface carrier, and the current carrier still produces template/detail-poor
+hands. This smoke is diagnostic only and not a candidate.
+```
+
+Next non-redundant implication:
+
+The hand-side ambiguity is no longer the main blocker. The next issue is lack of
+semantic correspondence inside each hand and face region. A stronger method
+would need per-finger / central-face correspondences or a learned surface-token
+decoder; simply increasing the unique-side landmark weight is a loop.

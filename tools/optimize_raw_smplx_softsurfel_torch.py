@@ -344,6 +344,15 @@ def parse_args() -> argparse.Namespace:
         help="Weight for connected-hand projected landmark Chamfer loss. Disabled by default.",
     )
     parser.add_argument("--hand-landmark-bidir-weight", type=float, default=0.10)
+    parser.add_argument(
+        "--hand-landmark-unique-side",
+        action="store_true",
+        help=(
+            "When a view detects multiple hands, assign at most one detected hand to left_hand "
+            "and one to right_hand before accumulating loss. This prevents broad Chamfer terms "
+            "from matching both detections to the same connected hand side."
+        ),
+    )
     parser.add_argument("--hand-landmark-min-points", type=int, default=12)
     parser.add_argument("--hand-landmark-min-confidence", type=float, default=0.02)
     parser.add_argument(
@@ -1592,6 +1601,7 @@ def hand_landmark_projection_loss(
     *,
     bidirectional_weight: float,
     min_points: int,
+    unique_side: bool,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Weak 2D hand constraint attached to connected SMPL-X hand vertices."""
 
@@ -1622,6 +1632,8 @@ def hand_landmark_projection_loss(
     losses: list[torch.Tensor] = []
     used_hands = 0
     used_views = 0
+    unique_side_views = 0
+    duplicate_side_fallback_views = 0
     for payload in view_payloads:
         hand_sets = payload.get("hand_landmarks_t") or []
         if not hand_sets:
@@ -1631,25 +1643,67 @@ def hand_landmark_projection_loss(
         if left_uv is None and right_uv is None:
             continue
         view_used = False
-        for landmarks in hand_sets:
+        view_candidates: list[dict[str, Any]] = []
+        for hand_idx, landmarks in enumerate(hand_sets):
             if landmarks.numel() < int(min_points) * 2:
                 continue
             landmarks_xy = landmarks[:, :2] / float(max(height, width))
-            candidates: list[torch.Tensor] = []
+            candidates: list[tuple[str, torch.Tensor]] = []
             if left_uv is not None:
-                candidates.append(chamfer(landmarks_xy, left_uv))
+                candidates.append(("left", chamfer(landmarks_xy, left_uv)))
             if right_uv is not None:
-                candidates.append(chamfer(landmarks_xy, right_uv))
+                candidates.append(("right", chamfer(landmarks_xy, right_uv)))
             if candidates:
-                losses.append(torch.stack(candidates).min())
+                view_candidates.append({"hand_index": int(hand_idx), "candidates": candidates})
+        if not view_candidates:
+            continue
+        if bool(unique_side) and left_uv is not None and right_uv is not None and len(view_candidates) >= 2:
+            best: tuple[torch.Tensor, int, str, int, str] | None = None
+            for i, first in enumerate(view_candidates):
+                first_costs = {side: cost for side, cost in first["candidates"]}
+                for j, second in enumerate(view_candidates):
+                    if i == j:
+                        continue
+                    second_costs = {side: cost for side, cost in second["candidates"]}
+                    for side_a, side_b in (("left", "right"), ("right", "left")):
+                        if side_a not in first_costs or side_b not in second_costs:
+                            continue
+                        total = first_costs[side_a] + second_costs[side_b]
+                        if best is None or float(total.detach().cpu()) < float(best[0].detach().cpu()):
+                            best = (total, i, side_a, j, side_b)
+            if best is not None:
+                _total, i, side_a, j, side_b = best
+                first_cost = {side: cost for side, cost in view_candidates[i]["candidates"]}[side_a]
+                second_cost = {side: cost for side, cost in view_candidates[j]["candidates"]}[side_b]
+                losses.extend([first_cost, second_cost])
+                used_hands += 2
+                unique_side_views += 1
+                view_used = True
+            else:
+                duplicate_side_fallback_views += 1
+        if not view_used:
+            chosen_sides: list[str] = []
+            for item in view_candidates:
+                side, cost = min(item["candidates"], key=lambda pair: float(pair[1].detach().cpu()))
+                chosen_sides.append(side)
+                losses.append(cost)
                 used_hands += 1
                 view_used = True
+            if bool(unique_side) and len(chosen_sides) >= 2 and len(set(chosen_sides)) < len(chosen_sides):
+                duplicate_side_fallback_views += 1
         if view_used:
             used_views += 1
     if not losses:
         zero = vertices.sum() * 0.0
         return zero, {"views": 0.0, "hands": 0.0, "reason": "no_usable_hand_landmark_views"}
-    return torch.stack(losses).mean(), {"views": float(used_views), "hands": float(used_hands), "reason": None}
+    return torch.stack(losses).mean(), {
+        "views": float(used_views),
+        "hands": float(used_hands),
+        "unique_side": bool(unique_side),
+        "unique_side_views": float(unique_side_views),
+        "duplicate_side_fallback_views": float(duplicate_side_fallback_views),
+        "reason": None,
+    }
 
 
 def compute_mask_metrics(rendered: np.ndarray, target: np.ndarray) -> dict[str, Any]:
@@ -2836,6 +2890,7 @@ def main() -> int:
             width=width,
             bidirectional_weight=float(args.hand_landmark_bidir_weight),
             min_points=int(args.hand_landmark_min_points),
+            unique_side=bool(args.hand_landmark_unique_side),
         )
         image_edge_loss, image_edge_meta = vertex_image_edge_loss(
             vertices=vertices,
@@ -3080,6 +3135,7 @@ def main() -> int:
         "detector": hand_landmarker_meta,
         "weight": float(args.hand_landmark_weight),
         "bidirectional_weight": float(args.hand_landmark_bidir_weight),
+        "unique_side": bool(args.hand_landmark_unique_side),
         "left_hand_vertex_count": int((vertex_parts_np == 1).sum()),
         "right_hand_vertex_count": int((vertex_parts_np == 2).sum()),
         "detected_views": int(len(hand_landmark_detected)),
@@ -3257,6 +3313,7 @@ def main() -> int:
         f"- face landmark detected views: `{face_landmark_stats['detected_views']}/{face_landmark_stats['selected_views']}`",
         f"- face landmark vertex count: `{face_landmark_stats['face_vertex_count']}`",
         f"- hand landmark weight: `{float(args.hand_landmark_weight)}`",
+        f"- hand landmark unique-side: `{bool(args.hand_landmark_unique_side)}`",
         f"- hand landmark detected views: `{hand_landmark_stats['detected_views']}/{hand_landmark_stats['selected_views']}`",
         f"- hand landmark detected hands: `{hand_landmark_stats['detected_hands']}`",
         f"- image edge weight: `{float(args.image_edge_weight)}`",
