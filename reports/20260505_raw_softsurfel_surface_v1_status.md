@@ -300,20 +300,126 @@ increasing hairline offset limits. The next hairline attempt needs actual
 head-top/hair support from image boundary / mask-edge surface construction, not
 looser SMPL-X residuals.
 
+## Shared Extra Hairline Surfels
+
+Run:
+
+```text
+output/normal_line_multiview_20260505/raw_softsurfel_surface_smoke6_t126_extrahair_export6v
+```
+
+This does not loosen the SMPL-X hairline offset. Instead, it builds a shared 3D
+diagnostic support set from raw mask pixels that are missing from the optimized
+SMPL-X raster, anchors them to nearby SMPL-X head depth, and keeps only points
+with multi-view mask support.
+
+Result:
+
+```text
+optimized mean IoU = 0.8385
+IoU delta = +0.0732
+optimized target recall = 0.8709
+target recall delta = -0.0126
+extra hairline surfels kept = 451
+support mean = 5.5033
+support p50 = 6.0
+```
+
+Self-protocol numeric sanity:
+
+```text
+face_core: 6 / 6 views pass
+head_face: 6 / 6 views pass
+hairline: 1 / 6 views pass
+head: 6 / 6 views pass
+```
+
+Global raw-to-VGGT bridge, fit on `head_face`:
+
+```text
+face_core compatible coverage = 0.8580
+head_face compatible coverage = 0.7789
+hairline compatible coverage = 0.7241
+head compatible coverage = 0.7789
+```
+
+Strict transformed teacher gate:
+
+```text
+face_core: 2 / 6 views pass
+head_face: 2 / 6 views pass
+hairline: 0 / 6 views pass
+head: 2 / 6 views pass
+```
+
+Open3D review was generated at:
+
+```text
+output/normal_line_multiview_20260505/raw_softsurfel_surface_smoke6_t126_extrahair_export6v/teacher_gate_transformed_vggt_protocol_open3d
+```
+
+Visual conclusion:
+
+The result is still a template-like head surface with sparse/floating top-head
+noise, not a modeled human head/hairline. It must remain a negative diagnostic.
+The extra surfels improve hairline coverage compared with the previous bridge,
+but they do not create a continuous, visually valid hair/head surface.
+
+## Visibility-Aware Photometric Smoke
+
+Run:
+
+```text
+output/normal_line_multiview_20260505/raw_softsurfel_surface_smoke6_t126_visphoto_extrahair_export6v
+```
+
+This adds `--photo-depth-tolerance 0.035`, so photometric consistency only uses
+surfels near the current rendered front depth. It is a structural visibility
+check, not a gate-threshold change.
+
+Result:
+
+```text
+optimized mean IoU = 0.8381
+IoU delta = +0.0728
+optimized target recall = 0.8711
+target recall delta = -0.0124
+```
+
+Global bridge:
+
+```text
+face_core compatible coverage = 0.8570
+head_face compatible coverage = 0.7754
+hairline compatible coverage = 0.7247
+head compatible coverage = 0.7754
+```
+
+Conclusion:
+
+Visibility-aware photometric filtering is technically cleaner and should stay in
+the tool, but at this smoke scale it does not improve the strict gate. The
+remaining blocker is not just hidden/backside surfels participating in
+photometric loss; it is the absence of a continuous image-derived hair/head
+surface beyond the SMPL-X scaffold.
+
 ## Next Non-Wall Actions
 
 Do not return to r-candidate threshold/confidence loops.
 
 Next actions should be:
 
-1. Refine the bridge beyond a single global similarity only if it remains
+1. Replace point-like extra hairline support with connected head-top/hair
+   boundary surface elements or a true soft triangle/surfel sheet attached to
+   the SMPL-X head scaffold. Per-view patches are not allowed.
+2. Refine the bridge beyond a single global similarity only if it remains
    geometrically meaningful and does not become a per-view cheat; test whether a
    robust head/face weighted similarity or bounded affine scale explains the
    remaining residuals.
-2. Improve hairline/head-top surface support using image boundary / mask-edge
+3. Improve hairline/head-top surface support using image boundary / mask-edge
    residuals rather than SMPL-X face/hair hard teacher.
-3. Add depth-ordered soft visibility or a soft triangle renderer, then rerun the
+4. Add a true depth-ordered soft triangle renderer, then rerun the
    same 6-view and 60-view raw-image checks.
-4. Only after raw surface, protocol bridge, hairline, Open3D visual, full-body,
+5. Only after raw surface, protocol bridge, hairline, Open3D visual, full-body,
    and hands pass strict gates should any learned backend or cloud run be
    considered.

@@ -80,6 +80,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--outside-weight", type=float, default=0.20)
     parser.add_argument("--boundary-weight", type=float, default=0.05)
     parser.add_argument("--photo-weight", type=float, default=0.08)
+    parser.add_argument(
+        "--photo-depth-tolerance",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional visibility filter for the photometric loss. When >0, a surfel must be "
+            "near the current rendered front depth in that view before its sampled RGB counts."
+        ),
+    )
     parser.add_argument("--translation-reg", type=float, default=0.05)
     parser.add_argument("--scale-reg", type=float, default=0.05)
     parser.add_argument("--offset-reg", type=float, default=0.35)
@@ -89,6 +98,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--normal-offset-limit-head", type=float, default=0.022)
     parser.add_argument("--normal-offset-limit-hairline", type=float, default=0.040)
     parser.add_argument("--normal-offset-limit-clothing", type=float, default=0.035)
+    parser.add_argument(
+        "--extra-hairline-surfels",
+        type=int,
+        default=0,
+        help=(
+            "Optional diagnostic: build a shared 3D head-top/hairline support set from raw mask pixels "
+            "that are missing from the optimized SMPL-X raster. Disabled by default."
+        ),
+    )
+    parser.add_argument("--extra-hairline-max-per-view", type=int, default=256)
+    parser.add_argument("--extra-hairline-min-support", type=int, default=2)
+    parser.add_argument("--extra-hairline-top-frac", type=float, default=0.40)
+    parser.add_argument("--extra-hairline-nearest-radius", type=float, default=10.0)
+    parser.add_argument("--extra-hairline-depth-offset", type=float, default=0.0)
+    parser.add_argument("--extra-hairline-voxel", type=float, default=0.004)
+    parser.add_argument("--extra-hairline-export-radius", type=int, default=1)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--overlay-limit", type=int, default=8)
     parser.add_argument("--export-raster-targets", action="store_true")
@@ -381,10 +406,13 @@ def photometric_consistency_loss(
     view_payloads: list[dict[str, Any]],
     height: int,
     width: int,
+    *,
+    visibility_depths: list[torch.Tensor] | None = None,
+    depth_tolerance: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     colors = []
     weights = []
-    for payload in view_payloads:
+    for view_i, payload in enumerate(view_payloads):
         uv, z, _ = project_points(surfels, payload["world_to_cam"], payload["intrinsic"])
         in_image = (
             (z > 1e-5)
@@ -393,6 +421,11 @@ def photometric_consistency_loss(
             & (uv[:, 1] >= 0.0)
             & (uv[:, 1] <= height - 1)
         )
+        if visibility_depths is not None and depth_tolerance > 0.0 and view_i < len(visibility_depths):
+            sampled_depth = sample_grid_values(visibility_depths[view_i][None, None], uv, height, width).reshape(-1)
+            visible = torch.isfinite(sampled_depth) & (sampled_depth > 1e-5)
+            visible = visible & ((z - sampled_depth).abs() <= float(depth_tolerance))
+            in_image = in_image & visible
         sampled_rgb = sample_grid_values(payload["rgb_t"], uv, height, width)
         sampled_mask = sample_grid_values(payload["mask_t"], uv, height, width).reshape(-1).clamp(0.0, 1.0)
         weight = sampled_mask * in_image.float()
@@ -493,6 +526,29 @@ def save_ply(path: Path, vertices: np.ndarray, faces: np.ndarray) -> None:
             handle.write(f"3 {int(face[0])} {int(face[1])} {int(face[2])}\n")
 
 
+def save_point_ply(path: Path, points: np.ndarray, normals: np.ndarray | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    points = np.asarray(points, dtype=np.float32)
+    normals = None if normals is None else np.asarray(normals, dtype=np.float32)
+    with path.open("w", encoding="ascii") as handle:
+        handle.write("ply\nformat ascii 1.0\n")
+        handle.write(f"element vertex {points.shape[0]}\n")
+        handle.write("property float x\nproperty float y\nproperty float z\n")
+        has_normals = normals is not None and normals.shape == points.shape
+        if has_normals:
+            handle.write("property float nx\nproperty float ny\nproperty float nz\n")
+        handle.write("end_header\n")
+        if has_normals:
+            for point, normal in zip(points, normals):
+                handle.write(
+                    f"{float(point[0])} {float(point[1])} {float(point[2])} "
+                    f"{float(normal[0])} {float(normal[1])} {float(normal[2])}\n"
+                )
+        else:
+            for point in points:
+                handle.write(f"{float(point[0])} {float(point[1])} {float(point[2])}\n")
+
+
 def save_depth_image(path: Path, depth: np.ndarray, mask: np.ndarray) -> None:
     depth = np.asarray(depth, dtype=np.float32)
     mask = np.asarray(mask, dtype=bool)
@@ -529,11 +585,340 @@ def parse_view_spec(spec: str, count: int) -> list[int]:
     return sorted(set(out))
 
 
+def backproject_pixels_to_world(
+    pixels_xy: np.ndarray,
+    depth: np.ndarray,
+    intrinsic: np.ndarray,
+    world_to_cam: np.ndarray,
+) -> np.ndarray:
+    pixels_xy = np.asarray(pixels_xy, dtype=np.float32)
+    depth = np.asarray(depth, dtype=np.float32).reshape(-1)
+    intrinsic = np.asarray(intrinsic, dtype=np.float32)
+    world_to_cam = homogeneous(world_to_cam)
+    fx = float(intrinsic[0, 0])
+    fy = float(intrinsic[1, 1])
+    cx = float(intrinsic[0, 2])
+    cy = float(intrinsic[1, 2])
+    cam = np.stack(
+        [
+            (pixels_xy[:, 0] + 0.5 - cx) * depth / max(1e-8, fx),
+            (pixels_xy[:, 1] + 0.5 - cy) * depth / max(1e-8, fy),
+            depth,
+        ],
+        axis=1,
+    ).astype(np.float32)
+    cam_to_world = np.linalg.inv(world_to_cam).astype(np.float32)
+    return (cam @ cam_to_world[:3, :3].T + cam_to_world[:3, 3][None, :]).astype(np.float32)
+
+
+def nearest_rendered_depths(
+    query_xy: np.ndarray,
+    source_xy: np.ndarray,
+    source_depth: np.ndarray,
+    max_radius: float,
+    *,
+    chunk: int = 512,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    query_xy = np.asarray(query_xy, dtype=np.float32)
+    source_xy = np.asarray(source_xy, dtype=np.float32)
+    source_depth = np.asarray(source_depth, dtype=np.float32).reshape(-1)
+    if query_xy.size == 0 or source_xy.size == 0:
+        return (
+            np.zeros((0,), dtype=bool),
+            np.zeros((0,), dtype=np.float32),
+            np.zeros((0,), dtype=np.float32),
+        )
+    keep = np.zeros((query_xy.shape[0],), dtype=bool)
+    depth = np.zeros((query_xy.shape[0],), dtype=np.float32)
+    distance = np.full((query_xy.shape[0],), np.inf, dtype=np.float32)
+    max_r2 = float(max_radius) ** 2
+    for start in range(0, query_xy.shape[0], max(1, int(chunk))):
+        q = query_xy[start : start + chunk]
+        d2 = ((q[:, None, :] - source_xy[None, :, :]) ** 2).sum(axis=2)
+        nearest = d2.argmin(axis=1)
+        best = d2[np.arange(q.shape[0]), nearest]
+        local_keep = np.isfinite(best) & (best <= max_r2)
+        keep[start : start + q.shape[0]] = local_keep
+        depth[start : start + q.shape[0]] = source_depth[nearest]
+        distance[start : start + q.shape[0]] = np.sqrt(np.maximum(best, 0.0)).astype(np.float32)
+    return keep, depth, distance
+
+
+def mask_support_for_points(
+    points_world: np.ndarray,
+    view_payloads: list[dict[str, Any]],
+    height: int,
+    width: int,
+) -> np.ndarray:
+    points_world = np.asarray(points_world, dtype=np.float32)
+    support = np.zeros((points_world.shape[0],), dtype=np.int32)
+    if points_world.size == 0:
+        return support
+    points_t = torch.from_numpy(points_world)
+    for payload in view_payloads:
+        uv, z, _ = project_points(
+            points_t,
+            torch.from_numpy(payload["world_to_cam_np"].astype(np.float32)),
+            torch.from_numpy(payload["intrinsic_np"].astype(np.float32)),
+        )
+        uv_np = uv.numpy()
+        z_np = z.numpy()
+        px = np.rint(uv_np[:, 0]).astype(np.int32)
+        py = np.rint(uv_np[:, 1]).astype(np.int32)
+        valid = (
+            np.isfinite(uv_np).all(axis=1)
+            & np.isfinite(z_np)
+            & (z_np > 1e-5)
+            & (px >= 0)
+            & (px < width)
+            & (py >= 0)
+            & (py < height)
+        )
+        if valid.any():
+            mask = np.asarray(payload["mask"], dtype=bool)
+            hit = np.zeros_like(valid)
+            hit[valid] = mask[py[valid], px[valid]]
+            support += hit.astype(np.int32)
+    return support
+
+
+def voxel_downsample_points(
+    points: np.ndarray,
+    normals: np.ndarray,
+    support: np.ndarray,
+    voxel: float,
+    max_points: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    points = np.asarray(points, dtype=np.float32)
+    normals = np.asarray(normals, dtype=np.float32)
+    support = np.asarray(support, dtype=np.int32)
+    if points.shape[0] == 0:
+        return points, normals, support
+    if voxel > 0:
+        keys = np.round(points / float(voxel)).astype(np.int64)
+        _, unique_idx = np.unique(keys, axis=0, return_index=True)
+        points = points[unique_idx]
+        normals = normals[unique_idx]
+        support = support[unique_idx]
+    order = np.lexsort((np.arange(points.shape[0]), -support))
+    if max_points > 0:
+        order = order[: int(max_points)]
+    points = points[order].astype(np.float32)
+    normals = normals[order].astype(np.float32)
+    normals = normals / np.clip(np.linalg.norm(normals, axis=1, keepdims=True), 1e-8, None)
+    return points, normals, support[order].astype(np.int32)
+
+
+def build_extra_hairline_surfels(
+    *,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    view_payloads: list[dict[str, Any]],
+    max_points: int,
+    max_per_view: int,
+    min_support: int,
+    top_frac: float,
+    nearest_radius: float,
+    depth_offset: float,
+    voxel: float,
+    output_dir: Path,
+) -> dict[str, Any]:
+    if int(max_points) <= 0:
+        return {
+            "enabled": False,
+            "points": np.zeros((0, 3), dtype=np.float32),
+            "normals": np.zeros((0, 3), dtype=np.float32),
+            "support": np.zeros((0,), dtype=np.int32),
+            "summary": {"candidate_points": 0, "kept_points": 0},
+        }
+
+    height, width = view_payloads[0]["mask"].shape
+    head_center = np.asarray(vertices, dtype=np.float32)[np.asarray(vertices[:, 1]).argsort()[-max(16, vertices.shape[0] // 12) :]].mean(axis=0)
+    candidates: list[np.ndarray] = []
+    distances: list[np.ndarray] = []
+    per_view_rows: list[dict[str, Any]] = []
+    for payload in view_payloads:
+        depth_map, _, _, raster_mask, _ = rasterize_world_mesh(
+            world_vertices=vertices,
+            faces=faces,
+            world_to_cam=payload["world_to_cam_np"],
+            intrinsic=payload["intrinsic_np"],
+            image_hw=payload["mask"].shape,
+            silhouette_mask=None,
+            fill_knn=0,
+            return_raster_mask=True,
+        )
+        target = np.asarray(payload["mask"], dtype=bool)
+        ys_mask, xs_mask = np.nonzero(target)
+        if ys_mask.size == 0:
+            per_view_rows.append({"view_index": payload["view_index"], "candidate_pixels": 0, "kept_pixels": 0})
+            continue
+        top = int(ys_mask.min())
+        bottom = int(ys_mask.max())
+        top_limit = int(round(top + np.clip(float(top_frac), 0.05, 0.80) * max(1, bottom - top + 1)))
+        yy = np.arange(height)[:, None]
+        head_top_band = yy <= top_limit
+        missing = target & ~raster_mask & head_top_band
+        source = raster_mask & target & (yy <= min(height - 1, top_limit + int(max(2.0, nearest_radius * 1.5))))
+        my, mx = np.nonzero(missing)
+        sy, sx = np.nonzero(source)
+        if my.size == 0 or sy.size == 0:
+            per_view_rows.append(
+                {
+                    "view_index": payload["view_index"],
+                    "top_limit": top_limit,
+                    "candidate_pixels": int(my.size),
+                    "kept_pixels": 0,
+                }
+            )
+            continue
+        if my.size > int(max_per_view):
+            pick = np.linspace(0, my.size - 1, int(max_per_view)).round().astype(np.int64)
+            my = my[pick]
+            mx = mx[pick]
+        query_xy = np.stack([mx, my], axis=1).astype(np.float32)
+        source_xy = np.stack([sx, sy], axis=1).astype(np.float32)
+        source_depth = depth_map[sy, sx].astype(np.float32)
+        keep, nearest_depth, nearest_distance = nearest_rendered_depths(
+            query_xy,
+            source_xy,
+            source_depth,
+            max_radius=float(nearest_radius),
+        )
+        valid_depth = np.isfinite(nearest_depth) & ((nearest_depth + float(depth_offset)) > 1e-5)
+        keep &= valid_depth
+        world = backproject_pixels_to_world(
+            query_xy[keep],
+            nearest_depth[keep] + float(depth_offset),
+            payload["intrinsic_np"],
+            payload["world_to_cam_np"],
+        )
+        if world.shape[0] > 0:
+            candidates.append(world)
+            distances.append(nearest_distance[keep].astype(np.float32))
+        per_view_rows.append(
+            {
+                "view_index": payload["view_index"],
+                "camera_id": payload["camera_id"],
+                "top_limit": top_limit,
+                "candidate_pixels": int(query_xy.shape[0]),
+                "kept_pixels": int(world.shape[0]),
+                "nearest_distance_p50": None if not keep.any() else float(np.percentile(nearest_distance[keep], 50)),
+                "nearest_distance_p90": None if not keep.any() else float(np.percentile(nearest_distance[keep], 90)),
+            }
+        )
+
+    if not candidates:
+        return {
+            "enabled": True,
+            "points": np.zeros((0, 3), dtype=np.float32),
+            "normals": np.zeros((0, 3), dtype=np.float32),
+            "support": np.zeros((0,), dtype=np.int32),
+            "summary": {
+                "candidate_points": 0,
+                "kept_points": 0,
+                "min_support": int(min_support),
+                "per_view": per_view_rows,
+            },
+        }
+    points = np.concatenate(candidates, axis=0).astype(np.float32)
+    support = mask_support_for_points(points, view_payloads, height, width)
+    keep = support >= int(max(1, min_support))
+    points = points[keep]
+    support = support[keep]
+    normals = points - head_center[None, :]
+    normals = normals / np.clip(np.linalg.norm(normals, axis=1, keepdims=True), 1e-8, None)
+    points, normals, support = voxel_downsample_points(points, normals, support, float(voxel), int(max_points))
+    ply_path = output_dir / "optimized_softsurfel_extra_hairline_points.ply"
+    save_point_ply(ply_path, points, normals)
+    summary = {
+        "enabled": True,
+        "candidate_points": int(sum(row.get("kept_pixels", 0) for row in per_view_rows)),
+        "kept_points": int(points.shape[0]),
+        "min_support": int(min_support),
+        "support": summarize(support.astype(np.float32).tolist()),
+        "top_frac": float(top_frac),
+        "nearest_radius": float(nearest_radius),
+        "depth_offset": float(depth_offset),
+        "voxel": float(voxel),
+        "ply_path": ply_path,
+        "per_view": per_view_rows,
+        "note": (
+            "Extra hairline surfels are shared 3D diagnostic support built from raw mask missing pixels "
+            "and SMPL-X depth anchors. They are not an external teacher and do not pass any gate by themselves."
+        ),
+    }
+    return {"enabled": True, "points": points, "normals": normals, "support": support, "summary": summary}
+
+
+def splat_points_into_maps(
+    *,
+    depth_map: np.ndarray,
+    point_map: np.ndarray,
+    mask_map: np.ndarray,
+    normal_map: np.ndarray,
+    points: np.ndarray,
+    normals_world: np.ndarray,
+    world_to_cam: np.ndarray,
+    intrinsic: np.ndarray,
+    radius: int,
+) -> dict[str, int]:
+    points = np.asarray(points, dtype=np.float32)
+    normals_world = np.asarray(normals_world, dtype=np.float32)
+    if points.shape[0] == 0:
+        return {"candidate_points": 0, "projected_points": 0, "updated_pixels": 0}
+    world_to_cam = homogeneous(world_to_cam)
+    rotation = world_to_cam[:3, :3].astype(np.float32)
+    translation = world_to_cam[:3, 3].astype(np.float32)
+    cam = points @ rotation.T + translation[None, :]
+    z = cam[:, 2]
+    uvw = cam @ np.asarray(intrinsic, dtype=np.float32).T
+    uv = uvw[:, :2] / np.clip(uvw[:, 2:3], 1e-8, None)
+    height, width = depth_map.shape
+    px = np.rint(uv[:, 0]).astype(np.int32)
+    py = np.rint(uv[:, 1]).astype(np.int32)
+    valid = (
+        np.isfinite(uv).all(axis=1)
+        & np.isfinite(z)
+        & (z > 1e-5)
+        & (px >= -int(radius))
+        & (px < width + int(radius))
+        & (py >= -int(radius))
+        & (py < height + int(radius))
+    )
+    cam_normals = normals_world @ rotation.T
+    cam_normals = cam_normals / np.clip(np.linalg.norm(cam_normals, axis=1, keepdims=True), 1e-8, None)
+    updated = 0
+    projected = int(valid.sum())
+    rad = max(0, int(radius))
+    for idx in np.nonzero(valid)[0].tolist():
+        for dy in range(-rad, rad + 1):
+            yy = int(py[idx] + dy)
+            if yy < 0 or yy >= height:
+                continue
+            for dx in range(-rad, rad + 1):
+                xx = int(px[idx] + dx)
+                if xx < 0 or xx >= width:
+                    continue
+                if rad > 0 and dx * dx + dy * dy > rad * rad:
+                    continue
+                if (not mask_map[yy, xx]) or float(z[idx]) < float(depth_map[yy, xx]):
+                    depth_map[yy, xx] = float(z[idx])
+                    point_map[yy, xx] = points[idx]
+                    normal_map[yy, xx] = cam_normals[idx]
+                    mask_map[yy, xx] = True
+                    updated += 1
+    return {"candidate_points": int(points.shape[0]), "projected_points": projected, "updated_pixels": int(updated)}
+
+
 def export_raster_targets(
     *,
     vertices: np.ndarray,
     faces: np.ndarray,
     vertex_normals: np.ndarray,
+    extra_points: np.ndarray | None = None,
+    extra_normals: np.ndarray | None = None,
+    extra_splat_radius: int = 1,
     scene_dir: Path,
     dataset_root: Path,
     subset_name: str,
@@ -558,6 +943,15 @@ def export_raster_targets(
     extrinsics = []
     camera_ids = []
     rows = []
+    extra_points_np = np.zeros((0, 3), dtype=np.float32) if extra_points is None else np.asarray(extra_points, dtype=np.float32)
+    extra_normals_np = (
+        np.zeros_like(extra_points_np, dtype=np.float32)
+        if extra_normals is None
+        else np.asarray(extra_normals, dtype=np.float32)
+    )
+    if extra_normals_np.shape != extra_points_np.shape:
+        extra_normals_np = np.zeros_like(extra_points_np, dtype=np.float32)
+    extra_rows = []
     for view_idx in view_indices:
         view = views[view_idx]
         camera_id = str(view["camera_id"]).zfill(2)
@@ -585,6 +979,17 @@ def export_raster_targets(
         point_map = point_map.astype(np.float32)
         normal_map = normal_map.astype(np.float32)
         mask_map = raster_mask.astype(bool)
+        extra_meta = splat_points_into_maps(
+            depth_map=depth_map,
+            point_map=point_map,
+            mask_map=mask_map,
+            normal_map=normal_map,
+            points=extra_points_np,
+            normals_world=extra_normals_np,
+            world_to_cam=world_to_cam_np,
+            intrinsic=intrinsic_np,
+            radius=int(extra_splat_radius),
+        )
         depths.append(depth_map)
         world_points.append(point_map)
         normal_maps.append(normal_map)
@@ -597,9 +1002,11 @@ def export_raster_targets(
                 "view_index": int(view_idx),
                 "camera_id": camera_id,
                 "rasterized_pixels": int(mask_map.sum()),
+                "extra_hairline_splat": extra_meta,
                 "meta": meta,
             }
         )
+        extra_rows.append({"view_index": int(view_idx), "camera_id": camera_id, **extra_meta})
         prefix = image_dir / f"view_{view_idx:02d}_cam{camera_id}"
         Image.fromarray(mask_map.astype(np.uint8) * 255).save(prefix.with_name(prefix.name + "_mask.png"))
         save_depth_image(prefix.with_name(prefix.name + "_depth.png"), depth_map, mask_map)
@@ -630,6 +1037,11 @@ def export_raster_targets(
         "target_size": int(target_size),
         "view_indices": view_indices,
         "camera_ids": camera_ids,
+        "extra_hairline": {
+            "points": int(extra_points_np.shape[0]),
+            "splat_radius": int(extra_splat_radius),
+            "rows": extra_rows,
+        },
         "rows": rows,
         "debug_image_dir": image_dir,
         "note": (
@@ -833,6 +1245,7 @@ def main() -> int:
         recall_losses = []
         outside_losses = []
         boundary_losses = []
+        visibility_depths = []
         sampled_vertices = vertices.index_select(0, sdf_indices_t)
         for payload in view_payloads:
             render = render_soft_surfel_maps(
@@ -845,6 +1258,7 @@ def main() -> int:
                 sigma=float(args.gaussian_sigma),
                 pixel_chunk=int(args.render_pixel_chunk),
             )
+            visibility_depths.append(render["depth"])
             rendered_mask = render["mask"].clamp(1e-4, 1.0 - 1e-4)
             target_mask = payload["mask_t"].reshape(height, width)
             mask_losses.append(F.binary_cross_entropy(rendered_mask, target_mask))
@@ -877,7 +1291,14 @@ def main() -> int:
         recall_loss = torch.stack(recall_losses).mean() if recall_losses else torch.zeros((), device=device)
         outside_loss = torch.stack(outside_losses).mean() if outside_losses else torch.zeros((), device=device)
         boundary_loss = torch.stack(boundary_losses).mean() if boundary_losses else torch.zeros((), device=device)
-        photo_loss, photo_meta = photometric_consistency_loss(surfels, view_payloads, height, width)
+        photo_loss, photo_meta = photometric_consistency_loss(
+            surfels,
+            view_payloads,
+            height,
+            width,
+            visibility_depths=visibility_depths,
+            depth_tolerance=float(args.photo_depth_tolerance),
+        )
 
         global_reg = float(args.translation_reg) * delta_t.square().sum() + float(args.scale_reg) * log_scale.square().sum()
         offset_values = bounded_offsets
@@ -940,6 +1361,21 @@ def main() -> int:
     )
     save_contact_sheet(soft_overlay_paths, output_dir / "soft_render_overlay_contact_sheet.png")
 
+    extra_hairline = build_extra_hairline_surfels(
+        vertices=optimized_np,
+        faces=faces_np,
+        view_payloads=view_payloads,
+        max_points=int(args.extra_hairline_surfels),
+        max_per_view=int(args.extra_hairline_max_per_view),
+        min_support=int(args.extra_hairline_min_support),
+        top_frac=float(args.extra_hairline_top_frac),
+        nearest_radius=float(args.extra_hairline_nearest_radius),
+        depth_offset=float(args.extra_hairline_depth_offset),
+        voxel=float(args.extra_hairline_voxel),
+        output_dir=output_dir,
+    )
+    extra_hairline_summary = extra_hairline["summary"]
+
     initial_iou = summarize([row["metrics"]["iou"] for row in initial_rows])
     optimized_iou = summarize([row["metrics"]["iou"] for row in optimized_rows])
     initial_recall = summarize([row["metrics"]["target_recall"] for row in initial_rows])
@@ -974,6 +1410,9 @@ def main() -> int:
             vertices=optimized_np,
             faces=faces_np,
             vertex_normals=compute_vertex_normals(optimized_np, faces_np).astype(np.float32),
+            extra_points=extra_hairline["points"],
+            extra_normals=extra_hairline["normals"],
+            extra_splat_radius=int(args.extra_hairline_export_radius),
             scene_dir=export_scene,
             dataset_root=dataset_root,
             subset_name=str(args.subset_name),
@@ -1001,6 +1440,7 @@ def main() -> int:
         "config": vars(args),
         "part_names": PART_NAMES,
         "part_stats": part_stats,
+        "extra_hairline": extra_hairline_summary,
         "optimization_history": history,
         "metrics": {
             "initial_iou": initial_iou,
@@ -1015,6 +1455,7 @@ def main() -> int:
             "initial_contact_sheet": output_dir / "initial_overlay_contact_sheet.png",
             "optimized_contact_sheet": output_dir / "optimized_overlay_contact_sheet.png",
             "soft_render_contact_sheet": output_dir / "soft_render_overlay_contact_sheet.png",
+            "extra_hairline_points": output_dir / "optimized_softsurfel_extra_hairline_points.ply",
             "summary_json": output_dir / "raw_softsurfel_surface_summary.json",
             "report_md": output_dir / "report.md",
             "rasterized_surface_targets": None if export_summary is None else export_summary.get("npz_path"),
@@ -1047,6 +1488,7 @@ def main() -> int:
         f"- uses VGGT depth/point/normal: `False`",
         f"- creates teacher targets: `{bool(args.export_raster_targets)}`",
         f"- creates candidate predictions: `False`",
+        f"- extra hairline surfels: `{extra_hairline_summary.get('kept_points', 0)}`",
         f"- initial mean IoU: `{initial_iou['mean']}`",
         f"- optimized mean IoU: `{optimized_iou['mean']}`",
         f"- IoU delta: `{iou_delta}`",
