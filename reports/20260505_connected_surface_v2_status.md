@@ -1723,3 +1723,68 @@ learned / optimizable capacity to turn mouth, nose, fingers, hairline, and
 clothing into a mentor-pass surface. Do not scale this by only increasing
 semantic weights.
 ```
+
+## Semantic Control Offset Basis
+
+I then added a finer connected deformation basis:
+
+```text
+--semantic-control-offset-limit
+--semantic-control-offset-topk
+--semantic-control-offset-radius
+--semantic-control-offset-reg
+```
+
+This is different from the previous one-offset-per-group smoke. For each
+semantic group, the optimizer now selects top-count audited vertices as local
+controls and diffuses bounded 3D offsets to nearby group vertices with RBF
+weights. This gives mouth / nose / finger groups more local freedom while
+remaining welded to the connected mesh.
+
+Reference group-offset run:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_v26_semantic_group_offset_smoke2_t96_step10
+```
+
+Top-k control run:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_v27_semantic_control_offset_smoke2_t96_step10
+```
+
+Comparison:
+
+```text
+v26 iou_delta = +0.004345
+v26 target_recall_delta = -0.000889
+v26 semantic_face_loss: 0.145027 -> 0.141942
+v26 semantic_hand_loss: 0.050673 -> 0.047487
+
+v27 iou_delta = +0.004345
+v27 target_recall_delta = -0.000889
+v27 semantic_face_loss: 0.145027 -> 0.141377
+v27 semantic_hand_loss: 0.050673 -> 0.047094
+```
+
+Largest v27 control offsets:
+
+```text
+face.right_eye max_control_norm = 0.002077
+face.central_nose max_control_norm = 0.002073
+face.mouth max_control_norm = 0.002067
+face.face_oval max_control_norm = 0.002063
+left_hand.thumb max_control_norm = 0.002057
+```
+
+Conclusion:
+
+```text
+Top-k semantic controls are executable and give a slightly stronger local
+semantic pull than the one-offset-per-group basis. But the global 2D IoU and
+target recall are unchanged, and this still does not create mentor-pass head /
+face / hairline / hand geometry. The result supports the route toward richer
+semantic local surface carriers, but also confirms that the current CPU-smoke
+connected mesh remains too template-like. This is not a teacher, not a
+candidate, and not a cloud unblocker.
+```

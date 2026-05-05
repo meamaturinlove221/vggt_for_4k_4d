@@ -420,6 +420,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--semantic-hand-landmark-weight", type=float, default=0.0)
     parser.add_argument("--semantic-landmark-bidir-weight", type=float, default=0.05)
     parser.add_argument("--semantic-landmark-min-vertices", type=int, default=3)
+    parser.add_argument(
+        "--semantic-group-offset-limit",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional low-rank connected deformation basis for semantic landmark groups. "
+            "Each audited group gets one bounded 3D offset shared by its connected vertices. "
+            "This is a representation-capacity diagnostic, not a floating patch."
+        ),
+    )
+    parser.add_argument("--semantic-group-offset-reg", type=float, default=0.15)
+    parser.add_argument(
+        "--semantic-control-offset-limit",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional finer connected semantic deformation basis. For each semantic group, "
+            "take top-count payload vertices as local controls and diffuse their bounded 3D "
+            "offsets to nearby group vertices with RBF weights."
+        ),
+    )
+    parser.add_argument("--semantic-control-offset-topk", type=int, default=4)
+    parser.add_argument(
+        "--semantic-control-offset-radius",
+        type=float,
+        default=0.018,
+        help="RBF radius in world units for semantic control offsets.",
+    )
+    parser.add_argument("--semantic-control-offset-reg", type=float, default=0.10)
     parser.add_argument("--hand-landmark-min-points", type=int, default=12)
     parser.add_argument("--hand-landmark-min-confidence", type=float, default=0.02)
     parser.add_argument(
@@ -541,26 +570,37 @@ def load_semantic_landmark_payload(
     *,
     vertex_count: int,
     device: torch.device,
-) -> dict[str, torch.Tensor]:
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     if payload_path is None:
-        return {}
+        return {}, {}
     path = payload_path.expanduser().resolve()
     if not path.exists():
         raise FileNotFoundError(f"Semantic landmark payload not found: {path}")
-    out: dict[str, torch.Tensor] = {}
+    ids_out: dict[str, torch.Tensor] = {}
+    counts_out: dict[str, torch.Tensor] = {}
     with np.load(path, allow_pickle=False) as payload:
         if "group_names" not in payload.files:
             raise ValueError(f"{path} does not contain group_names")
         for raw_name in payload["group_names"].astype(str).tolist():
             name = str(raw_name)
             array_key = name.replace(".", "__") + "__ids"
+            count_key = name.replace(".", "__") + "__counts"
             if array_key not in payload.files:
                 continue
             ids = np.asarray(payload[array_key], dtype=np.int64)
-            ids = ids[(ids >= 0) & (ids < int(vertex_count))]
+            if count_key in payload.files:
+                counts = np.asarray(payload[count_key], dtype=np.float32)
+                if counts.shape[0] != ids.shape[0]:
+                    counts = np.ones_like(ids, dtype=np.float32)
+            else:
+                counts = np.ones_like(ids, dtype=np.float32)
+            valid = (ids >= 0) & (ids < int(vertex_count))
+            ids = ids[valid]
+            counts = counts[valid]
             if ids.size:
-                out[name] = torch.from_numpy(np.unique(ids).astype(np.int64)).to(device=device)
-    return out
+                ids_out[name] = torch.from_numpy(ids.astype(np.int64)).to(device=device)
+                counts_out[name] = torch.from_numpy(counts.astype(np.float32)).to(device=device)
+    return ids_out, counts_out
 
 
 def image_edge_distance(rgb: np.ndarray, mask: np.ndarray, low: float, high: float, mask_dilate: int) -> tuple[np.ndarray, dict[str, Any]]:
@@ -1916,6 +1956,107 @@ def semantic_landmark_projection_losses(
     }
 
 
+def apply_semantic_group_offsets(
+    vertex_count: int,
+    semantic_ids: dict[str, torch.Tensor],
+    group_names: list[str],
+    raw_offsets: torch.Tensor,
+    *,
+    limit: float,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not group_names or float(limit) <= 0.0:
+        zero_offsets = torch.zeros((vertex_count, 3), device=device)
+        bounded_groups = torch.zeros((0, 3), device=device)
+        return zero_offsets, bounded_groups
+    bounded_groups = torch.tanh(raw_offsets) * float(limit)
+    offsets = torch.zeros((vertex_count, 3), device=device)
+    counts = torch.zeros((vertex_count, 1), device=device)
+    for group_idx, group_name in enumerate(group_names):
+        ids = semantic_ids.get(group_name)
+        if ids is None or ids.numel() == 0:
+            continue
+        group_offset = bounded_groups[group_idx].reshape(1, 3).expand(ids.numel(), 3)
+        offsets.index_add_(0, ids, group_offset)
+        counts.index_add_(0, ids, torch.ones((ids.numel(), 1), device=device))
+    offsets = offsets / counts.clamp_min(1.0)
+    return offsets, bounded_groups
+
+
+def build_semantic_control_basis(
+    base_vertices: torch.Tensor,
+    semantic_ids: dict[str, torch.Tensor],
+    semantic_counts: dict[str, torch.Tensor],
+    group_names: list[str],
+    *,
+    topk: int,
+    radius: float,
+    min_vertices: int,
+) -> tuple[list[dict[str, Any]], int]:
+    basis: list[dict[str, Any]] = []
+    control_offset = 0
+    for group_name in group_names:
+        ids = semantic_ids.get(group_name)
+        if ids is None or ids.numel() < int(min_vertices):
+            continue
+        counts = semantic_counts.get(group_name)
+        if counts is None or counts.numel() != ids.numel():
+            counts = torch.ones((ids.numel(),), device=ids.device)
+        k = min(max(1, int(topk)), int(ids.numel()))
+        order = torch.argsort(counts, descending=True)[:k]
+        control_ids = ids.index_select(0, order)
+        group_xyz = base_vertices.index_select(0, ids)
+        control_xyz = base_vertices.index_select(0, control_ids)
+        d2 = torch.cdist(group_xyz, control_xyz).square()
+        sigma = float(radius)
+        if sigma <= 0.0:
+            extent = torch.linalg.norm(group_xyz.max(dim=0).values - group_xyz.min(dim=0).values)
+            sigma = max(1e-4, float(extent.detach().cpu()) * 0.35)
+        weights = torch.exp(-d2 / max(1e-8, 2.0 * sigma * sigma))
+        weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        basis.append(
+            {
+                "group_name": group_name,
+                "ids": ids,
+                "control_ids": control_ids,
+                "weights": weights,
+                "start": int(control_offset),
+                "end": int(control_offset + k),
+                "radius": float(sigma),
+            }
+        )
+        control_offset += k
+    return basis, control_offset
+
+
+def apply_semantic_control_offsets(
+    vertex_count: int,
+    control_basis: list[dict[str, Any]],
+    raw_offsets: torch.Tensor,
+    *,
+    limit: float,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not control_basis or float(limit) <= 0.0 or raw_offsets.numel() == 0:
+        zero_offsets = torch.zeros((vertex_count, 3), device=device)
+        bounded_controls = torch.zeros((0, 3), device=device)
+        return zero_offsets, bounded_controls
+    bounded_controls = torch.tanh(raw_offsets) * float(limit)
+    offsets = torch.zeros((vertex_count, 3), device=device)
+    counts = torch.zeros((vertex_count, 1), device=device)
+    for item in control_basis:
+        ids = item["ids"]
+        weights = item["weights"]
+        controls = bounded_controls[int(item["start"]) : int(item["end"])]
+        if ids.numel() == 0 or controls.numel() == 0:
+            continue
+        group_offsets = weights @ controls
+        offsets.index_add_(0, ids, group_offsets)
+        counts.index_add_(0, ids, torch.ones((ids.numel(), 1), device=device))
+    offsets = offsets / counts.clamp_min(1.0)
+    return offsets, bounded_controls
+
+
 def compute_mask_metrics(rendered: np.ndarray, target: np.ndarray) -> dict[str, Any]:
     rendered = np.asarray(rendered, dtype=bool)
     target = np.asarray(target, dtype=bool)
@@ -2737,11 +2878,12 @@ def main() -> int:
         requested_device = "cpu"
     device = torch.device(requested_device)
     height = width = int(args.target_size)
-    semantic_landmark_ids = load_semantic_landmark_payload(
+    semantic_landmark_ids, semantic_landmark_counts = load_semantic_landmark_payload(
         args.semantic_landmark_payload,
         vertex_count=int(base_vertices_np.shape[0]),
         device=device,
     )
+    semantic_group_names = sorted(semantic_landmark_ids.keys())
     view_payloads: list[dict[str, Any]] = []
     face_mp_module = None
     face_detector = None
@@ -2896,6 +3038,15 @@ def main() -> int:
     base_vertices = torch.from_numpy(base_vertices_np).to(device=device)
     base_normals = torch.from_numpy(normals_np).to(device=device)
     faces_t = torch.from_numpy(faces_np.astype(np.int64)).to(device=device)
+    semantic_control_basis, semantic_control_count = build_semantic_control_basis(
+        base_vertices,
+        semantic_landmark_ids,
+        semantic_landmark_counts,
+        semantic_group_names,
+        topk=int(args.semantic_control_offset_topk),
+        radius=float(args.semantic_control_offset_radius),
+        min_vertices=int(args.semantic_landmark_min_vertices),
+    )
     face_indices_t = torch.from_numpy(surfel_plan["face_indices"]).to(device=device)
     render_face_indices_np = choose_triangle_render_faces(
         faces_np,
@@ -2947,11 +3098,17 @@ def main() -> int:
     normal_offsets = torch.zeros(base_vertices_np.shape[0], device=device, requires_grad=True)
     hairline_free_offsets = torch.zeros((base_vertices_np.shape[0], 3), device=device, requires_grad=True)
     part_free_offsets = torch.zeros((base_vertices_np.shape[0], 3), device=device, requires_grad=True)
+    semantic_group_offsets = torch.zeros((len(semantic_group_names), 3), device=device, requires_grad=True)
+    semantic_control_offsets = torch.zeros((semantic_control_count, 3), device=device, requires_grad=True)
     optimizer_params = [normal_offsets] if bool(args.freeze_global_transform) else [delta_t, log_scale, normal_offsets]
     if float(args.hairline_free_offset_limit) > 0.0:
         optimizer_params.append(hairline_free_offsets)
     if float(part_free_limits_np.max(initial=0.0)) > 0.0:
         optimizer_params.append(part_free_offsets)
+    if semantic_group_names and float(args.semantic_group_offset_limit) > 0.0:
+        optimizer_params.append(semantic_group_offsets)
+    if semantic_control_count > 0 and float(args.semantic_control_offset_limit) > 0.0:
+        optimizer_params.append(semantic_control_offsets)
     optimizer = torch.optim.Adam(optimizer_params, lr=float(args.lr))
 
     history: list[dict[str, Any]] = []
@@ -2961,6 +3118,21 @@ def main() -> int:
         hairline_free = torch.tanh(hairline_free_offsets) * float(args.hairline_free_offset_limit)
         hairline_free = hairline_free * hairline_vertex_mask_t
         part_free = torch.tanh(part_free_offsets) * part_free_limits_t
+        semantic_vertex_offsets, bounded_semantic_group_offsets = apply_semantic_group_offsets(
+            vertex_count=int(base_vertices_np.shape[0]),
+            semantic_ids=semantic_landmark_ids,
+            group_names=semantic_group_names,
+            raw_offsets=semantic_group_offsets,
+            limit=float(args.semantic_group_offset_limit),
+            device=device,
+        )
+        semantic_control_vertex_offsets, bounded_semantic_control_offsets = apply_semantic_control_offsets(
+            vertex_count=int(base_vertices_np.shape[0]),
+            control_basis=semantic_control_basis,
+            raw_offsets=semantic_control_offsets,
+            limit=float(args.semantic_control_offset_limit),
+            device=device,
+        )
         if bool(args.freeze_global_transform):
             vertices = base_vertices
         else:
@@ -2968,6 +3140,8 @@ def main() -> int:
         vertices = vertices + base_normals * bounded_offsets[:, None]
         vertices = vertices + hairline_free
         vertices = vertices + part_free
+        vertices = vertices + semantic_vertex_offsets
+        vertices = vertices + semantic_control_vertex_offsets
         surfels, surfel_normals = compute_surfels(vertices, faces_t, face_indices_t, barycentric_t)
 
         mask_losses = []
@@ -3143,6 +3317,16 @@ def main() -> int:
         part_free_smooth = (
             (part_free[edges_t[:, 0]] - part_free[edges_t[:, 1]]).square().sum(dim=1) * edge_free_mask
         ).sum() / edge_free_count
+        semantic_group_offset_reg = (
+            bounded_semantic_group_offsets.square().sum(dim=1).mean()
+            if bounded_semantic_group_offsets.numel() > 0
+            else vertices.sum() * 0.0
+        )
+        semantic_control_offset_reg = (
+            bounded_semantic_control_offsets.square().sum(dim=1).mean()
+            if bounded_semantic_control_offsets.numel() > 0
+            else vertices.sum() * 0.0
+        )
         loss = (
             float(args.mask_weight) * mask_loss
             + float(args.recall_weight) * recall_loss
@@ -3165,6 +3349,8 @@ def main() -> int:
             + float(args.hairline_free_smooth_reg) * hairline_free_smooth
             + float(args.part_free_offset_reg) * part_free_reg
             + float(args.part_free_smooth_reg) * part_free_smooth
+            + float(args.semantic_group_offset_reg) * semantic_group_offset_reg
+            + float(args.semantic_control_offset_reg) * semantic_control_offset_reg
         )
         loss.backward()
         optimizer.step()
@@ -3201,6 +3387,8 @@ def main() -> int:
                     "hairline_free_smooth_reg": float(hairline_free_smooth.detach().cpu()),
                     "part_free_offset_reg": float(part_free_reg.detach().cpu()),
                     "part_free_smooth_reg": float(part_free_smooth.detach().cpu()),
+                    "semantic_group_offset_reg": float(semantic_group_offset_reg.detach().cpu()),
+                    "semantic_control_offset_reg": float(semantic_control_offset_reg.detach().cpu()),
                     "photo_valid_surfels": photo_meta["valid_surfels"],
                     "photo_mean_support": photo_meta["mean_support"],
                     "translation": [float(v) for v in delta_t.detach().cpu().numpy().reshape(-1)],
@@ -3213,6 +3401,21 @@ def main() -> int:
         final_hairline_free = torch.tanh(hairline_free_offsets) * float(args.hairline_free_offset_limit)
         final_hairline_free = final_hairline_free * hairline_vertex_mask_t
         final_part_free = torch.tanh(part_free_offsets) * part_free_limits_t
+        final_semantic_vertex_offsets, final_semantic_group_offsets = apply_semantic_group_offsets(
+            vertex_count=int(base_vertices_np.shape[0]),
+            semantic_ids=semantic_landmark_ids,
+            group_names=semantic_group_names,
+            raw_offsets=semantic_group_offsets,
+            limit=float(args.semantic_group_offset_limit),
+            device=device,
+        )
+        final_semantic_control_vertex_offsets, final_semantic_control_offsets = apply_semantic_control_offsets(
+            vertex_count=int(base_vertices_np.shape[0]),
+            control_basis=semantic_control_basis,
+            raw_offsets=semantic_control_offsets,
+            limit=float(args.semantic_control_offset_limit),
+            device=device,
+        )
         if bool(args.freeze_global_transform):
             optimized = base_vertices
         else:
@@ -3220,10 +3423,14 @@ def main() -> int:
         optimized = optimized + base_normals * final_offsets[:, None]
         optimized = optimized + final_hairline_free
         optimized = optimized + final_part_free
+        optimized = optimized + final_semantic_vertex_offsets
+        optimized = optimized + final_semantic_control_vertex_offsets
         optimized_np = optimized.detach().cpu().numpy().astype(np.float32)
         final_offsets_np = final_offsets.detach().cpu().numpy().astype(np.float32)
         final_hairline_free_np = final_hairline_free.detach().cpu().numpy().astype(np.float32)
         final_part_free_np = final_part_free.detach().cpu().numpy().astype(np.float32)
+        final_semantic_group_offsets_np = final_semantic_group_offsets.detach().cpu().numpy().astype(np.float32)
+        final_semantic_control_offsets_np = final_semantic_control_offsets.detach().cpu().numpy().astype(np.float32)
 
     initial_rows, initial_overlays = evaluate_mesh(base_vertices_np, faces_np, view_payloads, output_dir / "initial", args.overlay_limit)
     optimized_rows, optimized_overlays = evaluate_mesh(optimized_np, faces_np, view_payloads, output_dir / "optimized", args.overlay_limit)
@@ -3397,6 +3604,48 @@ def main() -> int:
             "teacher surfaces and not a cloud unlock."
         ),
     }
+    semantic_group_offset_stats: dict[str, Any] = {
+        "enabled": bool(float(args.semantic_group_offset_limit) > 0.0 and len(semantic_group_names) > 0),
+        "limit": float(args.semantic_group_offset_limit),
+        "offset_reg": float(args.semantic_group_offset_reg),
+        "groups": {},
+        "note": (
+            "Each semantic group offset is a low-rank connected deformation shared by audited "
+            "vertices in that group. It is a carrier-capacity diagnostic, not a floating patch."
+        ),
+    }
+    for idx, group_name in enumerate(semantic_group_names):
+        norm = float(np.linalg.norm(final_semantic_group_offsets_np[idx])) if idx < final_semantic_group_offsets_np.shape[0] else 0.0
+        semantic_group_offset_stats["groups"][group_name] = {
+            "vertices": int(semantic_landmark_ids[group_name].numel()),
+            "offset_norm": norm,
+        }
+    semantic_control_offset_stats: dict[str, Any] = {
+        "enabled": bool(float(args.semantic_control_offset_limit) > 0.0 and semantic_control_count > 0),
+        "limit": float(args.semantic_control_offset_limit),
+        "topk": int(args.semantic_control_offset_topk),
+        "radius": float(args.semantic_control_offset_radius),
+        "offset_reg": float(args.semantic_control_offset_reg),
+        "control_count": int(semantic_control_count),
+        "groups": {},
+        "note": (
+            "Semantic controls are top-count audited vertices with local RBF diffusion over the "
+            "connected mesh. They add local carrier capacity for mouth/nose/fingers without "
+            "creating disconnected patches."
+        ),
+    }
+    for item in semantic_control_basis:
+        start = int(item["start"])
+        end = int(item["end"])
+        values = final_semantic_control_offsets_np[start:end]
+        norms = np.linalg.norm(values, axis=1) if values.size else np.zeros((0,), dtype=np.float32)
+        semantic_control_offset_stats["groups"][str(item["group_name"])] = {
+            "vertices": int(item["ids"].numel()),
+            "controls": int(end - start),
+            "radius": float(item["radius"]),
+            "mean_control_norm": float(norms.mean()) if norms.size else 0.0,
+            "max_control_norm": float(norms.max()) if norms.size else 0.0,
+        }
     image_edge_stats = {
         "weight": float(args.image_edge_weight),
         "part_ids": [int(v) for v in image_edge_part_ids],
@@ -3492,6 +3741,8 @@ def main() -> int:
         "face_landmarks": face_landmark_stats,
         "hand_landmarks": hand_landmark_stats,
         "semantic_landmarks": semantic_landmark_stats,
+        "semantic_group_offsets": semantic_group_offset_stats,
+        "semantic_control_offsets": semantic_control_offset_stats,
         "image_edges": image_edge_stats,
         "triangle_rgb": triangle_rgb_stats,
         "hairline_free_offset": hairline_free_stats,
@@ -3564,6 +3815,10 @@ def main() -> int:
         f"- semantic landmark payload groups: `{semantic_landmark_stats['payload_group_count']}`",
         f"- semantic face/hand landmark weights: `{float(args.semantic_face_landmark_weight)}` / `{float(args.semantic_hand_landmark_weight)}`",
         f"- semantic landmark last meta: `{json_ready(semantic_landmark_stats['last_meta'])}`",
+        f"- semantic group offset enabled: `{semantic_group_offset_stats['enabled']}`",
+        f"- semantic group offset limit/reg: `{float(args.semantic_group_offset_limit)}` / `{float(args.semantic_group_offset_reg)}`",
+        f"- semantic control offset enabled: `{semantic_control_offset_stats['enabled']}`",
+        f"- semantic control count/topk/radius: `{semantic_control_offset_stats['control_count']}` / `{int(args.semantic_control_offset_topk)}` / `{float(args.semantic_control_offset_radius)}`",
         f"- image edge weight: `{float(args.image_edge_weight)}`",
         f"- image edge part ids: `{image_edge_stats['part_ids']}`",
         f"- image edge usable views: `{image_edge_stats['usable_views']}/{image_edge_stats['selected_views']}`",
