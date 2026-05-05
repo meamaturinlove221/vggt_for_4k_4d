@@ -618,6 +618,94 @@ Therefore the hand landmark signal is useful evidence, but the current carrier
 and objective still cannot satisfy the full-body/hands strict gate. Do not
 continue by tuning hand landmark weights.
 
+## Soft Triangle Renderer Diagnostic
+
+The repeated negative landmark / soft-splat results indicate that the renderer
+itself is part of the failure mode: Gaussian surfel splats can improve proxy
+losses without representing connected mesh visibility. The optimizer therefore
+now has an explicit renderer switch:
+
+```text
+--renderer surfel
+--renderer triangle
+```
+
+`surfel` remains the default. `triangle` is a CPU-only diagnostic renderer using
+a sampled set of connected mesh triangles and a soft barycentric inside test. It
+is not a production rasterizer, not a teacher, and not a cloud unblocker.
+
+Tiny 1-view smoke:
+
+```text
+output/normal_line_multiview_20260505/triangle_renderer_smoke1_t64_s2000
+sampled render faces = 1771
+mask loss = 0.745597779750824
+soft recall loss = 0.7477416396141052
+```
+
+The 5-step 1-view optimization smoke was:
+
+```text
+output/normal_line_multiview_20260505/triangle_renderer_opt_smoke1_t64_s2000_step5
+```
+
+Metrics:
+
+```text
+initial mean IoU = 0.7706708312034607
+optimized mean IoU = 0.7737909555435181
+IoU delta = +0.003120124340057373
+initial target recall = 0.8502581715583801
+optimized target recall = 0.8537005186080933
+target recall delta = +0.0034423470497131348
+```
+
+Loss decreased monotonically:
+
+```text
+loss: 1.0841139554977417 -> 1.0075054168701172
+mask loss: 0.745597779750824 -> 0.6873644590377808
+soft recall loss: 0.7477416396141052 -> 0.7071121335029602
+```
+
+The 5-step 3-view optimization smoke was:
+
+```text
+output/normal_line_multiview_20260505/triangle_renderer_opt_smoke3_t64_s2000_step5
+```
+
+Metrics:
+
+```text
+initial mean IoU = 0.7706115245819092
+optimized mean IoU = 0.7750326991081238
+IoU delta = +0.0044211745262146
+initial target recall = 0.8578081130981445
+optimized target recall = 0.8643603324890137
+target recall delta = +0.006552219390869141
+```
+
+Loss again decreased monotonically:
+
+```text
+loss: 0.8999999165534973 -> 0.8428559303283691
+mask loss: 0.5696393847465515 -> 0.5290072560310364
+soft recall loss: 0.7117570042610168 -> 0.6752879619598389
+photometric consistency: 0.09462591260671616 -> 0.09386990964412689
+```
+
+Interpretation:
+
+This is the first raw-surface diagnostic in this sequence where the optimized
+hard-raster IoU and target recall both improve without allowing global
+scale/translation shrinkage. The effect is still small and low-resolution
+(`64px`, `3 views`, `5 steps`, sampled triangles only), and the visual result is
+not a normal-human Open3D surface. It should not be scaled by brute-force CPU
+loops. The useful conclusion is narrower: the next non-redundant route is a real
+connected-mesh rasterizer/visibility backend, preferably accelerated, rather
+than further tuning surfel splat weights, landmark weights, support thresholds,
+or r-candidates.
+
 ## Decision
 
 Do not:

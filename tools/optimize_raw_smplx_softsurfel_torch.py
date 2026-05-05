@@ -85,6 +85,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--render-pixel-chunk", type=int, default=4096)
     parser.add_argument("--gaussian-sigma", type=float, default=1.7)
     parser.add_argument(
+        "--renderer",
+        choices=("surfel", "triangle"),
+        default="surfel",
+        help=(
+            "Differentiable mask/depth renderer for the optimization loss. "
+            "triangle is a CPU smoke for connected mesh visibility; surfel remains the default."
+        ),
+    )
+    parser.add_argument(
+        "--triangle-inside-softness",
+        type=float,
+        default=70.0,
+        help="Sigmoid sharpness for the soft barycentric inside test when --renderer triangle.",
+    )
+    parser.add_argument(
         "--depth-softness",
         type=float,
         default=0.0,
@@ -838,6 +853,134 @@ def render_soft_surfel_maps(
         "normal": normal,
         "visibility": visibility,
         "valid_count": valid.float().sum(),
+    }
+
+
+def render_soft_triangle_maps(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    face_indices: torch.Tensor,
+    world_to_cam: torch.Tensor,
+    intrinsic: torch.Tensor,
+    height: int,
+    width: int,
+    pixel_chunk: int,
+    inside_softness: float,
+    face_chunk: int = 256,
+) -> dict[str, torch.Tensor]:
+    """CPU-friendly soft triangle smoke for connected surface visibility.
+
+    This is intentionally modest: it renders a sampled set of connected mesh
+    triangles with a soft barycentric inside test. It is a diagnostic renderer,
+    not a production rasterizer or a strict teacher gate.
+    """
+
+    if face_indices.numel() == 0:
+        zeros = torch.zeros((height, width), dtype=vertices.dtype, device=vertices.device)
+        return {
+            "mask": zeros,
+            "depth": zeros,
+            "normal": torch.zeros((height, width, 3), dtype=vertices.dtype, device=vertices.device),
+            "visibility": zeros,
+            "valid_count": torch.zeros((), dtype=vertices.dtype, device=vertices.device),
+        }
+    selected_faces = faces.index_select(0, face_indices)
+    tri_world = vertices[selected_faces]
+    tri_flat = tri_world.reshape(-1, 3)
+    uv_flat, z_flat, _ = project_points(tri_flat, world_to_cam, intrinsic)
+    uv_tri = uv_flat.reshape(-1, 3, 2)
+    z_tri = z_flat.reshape(-1, 3)
+    face_normals = torch.cross(tri_world[:, 1] - tri_world[:, 0], tri_world[:, 2] - tri_world[:, 0], dim=1)
+    face_normals = F.normalize(face_normals, dim=1, eps=1e-6)
+
+    finite = torch.isfinite(uv_tri).all(dim=(1, 2)) & torch.isfinite(z_tri).all(dim=1) & (z_tri > 1e-5).all(dim=1)
+    min_xy = uv_tri.min(dim=1).values
+    max_xy = uv_tri.max(dim=1).values
+    intersects = (
+        (max_xy[:, 0] >= -2.0)
+        & (min_xy[:, 0] <= float(width + 1))
+        & (max_xy[:, 1] >= -2.0)
+        & (min_xy[:, 1] <= float(height + 1))
+    )
+    valid_faces = finite & intersects
+    if not valid_faces.any():
+        zeros = torch.zeros((height, width), dtype=vertices.dtype, device=vertices.device)
+        return {
+            "mask": zeros,
+            "depth": zeros,
+            "normal": torch.zeros((height, width, 3), dtype=vertices.dtype, device=vertices.device),
+            "visibility": zeros,
+            "valid_count": torch.zeros((), dtype=vertices.dtype, device=vertices.device),
+        }
+    uv_tri = uv_tri[valid_faces]
+    z_tri = z_tri[valid_faces]
+    face_normals = face_normals[valid_faces]
+
+    ys = torch.arange(height, dtype=vertices.dtype, device=vertices.device) + 0.5
+    xs = torch.arange(width, dtype=vertices.dtype, device=vertices.device) + 0.5
+    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+    pixels = torch.stack([grid_x.reshape(-1), grid_y.reshape(-1)], dim=1)
+
+    masks = []
+    depths = []
+    normal_maps = []
+    vis_maps = []
+    pchunk = max(1, int(pixel_chunk))
+    fchunk = max(1, int(face_chunk))
+    sharpness = max(1e-3, float(inside_softness))
+    for start in range(0, pixels.shape[0], pchunk):
+        pixel_xy = pixels[start : start + pchunk]
+        sumw = torch.zeros((pixel_xy.shape[0],), dtype=vertices.dtype, device=vertices.device)
+        depth_num = torch.zeros_like(sumw)
+        normal_num = torch.zeros((pixel_xy.shape[0], 3), dtype=vertices.dtype, device=vertices.device)
+        for face_start in range(0, uv_tri.shape[0], fchunk):
+            uv = uv_tri[face_start : face_start + fchunk]
+            z = z_tri[face_start : face_start + fchunk]
+            normals = face_normals[face_start : face_start + fchunk]
+            v0 = uv[:, 0, :]
+            v1 = uv[:, 1, :]
+            v2 = uv[:, 2, :]
+            denom = (v1[:, 1] - v2[:, 1]) * (v0[:, 0] - v2[:, 0]) + (v2[:, 0] - v1[:, 0]) * (v0[:, 1] - v2[:, 1])
+            good = denom.abs() > 1e-6
+            if not good.any():
+                continue
+            v0 = v0[good]
+            v1 = v1[good]
+            v2 = v2[good]
+            z = z[good]
+            normals = normals[good]
+            denom = denom[good]
+            px = pixel_xy[:, 0:1]
+            py = pixel_xy[:, 1:2]
+            w0 = ((v1[:, 1] - v2[:, 1])[None, :] * (px - v2[:, 0][None, :]) + (v2[:, 0] - v1[:, 0])[None, :] * (py - v2[:, 1][None, :])) / denom[None, :]
+            w1 = ((v2[:, 1] - v0[:, 1])[None, :] * (px - v2[:, 0][None, :]) + (v0[:, 0] - v2[:, 0])[None, :] * (py - v2[:, 1][None, :])) / denom[None, :]
+            w2 = 1.0 - w0 - w1
+            inside = torch.sigmoid(sharpness * w0) * torch.sigmoid(sharpness * w1) * torch.sigmoid(sharpness * w2)
+            tri_z = w0 * z[:, 0][None, :] + w1 * z[:, 1][None, :] + w2 * z[:, 2][None, :]
+            positive = tri_z > 1e-5
+            weights = inside * positive.to(inside.dtype)
+            local_sumw = weights.sum(dim=1)
+            sumw = sumw + local_sumw
+            depth_num = depth_num + (weights * tri_z).sum(dim=1)
+            normal_num = normal_num + weights @ normals
+        alpha = 1.0 - torch.exp(-sumw.clamp_min(0.0))
+        depth = depth_num / sumw.clamp_min(1e-8)
+        normal = F.normalize(normal_num / sumw.clamp_min(1e-8)[:, None], dim=1, eps=1e-6)
+        masks.append(alpha)
+        depths.append(depth)
+        normal_maps.append(normal)
+        vis_maps.append(sumw)
+
+    mask = torch.cat(masks, dim=0).reshape(height, width).clamp(0.0, 1.0)
+    depth = torch.cat(depths, dim=0).reshape(height, width)
+    normal = torch.cat(normal_maps, dim=0).reshape(height, width, 3)
+    visibility = torch.cat(vis_maps, dim=0).reshape(height, width)
+    return {
+        "mask": mask,
+        "depth": depth,
+        "normal": normal,
+        "visibility": visibility,
+        "valid_count": valid_faces.float().sum(),
     }
 
 
@@ -2053,6 +2196,7 @@ def main() -> int:
     base_normals = torch.from_numpy(normals_np).to(device=device)
     faces_t = torch.from_numpy(faces_np.astype(np.int64)).to(device=device)
     face_indices_t = torch.from_numpy(surfel_plan["face_indices"]).to(device=device)
+    render_face_indices_t = torch.unique(face_indices_t)
     barycentric_t = torch.from_numpy(surfel_plan["barycentric"]).to(device=device)
     surfel_part_ids_t = torch.from_numpy(surfel_plan["part_ids"]).to(device=device)
     sdf_indices_t = torch.from_numpy(sdf_indices_np).to(device=device)
@@ -2096,17 +2240,30 @@ def main() -> int:
         visibility_depths = []
         sampled_vertices = vertices.index_select(0, sdf_indices_t)
         for payload in view_payloads:
-            render = render_soft_surfel_maps(
-                surfels=surfels,
-                normals=surfel_normals,
-                world_to_cam=payload["world_to_cam"],
-                intrinsic=payload["intrinsic"],
-                height=height,
-                width=width,
-                sigma=float(args.gaussian_sigma),
-                pixel_chunk=int(args.render_pixel_chunk),
-                depth_softness=float(args.depth_softness),
-            )
+            if str(args.renderer) == "triangle":
+                render = render_soft_triangle_maps(
+                    vertices=vertices,
+                    faces=faces_t,
+                    face_indices=render_face_indices_t,
+                    world_to_cam=payload["world_to_cam"],
+                    intrinsic=payload["intrinsic"],
+                    height=height,
+                    width=width,
+                    pixel_chunk=int(args.render_pixel_chunk),
+                    inside_softness=float(args.triangle_inside_softness),
+                )
+            else:
+                render = render_soft_surfel_maps(
+                    surfels=surfels,
+                    normals=surfel_normals,
+                    world_to_cam=payload["world_to_cam"],
+                    intrinsic=payload["intrinsic"],
+                    height=height,
+                    width=width,
+                    sigma=float(args.gaussian_sigma),
+                    pixel_chunk=int(args.render_pixel_chunk),
+                    depth_softness=float(args.depth_softness),
+                )
             visibility_depths.append(render["depth"])
             rendered_mask = render["mask"].clamp(1e-4, 1.0 - 1e-4)
             target_mask = payload["mask_t"].reshape(height, width)
@@ -2435,6 +2592,15 @@ def main() -> int:
         "config": vars(args),
         "part_names": PART_NAMES,
         "connected_template": connected_template_summary,
+        "renderer": {
+            "mode": str(args.renderer),
+            "triangle_inside_softness": float(args.triangle_inside_softness),
+            "sampled_render_faces": int(render_face_indices_t.numel()),
+            "note": (
+                "triangle mode is a connected-mesh visibility diagnostic. It is still not a production "
+                "rasterizer and does not create a teacher or cloud unblocker."
+            ),
+        },
         "part_stats": part_stats,
         "surfel_part_stats": surfel_part_stats,
         "part_target_stats": part_target_stats,
@@ -2490,6 +2656,8 @@ def main() -> int:
         f"- creates teacher targets: `{bool(args.export_raster_targets)}`",
         f"- creates candidate predictions: `False`",
         f"- freeze global transform: `{bool(args.freeze_global_transform)}`",
+        f"- renderer: `{str(args.renderer)}`",
+        f"- sampled render faces: `{int(render_face_indices_t.numel())}`",
         f"- hairline free-offset enabled: `{hairline_free_stats['enabled']}`",
         f"- hairline free-offset p90: `{hairline_free_stats['p90_norm']}`",
         f"- balanced part surfels: `{bool(args.balanced_part_surfels)}`",
