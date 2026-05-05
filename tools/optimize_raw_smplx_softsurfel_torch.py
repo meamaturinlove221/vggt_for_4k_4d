@@ -156,6 +156,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hairline-free-offset-reg", type=float, default=0.50)
     parser.add_argument("--hairline-free-smooth-reg", type=float, default=0.10)
     parser.add_argument(
+        "--hair-boundary-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional connected-cap diagnostic. Pulls the hair/head cap outer ring toward "
+            "raw-mask silhouette boundaries using image SDF; disabled by default."
+        ),
+    )
+    parser.add_argument(
         "--extra-hairline-surfels",
         type=int,
         default=0,
@@ -675,6 +684,43 @@ def part_recall_loss(
         return zero, {"enabled_terms": 0.0, "terms": rows}
     loss = torch.stack(losses).mean()
     return loss, {"enabled_terms": float(len(losses)), "terms": rows}
+
+
+def vertex_silhouette_boundary_loss(
+    vertices: torch.Tensor,
+    vertex_ids: torch.Tensor,
+    view_payloads: list[dict[str, Any]],
+    height: int,
+    width: int,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    if vertex_ids.numel() == 0:
+        zero = vertices.sum() * 0.0
+        return zero, {"visible_vertices": 0.0, "views": 0.0}
+    selected = vertices.index_select(0, vertex_ids)
+    losses: list[torch.Tensor] = []
+    visible_counts: list[float] = []
+    for payload in view_payloads:
+        uv, z, _ = project_points(selected, payload["world_to_cam"], payload["intrinsic"])
+        valid = (
+            (z > 1e-5)
+            & (uv[:, 0] >= 0.0)
+            & (uv[:, 0] <= width - 1)
+            & (uv[:, 1] >= 0.0)
+            & (uv[:, 1] <= height - 1)
+        )
+        if not valid.any():
+            continue
+        sdf_values = sample_sdf(payload["sdf"], uv[valid], height, width)
+        losses.append(sdf_values.abs().mean())
+        visible_counts.append(float(valid.float().sum().detach().cpu()))
+    if not losses:
+        zero = vertices.sum() * 0.0
+        return zero, {"visible_vertices": 0.0, "views": 0.0}
+    stacked = torch.stack(losses)
+    return stacked.mean(), {
+        "visible_vertices": float(np.mean(visible_counts)) if visible_counts else 0.0,
+        "views": float(len(losses)),
+    }
 
 
 def compute_mask_metrics(rendered: np.ndarray, target: np.ndarray) -> dict[str, Any]:
@@ -1392,24 +1438,33 @@ def main() -> int:
     normals_np = compute_vertex_normals(base_vertices_np, faces_np).astype(np.float32)
     vertex_parts_np = classify_vertex_parts(np.asarray(static_features["canonical_positions"], dtype=np.float32))
     connected_template_summary: dict[str, Any] | None = None
+    hair_outer_vertex_ids_np = np.zeros((0,), dtype=np.int64)
     if args.connected_template_payload:
         template_payload = args.connected_template_payload.expanduser().resolve()
         with np.load(template_payload, allow_pickle=False) as payload:
+            template_base_count = int(np.asarray(payload["vertices"]).shape[0])
             base_vertices_np = np.asarray(payload["hybrid_vertices"], dtype=np.float32)
             faces_np = np.asarray(payload["hybrid_faces"], dtype=np.int32)
             base_part_ids = np.asarray(payload["part_ids"], dtype=np.int64)
+            hair_ring_count = int(np.asarray(payload["hair_ring_vertex_ids"], dtype=np.int64).shape[0])
             if base_part_ids.shape[0] > base_vertices_np.shape[0]:
                 raise ValueError(
                     f"Template part ids ({base_part_ids.shape[0]}) exceed vertex count ({base_vertices_np.shape[0]})."
                 )
             vertex_parts_np = np.full((base_vertices_np.shape[0],), 4, dtype=np.int64)
             vertex_parts_np[: base_part_ids.shape[0]] = base_part_ids
+            hair_outer_vertex_ids_np = np.arange(
+                template_base_count + hair_ring_count,
+                template_base_count + 2 * hair_ring_count,
+                dtype=np.int64,
+            )
         normals_np = compute_vertex_normals(base_vertices_np, faces_np).astype(np.float32)
         connected_template_summary = {
             "payload": template_payload,
             "vertices": int(base_vertices_np.shape[0]),
             "faces": int(faces_np.shape[0]),
             "new_vertices": int(base_vertices_np.shape[0] - mesh["vertices"].shape[0]),
+            "hair_outer_ring_vertices": int(hair_outer_vertex_ids_np.shape[0]),
             "note": (
                 "Connected raw-surface v2 carrier is used for the local upper-bound smoke. "
                 "It is not a teacher and does not permit cloud."
@@ -1502,6 +1557,7 @@ def main() -> int:
     edges_t = torch.from_numpy(edges_np).to(device=device)
     center = torch.from_numpy(base_vertices_np.mean(axis=0, keepdims=True).astype(np.float32)).to(device=device)
     hairline_vertex_mask_t = torch.from_numpy((vertex_parts_np == 4).astype(np.float32))[:, None].to(device=device)
+    hair_outer_vertex_ids_t = torch.from_numpy(hair_outer_vertex_ids_np.astype(np.int64)).to(device=device)
 
     delta_t = torch.zeros(3, device=device, requires_grad=True)
     log_scale = torch.zeros(1, device=device, requires_grad=True)
@@ -1594,6 +1650,13 @@ def main() -> int:
             depth_softness=float(args.depth_softness),
             min_pixels=int(args.part_target_min_pixels),
         )
+        hair_boundary_loss, hair_boundary_meta = vertex_silhouette_boundary_loss(
+            vertices=vertices,
+            vertex_ids=hair_outer_vertex_ids_t,
+            view_payloads=view_payloads,
+            height=height,
+            width=width,
+        )
 
         global_reg = float(args.translation_reg) * delta_t.square().sum() + float(args.scale_reg) * log_scale.square().sum()
         offset_values = bounded_offsets
@@ -1609,6 +1672,7 @@ def main() -> int:
             + float(args.outside_weight) * outside_loss
             + float(args.boundary_weight) * boundary_loss
             + float(args.part_recall_weight) * part_loss
+            + float(args.hair_boundary_weight) * hair_boundary_loss
             + float(args.photo_weight) * photo_loss
             + global_reg
             + float(args.offset_reg) * offset_reg
@@ -1630,6 +1694,8 @@ def main() -> int:
                     "boundary_loss": float(boundary_loss.detach().cpu()),
                     "part_recall_loss": float(part_loss.detach().cpu()),
                     "part_recall_meta": part_meta,
+                    "hair_boundary_loss": float(hair_boundary_loss.detach().cpu()),
+                    "hair_boundary_meta": hair_boundary_meta,
                     "photometric_consistency_loss": float(photo_loss.detach().cpu()),
                     "offset_reg": float(offset_reg.detach().cpu()),
                     "offset_smooth_reg": float(smooth_reg.detach().cpu()),
@@ -1833,6 +1899,7 @@ def main() -> int:
         f"- surfel part stats: `{surfel_part_stats}`",
         f"- part recall weight: `{float(args.part_recall_weight)}`",
         f"- part target stats: `{json_ready(part_target_stats)}`",
+        f"- hair boundary weight: `{float(args.hair_boundary_weight)}`",
         f"- extra hairline surfels: `{extra_hairline_summary.get('kept_points', 0)}`",
         f"- initial mean IoU: `{initial_iou['mean']}`",
         f"- optimized mean IoU: `{optimized_iou['mean']}`",

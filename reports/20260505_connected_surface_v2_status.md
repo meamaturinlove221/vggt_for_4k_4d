@@ -281,6 +281,64 @@ another negative diagnostic. Do not tune the part proxy fractions or weight as
 another loop. The next non-redundant step must improve the surface objective or
 renderer itself, rather than weighting the same soft-splat mask losses harder.
 
+## Mesh-Level Hair Boundary Smoke
+
+The connected cap payload stores the scalp seam and cap vertex order, so the
+optimizer was extended with an optional `--hair-boundary-weight`. This is a
+mesh-level diagnostic: it pulls the connected hair/head cap outer ring toward
+the raw human-mask silhouette using the image SDF. It does not use VGGT
+depth/point/normal and does not create a candidate.
+
+Smoke output:
+
+```text
+output/normal_line_multiview_20260505/connected_surface_template_v2_0012_11_frame0000_smoothcap_hairboundary_smoke3_t96_export6v
+```
+
+Small-smoke metrics:
+
+```text
+initial mean IoU = 0.7690008282661438
+optimized mean IoU = 0.8019518852233887
+IoU delta = +0.03295105695724487
+initial target recall = 0.8903587460517883
+optimized target recall = 0.8553047180175781
+target recall delta = -0.035054028034210205
+```
+
+This is better than the proxy-only part recall diagnostic, and the target recall
+drop is smaller than the previous soft-depth smoke, but it still loses full-mask
+coverage and is not a teacher.
+
+After rasterizing to the original 6-view headshoulder protocol, bridging into
+the signfix VGGT world, and running the strict teacher gate:
+
+```text
+overall numeric pass = false
+visual pass = false
+face_core pass = 1 / 6
+head_face pass = 2 / 6
+hairline pass = 0 / 6
+head pass = 2 / 6
+```
+
+Passing subviews were limited:
+
+```text
+face_core: view05 only, coverage 0.9650, p50 residual 0.0084, p90 residual 0.0181
+head_face: view01 and view05 only
+head: view01 and view05 only
+hairline: 0 / 6
+```
+
+Interpretation:
+
+The mesh-level hair-boundary term is the first non-redundant positive signal in
+v2, because it acts on connected cap vertices rather than free points or coarse
+part proxies. However, the strict gate remains blocked: coverage is view-local,
+hairline still fails every view, and the Open3D result still cannot be called a
+normal human head/face/hair surface.
+
 ## Decision
 
 Do not:
