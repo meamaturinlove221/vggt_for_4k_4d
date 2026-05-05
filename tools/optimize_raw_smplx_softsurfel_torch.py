@@ -46,6 +46,27 @@ PART_NAMES = {
     5: "lower_clothing_proxy",
 }
 
+PART_ALIASES = {
+    "body": 0,
+    "torso": 0,
+    "limbs": 0,
+    "left_hand": 1,
+    "lh": 1,
+    "right_hand": 2,
+    "rh": 2,
+    "hands": (1, 2),
+    "hand": (1, 2),
+    "face": 3,
+    "head": 3,
+    "head_face": 3,
+    "hair": 4,
+    "hairline": 4,
+    "head_top": 4,
+    "clothing": 5,
+    "skirt": 5,
+    "lower": 5,
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -164,6 +185,33 @@ def parse_args() -> argparse.Namespace:
             "Optional visibility filter for the photometric loss. When >0, a surfel must be "
             "near the current rendered front depth in that view before its sampled RGB counts."
         ),
+    )
+    parser.add_argument(
+        "--image-edge-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional raw-RGB edge distance loss for connected face/hair/hand/clothing vertices. "
+            "This uses Canny edges from the input images, not VGGT depth/point/normal, and is "
+            "disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--image-edge-part-ids",
+        default="1,2,3,4,5",
+        help=(
+            "Comma-separated part ids or aliases for --image-edge-weight. "
+            "Examples: 'face,hair,hands,clothing' or '1,2,3,4,5'."
+        ),
+    )
+    parser.add_argument("--image-edge-canny-low", type=float, default=40.0)
+    parser.add_argument("--image-edge-canny-high", type=float, default=120.0)
+    parser.add_argument("--image-edge-mask-dilate", type=int, default=3)
+    parser.add_argument(
+        "--image-edge-max-distance",
+        type=float,
+        default=0.08,
+        help="Clamp normalized edge distance in the optional image-edge loss; <=0 disables clamp.",
     )
     parser.add_argument(
         "--freeze-global-transform",
@@ -365,6 +413,58 @@ def mask_sdf(mask: np.ndarray) -> np.ndarray:
     outside = cv2.distanceTransform((1 - mask_u8).astype(np.uint8), cv2.DIST_L2, 3)
     sdf = outside - inside
     return (sdf / float(max(mask.shape))).astype(np.float32)
+
+
+def parse_part_id_spec(spec: str) -> list[int]:
+    out: list[int] = []
+    for raw_item in str(spec).replace(";", ",").split(","):
+        item = raw_item.strip().lower()
+        if not item:
+            continue
+        if item.isdigit() or (item.startswith("-") and item[1:].isdigit()):
+            value = int(item)
+            if value not in PART_NAMES:
+                raise ValueError(f"Unknown part id {value!r} in --image-edge-part-ids")
+            out.append(value)
+            continue
+        if item not in PART_ALIASES:
+            raise ValueError(f"Unknown part alias {item!r} in --image-edge-part-ids")
+        value = PART_ALIASES[item]
+        if isinstance(value, tuple):
+            out.extend(int(v) for v in value)
+        else:
+            out.append(int(value))
+    return sorted(set(out))
+
+
+def image_edge_distance(rgb: np.ndarray, mask: np.ndarray, low: float, high: float, mask_dilate: int) -> tuple[np.ndarray, dict[str, Any]]:
+    """Distance to raw RGB Canny edges, normalized by image size.
+
+    This deliberately uses only raw image/mask evidence. It is a local surface
+    objective, not a teacher surface and not a VGGT shell recycling path.
+    """
+
+    rgb_u8 = np.clip(normalize_rgb(rgb) * 255.0, 0.0, 255.0).astype(np.uint8)
+    gray = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, float(low), float(high)).astype(np.uint8)
+    mask_u8 = (np.asarray(mask, dtype=np.uint8) > 0).astype(np.uint8)
+    if int(mask_dilate) > 0:
+        k = max(1, int(mask_dilate))
+        kernel = np.ones((k, k), dtype=np.uint8)
+        mask_u8 = cv2.dilate(mask_u8, kernel, iterations=1)
+    edges = (edges > 0).astype(np.uint8) * mask_u8
+    edge_pixels = int(edges.sum())
+    if edge_pixels == 0:
+        dist = np.ones(mask_u8.shape, dtype=np.float32)
+    else:
+        dist = cv2.distanceTransform((1 - edges).astype(np.uint8), cv2.DIST_L2, 3)
+        dist = (dist / float(max(mask_u8.shape))).astype(np.float32)
+    return dist.astype(np.float32), {
+        "edge_pixels": edge_pixels,
+        "low": float(low),
+        "high": float(high),
+        "mask_dilate": int(mask_dilate),
+    }
 
 
 def boundary_points(mask: np.ndarray, max_points: int) -> np.ndarray:
@@ -1199,6 +1299,56 @@ def vertex_silhouette_boundary_loss(
     return stacked.mean(), {
         "visible_vertices": float(np.mean(visible_counts)) if visible_counts else 0.0,
         "views": float(len(losses)),
+    }
+
+
+def vertex_image_edge_loss(
+    vertices: torch.Tensor,
+    vertex_ids: torch.Tensor,
+    view_payloads: list[dict[str, Any]],
+    height: int,
+    width: int,
+    *,
+    max_distance: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    if vertex_ids.numel() == 0:
+        zero = vertices.sum() * 0.0
+        return zero, {"visible_vertices": 0.0, "views": 0.0, "edge_pixels": 0.0}
+    selected = vertices.index_select(0, vertex_ids)
+    losses: list[torch.Tensor] = []
+    visible_counts: list[float] = []
+    edge_counts: list[float] = []
+    for payload in view_payloads:
+        edge_meta = payload.get("image_edge_meta", {})
+        if int(edge_meta.get("edge_pixels", 0)) <= 0:
+            continue
+        edge_sdf = payload.get("image_edge_sdf")
+        if edge_sdf is None:
+            continue
+        uv, z, _ = project_points(selected, payload["world_to_cam"], payload["intrinsic"])
+        valid = (
+            (z > 1e-5)
+            & (uv[:, 0] >= 0.0)
+            & (uv[:, 0] <= width - 1)
+            & (uv[:, 1] >= 0.0)
+            & (uv[:, 1] <= height - 1)
+        )
+        if not valid.any():
+            continue
+        distances = sample_sdf(edge_sdf, uv[valid], height, width)
+        if float(max_distance) > 0.0:
+            distances = distances.clamp(max=float(max_distance))
+        losses.append(distances.mean())
+        visible_counts.append(float(valid.float().sum().detach().cpu()))
+        edge_counts.append(float(edge_meta.get("edge_pixels", 0)))
+    if not losses:
+        zero = vertices.sum() * 0.0
+        return zero, {"visible_vertices": 0.0, "views": 0.0, "edge_pixels": 0.0}
+    stacked = torch.stack(losses)
+    return stacked.mean(), {
+        "visible_vertices": float(np.mean(visible_counts)) if visible_counts else 0.0,
+        "views": float(len(losses)),
+        "edge_pixels": float(np.mean(edge_counts)) if edge_counts else 0.0,
     }
 
 
@@ -2118,6 +2268,8 @@ def main() -> int:
     part_limits_np, part_reg_weights_np = make_part_limits(vertex_parts_np, args)
     part_free_limits_np = make_part_free_limits(vertex_parts_np, args)
     edges_np = unique_edges(faces_np)
+    image_edge_part_ids = parse_part_id_spec(str(args.image_edge_part_ids))
+    image_edge_vertex_mask_np = np.isin(vertex_parts_np, np.asarray(image_edge_part_ids, dtype=np.int64))
 
     min_part_samples = None
     if bool(args.balanced_part_surfels):
@@ -2160,6 +2312,7 @@ def main() -> int:
     hand_landmarker_meta: dict[str, Any] = {"requested": bool(args.hand_landmarker_task), "available": False}
     hand_landmark_overlay_paths: list[Path] = []
     hand_landmark_rows: list[dict[str, Any]] = []
+    image_edge_rows: list[dict[str, Any]] = []
     if args.face_landmarker_task is not None:
         face_mp_module, face_detector, face_landmarker_meta = create_face_landmarker(
             args.face_landmarker_task,
@@ -2212,6 +2365,15 @@ def main() -> int:
             hairline_frac=float(args.hairline_target_frac),
             hand_side_frac=float(args.hand_side_target_frac),
         )
+        image_edge_sdf_np, image_edge_meta = image_edge_distance(
+            rgb_np,
+            mask_np,
+            low=float(args.image_edge_canny_low),
+            high=float(args.image_edge_canny_high),
+            mask_dilate=int(args.image_edge_mask_dilate),
+        )
+        image_edge_meta.update({"view_index": int(view_idx), "camera_id": camera_id})
+        image_edge_rows.append(json_ready(image_edge_meta))
         face_landmarks_np: np.ndarray | None = None
         face_meta: dict[str, Any] = {"detected": False, "reason": "face_landmarker_disabled"}
         if face_detector is not None and face_mp_module is not None:
@@ -2261,6 +2423,8 @@ def main() -> int:
                     for name, value in part_targets_np.items()
                 },
                 "sdf": torch.from_numpy(mask_sdf(mask_np))[None, None].to(device=device),
+                "image_edge_sdf": torch.from_numpy(image_edge_sdf_np)[None, None].to(device=device),
+                "image_edge_meta": image_edge_meta,
                 "boundary": torch.from_numpy(boundary_np).to(device=device),
                 "intrinsic": torch.from_numpy(intrinsic_np).to(device=device),
                 "world_to_cam": torch.from_numpy(world_to_cam_np).to(device=device),
@@ -2309,6 +2473,7 @@ def main() -> int:
     face_landmark_vertex_ids_t = torch.from_numpy(np.nonzero(face_landmark_vertex_mask_np)[0].astype(np.int64)).to(device=device)
     left_hand_vertex_ids_t = torch.from_numpy(np.nonzero(vertex_parts_np == 1)[0].astype(np.int64)).to(device=device)
     right_hand_vertex_ids_t = torch.from_numpy(np.nonzero(vertex_parts_np == 2)[0].astype(np.int64)).to(device=device)
+    image_edge_vertex_ids_t = torch.from_numpy(np.nonzero(image_edge_vertex_mask_np)[0].astype(np.int64)).to(device=device)
 
     delta_t = torch.zeros(3, device=device, requires_grad=True)
     log_scale = torch.zeros(1, device=device, requires_grad=True)
@@ -2449,6 +2614,14 @@ def main() -> int:
             bidirectional_weight=float(args.hand_landmark_bidir_weight),
             min_points=int(args.hand_landmark_min_points),
         )
+        image_edge_loss, image_edge_meta = vertex_image_edge_loss(
+            vertices=vertices,
+            vertex_ids=image_edge_vertex_ids_t,
+            view_payloads=view_payloads,
+            height=height,
+            width=width,
+            max_distance=float(args.image_edge_max_distance),
+        )
 
         if bool(args.freeze_global_transform):
             global_reg = delta_t.sum() * 0.0 + log_scale.sum() * 0.0
@@ -2477,6 +2650,7 @@ def main() -> int:
             + float(args.hair_boundary_weight) * hair_boundary_loss
             + float(args.face_landmark_weight) * face_landmark_loss
             + float(args.hand_landmark_weight) * hand_landmark_loss
+            + float(args.image_edge_weight) * image_edge_loss
             + float(args.photo_weight) * photo_loss
             + global_reg
             + float(args.offset_reg) * offset_reg
@@ -2506,6 +2680,8 @@ def main() -> int:
                     "face_landmark_meta": face_landmark_meta,
                     "hand_landmark_loss": float(hand_landmark_loss.detach().cpu()),
                     "hand_landmark_meta": hand_landmark_meta,
+                    "image_edge_loss": float(image_edge_loss.detach().cpu()),
+                    "image_edge_meta": image_edge_meta,
                     "photometric_consistency_loss": float(photo_loss.detach().cpu()),
                     "offset_reg": float(offset_reg.detach().cpu()),
                     "offset_smooth_reg": float(smooth_reg.detach().cpu()),
@@ -2693,6 +2869,28 @@ def main() -> int:
             "They are not triangulated and do not create a hand teacher patch."
         ),
     }
+    image_edge_stats = {
+        "weight": float(args.image_edge_weight),
+        "part_ids": [int(v) for v in image_edge_part_ids],
+        "part_names": [PART_NAMES[int(v)] for v in image_edge_part_ids],
+        "vertex_count": int(image_edge_vertex_mask_np.sum()),
+        "canny_low": float(args.image_edge_canny_low),
+        "canny_high": float(args.image_edge_canny_high),
+        "mask_dilate": int(args.image_edge_mask_dilate),
+        "max_distance": float(args.image_edge_max_distance),
+        "mean_edge_pixels": (
+            float(np.mean([float(row.get("edge_pixels", 0)) for row in image_edge_rows]))
+            if image_edge_rows
+            else 0.0
+        ),
+        "usable_views": int(sum(1 for row in image_edge_rows if int(row.get("edge_pixels", 0)) > 0)),
+        "selected_views": int(len(view_payloads)),
+        "rows": image_edge_rows,
+        "note": (
+            "Image-edge loss samples raw RGB Canny edge distance for connected mesh vertices only. "
+            "It uses no VGGT depth/point/normal and creates no floating patch or teacher."
+        ),
+    }
 
     truthful_status = "raw_softsurfel_surface_smoke_complete_not_teacher_or_candidate"
     export_summary = None
@@ -2753,6 +2951,7 @@ def main() -> int:
         "part_target_stats": part_target_stats,
         "face_landmarks": face_landmark_stats,
         "hand_landmarks": hand_landmark_stats,
+        "image_edges": image_edge_stats,
         "hairline_free_offset": hairline_free_stats,
         "part_free_offset": part_free_stats,
         "extra_hairline": extra_hairline_summary,
@@ -2819,6 +3018,10 @@ def main() -> int:
         f"- hand landmark weight: `{float(args.hand_landmark_weight)}`",
         f"- hand landmark detected views: `{hand_landmark_stats['detected_views']}/{hand_landmark_stats['selected_views']}`",
         f"- hand landmark detected hands: `{hand_landmark_stats['detected_hands']}`",
+        f"- image edge weight: `{float(args.image_edge_weight)}`",
+        f"- image edge part ids: `{image_edge_stats['part_ids']}`",
+        f"- image edge usable views: `{image_edge_stats['usable_views']}/{image_edge_stats['selected_views']}`",
+        f"- image edge mean pixels: `{image_edge_stats['mean_edge_pixels']}`",
         f"- part-free offsets enabled: `{part_free_stats['enabled']}`",
         f"- part-free limits: `{json_ready(part_free_stats['limits'])}`",
         f"- extra hairline surfels: `{extra_hairline_summary.get('kept_points', 0)}`",

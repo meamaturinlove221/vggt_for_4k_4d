@@ -1195,3 +1195,80 @@ progress needs a stronger learned or optimized surface backend with real
 visibility-aware photometric/normal objectives and possibly a strict-passing
 dense target-frame teacher; do not continue by increasing v2.1 steps or weights
 without adding new information or a stronger objective.
+
+## Connected Surface v2.2 Raw RGB Edge-SDF Smoke
+
+To avoid another parameter-only loop, v2.2 adds an optional raw-image edge
+distance objective to the connected surface optimizer:
+
+```text
+tools/optimize_raw_smplx_softsurfel_torch.py
+```
+
+New local-only arguments:
+
+```text
+--image-edge-weight
+--image-edge-part-ids
+--image-edge-canny-low
+--image-edge-canny-high
+--image-edge-mask-dilate
+--image-edge-max-distance
+```
+
+This loss computes Canny edges from the raw RGB crop inside a dilated human
+mask, converts them to a normalized distance field, and samples that field only
+at selected connected mesh vertices. It uses no VGGT depth, point, normal, or
+confidence output; it also creates no floating face/hand/hair patch and is
+disabled by default.
+
+Smoke run:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_v21_imageedge_partfree_landmark_smoke6_t96_step20
+```
+
+Metrics:
+
+```text
+initial_iou.mean = 0.7700
+optimized_iou.mean = 0.7765
+iou_delta = +0.0065
+initial_target_recall.mean = 0.8915
+optimized_target_recall.mean = 0.8907
+target_recall_delta = -0.0008
+image_edge_weight = 0.12
+image_edge usable views = 6 / 6
+mean raw edge pixels = 340.33
+face landmarks detected = 4 / 6 views
+hand landmarks detected = 6 / 6 views, 9 hands
+```
+
+Open3D review:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_v21_imageedge_partfree_landmark_smoke6_t96_step20/open3d_review_full/solid_mesh/iso.png
+output/normal_line_multiview_20260506/connected_surface_v21_imageedge_partfree_landmark_smoke6_t96_step20/open3d_review_full/solid_mesh/face_close.png
+output/normal_line_multiview_20260506/connected_surface_v21_imageedge_partfree_landmark_smoke6_t96_step20/open3d_review_hands/solid_mesh/iso.png
+```
+
+Conclusion:
+
+```text
+The edge-SDF term gives a stronger 2D raw-image signal than the previous
+v2.1 smoke, and the IoU delta improves from roughly +0.0027 to +0.0065. However
+the visual failure mode is unchanged: the mesh remains a connected SMPL-X-like
+template shell. The face is not a personalized modeled face, the head cap is
+still artificial, clothing remains template-like, and hands are still not
+mentor-pass hand geometry. Therefore no strict teacher gate was run and the
+cloud remains blocked.
+```
+
+Next non-redundant implication:
+
+The raw RGB edge distance objective helps local alignment but does not solve the
+surface representation/objective gap. The next distinct local step should make
+the connected mesh explain raw image appearance under its own visibility:
+visibility-aware triangle RGB/gradient rendering with a fixed per-vertex
+appearance estimate. That is a stronger objective than silhouette, landmark,
+edge-SDF, or surfel color variance, and it still avoids VGGT shell recycling.
