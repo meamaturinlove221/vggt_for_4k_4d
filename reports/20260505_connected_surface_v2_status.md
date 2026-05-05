@@ -339,6 +339,35 @@ part proxies. However, the strict gate remains blocked: coverage is view-local,
 hairline still fails every view, and the Open3D result still cannot be called a
 normal human head/face/hair surface.
 
+## 6-View / 4000-Surfel Scale Smoke
+
+To check whether the previous result was only a tiny 3-view / 1800-surfel smoke,
+the same connected hair-boundary setup was scaled locally to 6 spaced views and
+4000 balanced surfels:
+
+```text
+output/normal_line_multiview_20260505/connected_surface_template_v2_0012_11_frame0000_smoothcap_hairboundary_smoke6_t96_s4000
+```
+
+Metrics:
+
+```text
+initial mean IoU = 0.7700232863426208
+optimized mean IoU = 0.7995951771736145
+IoU delta = +0.029571890830993652
+initial target recall = 0.8914699554443359
+optimized target recall = 0.8558440208435059
+target recall delta = -0.03562593460083008
+```
+
+Interpretation:
+
+More views and more balanced surfels preserve the same basic pattern as the
+3-view hair-boundary smoke: mask IoU improves, but hard target recall still
+drops by about 3.5 points. This means the current soft-splat connected carrier
+still prefers a tighter template shell and does not form a mentor-valid raw
+surface. Do not continue scaling view count or surfel count as the next move.
+
 ## Decision
 
 Do not:
