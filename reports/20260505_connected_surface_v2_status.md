@@ -211,6 +211,76 @@ teacher pass. The next useful step is therefore not more renderer temperature
 tuning; it is adding an actual connected surface objective that can move the
 cap/face/hands toward raw-image boundaries without shrinking the body.
 
+## Part-Aware Coverage Smoke
+
+The optimizer was extended with an optional `--part-recall-weight` guard and
+coarse raw-mask part proxies:
+
+```text
+head_upper: top raw-mask region, rendered by head/face + hairline surfels
+hairline_top: top raw-mask strip, rendered by hairline surfels
+hands_side: left/right raw-mask side regions, rendered by both hand surfels
+```
+
+This first exposed a representation problem: with area-only sampling at 1800
+surfels, the connected surface had almost no differentiable support for the
+mentor-critical parts:
+
+```text
+torso_limbs = 557
+left_hand = 24
+right_hand = 25
+head_face = 9
+head_top_hairline_proxy = 139
+lower_clothing_proxy = 1046
+```
+
+A part-balanced sampler was therefore added as a representation diagnostic,
+not as a pass gate. The balanced smoke used:
+
+```text
+output/normal_line_multiview_20260505/connected_surface_template_v2_0012_11_frame0000_smoothcap_balanced_partrecall_smoke3_t96
+```
+
+Balanced surfel support:
+
+```text
+torso_limbs = 395
+left_hand = 126
+right_hand = 127
+head_face = 222
+head_top_hairline_proxy = 365
+lower_clothing_proxy = 565
+```
+
+Metrics:
+
+```text
+initial mean IoU = 0.7690008282661438
+optimized mean IoU = 0.7772732377052307
+IoU delta = +0.008272409439086914
+initial target recall = 0.8903587460517883
+optimized target recall = 0.8394091725349426
+target recall delta = -0.0509495735168457
+```
+
+Final part recall losses were still high:
+
+```text
+head_upper = 0.6917787194252014
+hairline_top = 0.28859564661979675
+hands_side = 0.7944923043251038
+```
+
+Interpretation:
+
+Balanced sampling fixes the obvious lack of head/hand/hairline surfel support,
+but the coarse image-space part proxies still do not produce a valid connected
+surface. The hard rasterized full-body target recall drops further, so this is
+another negative diagnostic. Do not tune the part proxy fractions or weight as
+another loop. The next non-redundant step must improve the surface objective or
+renderer itself, rather than weighting the same soft-splat mask losses harder.
+
 ## Decision
 
 Do not:
@@ -226,10 +296,11 @@ continue tuning offsets/support/threshold/view count
 Next non-redundant step:
 
 ```text
-replace pure soft-splat masking with depth-ordered connected surface rendering,
-then add raw-image surface losses that can actually shape the connected cap:
-multi-view photometric consistency, boundary/edge terms, face weak reprojection,
-hand connectivity, and full-body visual review.
+move beyond soft-splat/proxy-mask objectives toward mesh-level connected
+visibility: a depth-ordered triangle or connected-surfel renderer with
+surface-aware boundary/edge, face weak reprojection, hand-wrist connectivity,
+and full-body visual review. Balanced surfel sampling should stay as a debug
+guard, not as the main optimization signal.
 ```
 
 Only if the optimized 60-view connected surface looks like a normal human and

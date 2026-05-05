@@ -67,6 +67,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=40)
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--surfel-samples", type=int, default=1200)
+    parser.add_argument(
+        "--balanced-part-surfels",
+        action="store_true",
+        help=(
+            "Sample a minimum number of surfels from key body parts before area-filling the rest. "
+            "This is a representation diagnostic for tiny head/hand/hairline support, not a pass gate."
+        ),
+    )
+    parser.add_argument("--min-surfel-hand", type=int, default=0)
+    parser.add_argument("--min-surfel-head", type=int, default=0)
+    parser.add_argument("--min-surfel-hairline", type=int, default=0)
+    parser.add_argument("--min-surfel-torso", type=int, default=0)
+    parser.add_argument("--min-surfel-clothing", type=int, default=0)
     parser.add_argument("--surface-samples-for-sdf", type=int, default=2500)
     parser.add_argument("--boundary-samples", type=int, default=192)
     parser.add_argument("--render-pixel-chunk", type=int, default=4096)
@@ -98,6 +111,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--outside-weight", type=float, default=0.20)
     parser.add_argument("--boundary-weight", type=float, default=0.05)
+    parser.add_argument(
+        "--part-recall-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional part-aware coverage guard for the connected surface smoke. "
+            "It uses coarse raw-mask regions for upper head/hairline/hands so IoU "
+            "cannot improve only by shrinking the full-body shell. Disabled by default."
+        ),
+    )
+    parser.add_argument("--head-target-frac", type=float, default=0.35)
+    parser.add_argument("--hairline-target-frac", type=float, default=0.18)
+    parser.add_argument("--hand-side-target-frac", type=float, default=0.18)
+    parser.add_argument("--part-target-min-pixels", type=int, default=16)
     parser.add_argument("--photo-weight", type=float, default=0.08)
     parser.add_argument(
         "--photo-depth-tolerance",
@@ -234,6 +261,56 @@ def boundary_points(mask: np.ndarray, max_points: int) -> np.ndarray:
     return np.stack([xs[indices], ys[indices]], axis=1).astype(np.float32)
 
 
+def coarse_part_target_masks(
+    mask: np.ndarray,
+    *,
+    head_frac: float,
+    hairline_frac: float,
+    hand_side_frac: float,
+    hand_y_min_frac: float = 0.20,
+    hand_y_max_frac: float = 0.88,
+) -> dict[str, np.ndarray]:
+    """Build raw-mask part proxies for a coverage guard.
+
+    These are intentionally coarse image-space guards, not part annotations.
+    Their job is to catch the recurring failure where the connected surface gets
+    a better global IoU by losing upper-head/hairline/hand coverage.
+    """
+
+    mask_bool = np.asarray(mask, dtype=bool)
+    ys, xs = np.nonzero(mask_bool)
+    empty = np.zeros_like(mask_bool, dtype=bool)
+    if xs.size == 0:
+        return {
+            "head_upper": empty.copy(),
+            "hairline_top": empty.copy(),
+            "hands_side": empty.copy(),
+        }
+
+    x0, x1 = int(xs.min()), int(xs.max())
+    y0, y1 = int(ys.min()), int(ys.max())
+    width = max(1, x1 - x0 + 1)
+    height = max(1, y1 - y0 + 1)
+
+    yy, xx = np.indices(mask_bool.shape)
+    head_cut = y0 + int(round(np.clip(float(head_frac), 0.02, 0.80) * height))
+    hair_cut = y0 + int(round(np.clip(float(hairline_frac), 0.02, 0.60) * height))
+    side = max(1, int(round(np.clip(float(hand_side_frac), 0.02, 0.45) * width)))
+    hand_y0 = y0 + int(round(np.clip(float(hand_y_min_frac), 0.0, 0.95) * height))
+    hand_y1 = y0 + int(round(np.clip(float(hand_y_max_frac), 0.05, 1.0) * height))
+
+    head_upper = mask_bool & (yy <= head_cut)
+    hairline_top = mask_bool & (yy <= hair_cut)
+    side_band = (xx <= x0 + side) | (xx >= x1 - side)
+    hand_y_band = (yy >= hand_y0) & (yy <= hand_y1)
+    hands_side = mask_bool & side_band & hand_y_band
+    return {
+        "head_upper": head_upper,
+        "hairline_top": hairline_top,
+        "hands_side": hands_side,
+    }
+
+
 def normalize_rgb(rgb: np.ndarray) -> np.ndarray:
     arr = np.asarray(rgb, dtype=np.float32)
     if arr.max() > 1.5:
@@ -327,12 +404,47 @@ def sample_surface_plan(
     vertex_parts: np.ndarray,
     sample_count: int,
     seed: int,
+    min_part_samples: dict[int, int] | None = None,
 ) -> dict[str, np.ndarray]:
     rng = np.random.default_rng(int(seed))
     triangles = np.asarray(base_vertices, dtype=np.float32)[np.asarray(faces, dtype=np.int64)]
     areas = np.linalg.norm(np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]), axis=1)
-    probs = areas / np.clip(areas.sum(), 1e-8, None)
-    face_indices = rng.choice(len(faces), size=max(1, int(sample_count)), replace=True, p=probs)
+    face_vertex_parts_all = vertex_parts[np.asarray(faces, dtype=np.int64)]
+    face_parts = np.asarray(
+        [np.bincount(row.astype(np.int64), minlength=len(PART_NAMES)).argmax() for row in face_vertex_parts_all],
+        dtype=np.int64,
+    )
+
+    def choose_from_pool(pool: np.ndarray, count: int) -> np.ndarray:
+        if count <= 0 or pool.size == 0:
+            return np.zeros((0,), dtype=np.int64)
+        local_areas = areas[pool]
+        probs = local_areas / np.clip(local_areas.sum(), 1e-8, None)
+        return rng.choice(pool, size=int(count), replace=True, p=probs).astype(np.int64)
+
+    total = max(1, int(sample_count))
+    chosen: list[np.ndarray] = []
+    used = 0
+    if min_part_samples:
+        for part_id, requested in min_part_samples.items():
+            remaining = total - used
+            if remaining <= 0:
+                break
+            count = min(max(0, int(requested)), remaining)
+            pool = np.nonzero(face_parts == int(part_id))[0].astype(np.int64)
+            selected = choose_from_pool(pool, count)
+            if selected.size:
+                chosen.append(selected)
+                used += int(selected.size)
+    remaining = total - used
+    if remaining > 0:
+        all_pool = np.arange(len(faces), dtype=np.int64)
+        chosen.append(choose_from_pool(all_pool, remaining))
+    face_indices = np.concatenate(chosen, axis=0) if chosen else choose_from_pool(np.arange(len(faces)), total)
+    if face_indices.shape[0] > total:
+        face_indices = face_indices[:total]
+    rng.shuffle(face_indices)
+
     u = rng.random(face_indices.shape[0]).astype(np.float32)
     v = rng.random(face_indices.shape[0]).astype(np.float32)
     flip = u + v > 1.0
@@ -496,6 +608,73 @@ def photometric_consistency_loss(
         "valid_surfels": float(valid.float().sum().detach().cpu()),
         "mean_support": float(support[valid].mean().detach().cpu()),
     }
+
+
+def part_recall_loss(
+    surfels: torch.Tensor,
+    normals: torch.Tensor,
+    surfel_part_ids: torch.Tensor,
+    view_payloads: list[dict[str, Any]],
+    height: int,
+    width: int,
+    *,
+    sigma: float,
+    pixel_chunk: int,
+    depth_softness: float,
+    min_pixels: int,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    specs = {
+        "head_upper": (3, 4),
+        "hairline_top": (4,),
+        "hands_side": (1, 2),
+    }
+    losses: list[torch.Tensor] = []
+    rows: dict[str, dict[str, float]] = {}
+    for name, part_ids in specs.items():
+        part_mask = torch.zeros_like(surfel_part_ids, dtype=torch.bool)
+        for part_id in part_ids:
+            part_mask = part_mask | (surfel_part_ids == int(part_id))
+        if not part_mask.any():
+            continue
+        part_surfels = surfels[part_mask]
+        part_normals = normals[part_mask]
+        per_view_losses: list[torch.Tensor] = []
+        pixel_counts: list[float] = []
+        for payload in view_payloads:
+            target = payload.get("part_target_tensors", {}).get(name)
+            if target is None:
+                continue
+            target_2d = target.reshape(height, width)
+            target_area = target_2d.sum()
+            if float(target_area.detach().cpu()) < int(min_pixels):
+                continue
+            render = render_soft_surfel_maps(
+                surfels=part_surfels,
+                normals=part_normals,
+                world_to_cam=payload["world_to_cam"],
+                intrinsic=payload["intrinsic"],
+                height=height,
+                width=width,
+                sigma=sigma,
+                pixel_chunk=pixel_chunk,
+                depth_softness=depth_softness,
+            )
+            rendered_mask = render["mask"].clamp(0.0, 1.0)
+            per_view_losses.append((target_2d * (1.0 - rendered_mask)).sum() / target_area.clamp_min(1.0))
+            pixel_counts.append(float(target_area.detach().cpu()))
+        if per_view_losses:
+            stacked = torch.stack(per_view_losses)
+            losses.append(stacked.mean())
+            rows[name] = {
+                "views": float(len(per_view_losses)),
+                "mean_loss": float(stacked.mean().detach().cpu()),
+                "mean_target_pixels": float(np.mean(pixel_counts)) if pixel_counts else 0.0,
+            }
+    if not losses:
+        zero = surfels.sum() * 0.0
+        return zero, {"enabled_terms": 0.0, "terms": rows}
+    loss = torch.stack(losses).mean()
+    return loss, {"enabled_terms": float(len(losses)), "terms": rows}
 
 
 def compute_mask_metrics(rendered: np.ndarray, target: np.ndarray) -> dict[str, Any]:
@@ -1239,12 +1418,23 @@ def main() -> int:
     part_limits_np, part_reg_weights_np = make_part_limits(vertex_parts_np, args)
     edges_np = unique_edges(faces_np)
 
+    min_part_samples = None
+    if bool(args.balanced_part_surfels):
+        min_part_samples = {
+            0: int(args.min_surfel_torso),
+            1: int(args.min_surfel_hand),
+            2: int(args.min_surfel_hand),
+            3: int(args.min_surfel_head),
+            4: int(args.min_surfel_hairline),
+            5: int(args.min_surfel_clothing),
+        }
     surfel_plan = sample_surface_plan(
         base_vertices=base_vertices_np,
         faces=faces_np,
         vertex_parts=vertex_parts_np,
         sample_count=int(args.surfel_samples),
         seed=int(args.seed),
+        min_part_samples=min_part_samples,
     )
     sdf_sample_count = min(int(args.surface_samples_for_sdf), base_vertices_np.shape[0])
     sdf_indices_np = np.linspace(0, base_vertices_np.shape[0] - 1, sdf_sample_count).round().astype(np.int64)
@@ -1272,6 +1462,12 @@ def main() -> int:
         )
         world_to_cam_np = homogeneous(np.asarray(camera_params[camera_id]["world_to_cam"], dtype=np.float32))
         boundary_np = boundary_points(mask_np, args.boundary_samples)
+        part_targets_np = coarse_part_target_masks(
+            mask_np,
+            head_frac=float(args.head_target_frac),
+            hairline_frac=float(args.hairline_target_frac),
+            hand_side_frac=float(args.hand_side_target_frac),
+        )
         view_payloads.append(
             {
                 "view_index": int(view_idx),
@@ -1280,6 +1476,11 @@ def main() -> int:
                 "mask": mask_np,
                 "rgb_t": torch.from_numpy(rgb_np).permute(2, 0, 1)[None].to(device=device),
                 "mask_t": torch.from_numpy(mask_np.astype(np.float32))[None, None].to(device=device),
+                "part_targets": part_targets_np,
+                "part_target_tensors": {
+                    name: torch.from_numpy(value.astype(np.float32))[None, None].to(device=device)
+                    for name, value in part_targets_np.items()
+                },
                 "sdf": torch.from_numpy(mask_sdf(mask_np))[None, None].to(device=device),
                 "boundary": torch.from_numpy(boundary_np).to(device=device),
                 "intrinsic": torch.from_numpy(intrinsic_np).to(device=device),
@@ -1294,6 +1495,7 @@ def main() -> int:
     faces_t = torch.from_numpy(faces_np.astype(np.int64)).to(device=device)
     face_indices_t = torch.from_numpy(surfel_plan["face_indices"]).to(device=device)
     barycentric_t = torch.from_numpy(surfel_plan["barycentric"]).to(device=device)
+    surfel_part_ids_t = torch.from_numpy(surfel_plan["part_ids"]).to(device=device)
     sdf_indices_t = torch.from_numpy(sdf_indices_np).to(device=device)
     part_limits_t = torch.from_numpy(part_limits_np).to(device=device)
     part_reg_weights_t = torch.from_numpy(part_reg_weights_np).to(device=device)
@@ -1380,6 +1582,18 @@ def main() -> int:
             visibility_depths=visibility_depths,
             depth_tolerance=float(args.photo_depth_tolerance),
         )
+        part_loss, part_meta = part_recall_loss(
+            surfels=surfels,
+            normals=surfel_normals,
+            surfel_part_ids=surfel_part_ids_t,
+            view_payloads=view_payloads,
+            height=height,
+            width=width,
+            sigma=float(args.gaussian_sigma),
+            pixel_chunk=int(args.render_pixel_chunk),
+            depth_softness=float(args.depth_softness),
+            min_pixels=int(args.part_target_min_pixels),
+        )
 
         global_reg = float(args.translation_reg) * delta_t.square().sum() + float(args.scale_reg) * log_scale.square().sum()
         offset_values = bounded_offsets
@@ -1394,6 +1608,7 @@ def main() -> int:
             + float(args.recall_weight) * recall_loss
             + float(args.outside_weight) * outside_loss
             + float(args.boundary_weight) * boundary_loss
+            + float(args.part_recall_weight) * part_loss
             + float(args.photo_weight) * photo_loss
             + global_reg
             + float(args.offset_reg) * offset_reg
@@ -1413,6 +1628,8 @@ def main() -> int:
                     "soft_recall_loss": float(recall_loss.detach().cpu()),
                     "outside_loss": float(outside_loss.detach().cpu()),
                     "boundary_loss": float(boundary_loss.detach().cpu()),
+                    "part_recall_loss": float(part_loss.detach().cpu()),
+                    "part_recall_meta": part_meta,
                     "photometric_consistency_loss": float(photo_loss.detach().cpu()),
                     "offset_reg": float(offset_reg.detach().cpu()),
                     "offset_smooth_reg": float(smooth_reg.detach().cpu()),
@@ -1508,6 +1725,17 @@ def main() -> int:
             "the same strict visual gates before being useful."
         ),
     }
+    part_target_stats: dict[str, Any] = {}
+    for name in ("head_upper", "hairline_top", "hands_side"):
+        counts = [
+            int(np.asarray(payload.get("part_targets", {}).get(name, np.zeros_like(payload["mask"]))).sum())
+            for payload in view_payloads
+        ]
+        part_target_stats[name] = summarize([float(v) for v in counts])
+    surfel_part_stats = {}
+    surfel_part_ids_np = np.asarray(surfel_plan["part_ids"], dtype=np.int64)
+    for part_id, part_name in PART_NAMES.items():
+        surfel_part_stats[part_name] = int((surfel_part_ids_np == int(part_id)).sum())
 
     truthful_status = "raw_softsurfel_surface_smoke_complete_not_teacher_or_candidate"
     export_summary = None
@@ -1548,6 +1776,8 @@ def main() -> int:
         "part_names": PART_NAMES,
         "connected_template": connected_template_summary,
         "part_stats": part_stats,
+        "surfel_part_stats": surfel_part_stats,
+        "part_target_stats": part_target_stats,
         "hairline_free_offset": hairline_free_stats,
         "extra_hairline": extra_hairline_summary,
         "optimization_history": history,
@@ -1599,6 +1829,10 @@ def main() -> int:
         f"- creates candidate predictions: `False`",
         f"- hairline free-offset enabled: `{hairline_free_stats['enabled']}`",
         f"- hairline free-offset p90: `{hairline_free_stats['p90_norm']}`",
+        f"- balanced part surfels: `{bool(args.balanced_part_surfels)}`",
+        f"- surfel part stats: `{surfel_part_stats}`",
+        f"- part recall weight: `{float(args.part_recall_weight)}`",
+        f"- part target stats: `{json_ready(part_target_stats)}`",
         f"- extra hairline surfels: `{extra_hairline_summary.get('kept_points', 0)}`",
         f"- initial mean IoU: `{initial_iou['mean']}`",
         f"- optimized mean IoU: `{optimized_iou['mean']}`",
