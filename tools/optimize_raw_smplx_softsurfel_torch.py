@@ -100,6 +100,15 @@ def parse_args() -> argparse.Namespace:
         help="Sigmoid sharpness for the soft barycentric inside test when --renderer triangle.",
     )
     parser.add_argument(
+        "--triangle-render-face-budget",
+        type=int,
+        default=0,
+        help=(
+            "Face budget for --renderer triangle. 0 reuses sampled surfel faces; negative renders all "
+            "mesh faces; positive uses a deterministic subset of that many mesh faces."
+        ),
+    )
+    parser.add_argument(
         "--depth-softness",
         type=float,
         default=0.0,
@@ -759,6 +768,20 @@ def sample_surface_plan(
         "barycentric": bary.astype(np.float32),
         "part_ids": surfel_parts.astype(np.int64),
     }
+
+
+def choose_triangle_render_faces(
+    faces: np.ndarray,
+    surfel_face_indices: np.ndarray,
+    budget: int,
+) -> np.ndarray:
+    faces = np.asarray(faces, dtype=np.int64)
+    if int(budget) < 0:
+        return np.arange(faces.shape[0], dtype=np.int64)
+    if int(budget) == 0:
+        return np.unique(np.asarray(surfel_face_indices, dtype=np.int64)).astype(np.int64)
+    count = min(int(budget), faces.shape[0])
+    return np.linspace(0, faces.shape[0] - 1, count).round().astype(np.int64)
 
 
 def compute_surfels(
@@ -1917,18 +1940,38 @@ def save_soft_render_debug(
     paths: list[Path] = []
     with torch.no_grad():
         surfels, normals = compute_surfels(vertices_t, faces_t, face_indices_t, barycentric_t)
+        if int(args.triangle_render_face_budget) < 0:
+            render_face_indices_t = torch.arange(faces_t.shape[0], dtype=torch.long, device=faces_t.device)
+        elif int(args.triangle_render_face_budget) > 0:
+            count = min(int(args.triangle_render_face_budget), int(faces_t.shape[0]))
+            render_face_indices_t = torch.linspace(0, int(faces_t.shape[0]) - 1, count, device=faces_t.device).round().long()
+        else:
+            render_face_indices_t = torch.unique(face_indices_t)
         for payload in view_payloads[: max(1, int(args.overlay_limit))]:
-            render = render_soft_surfel_maps(
-                surfels=surfels,
-                normals=normals,
-                world_to_cam=payload["world_to_cam"],
-                intrinsic=payload["intrinsic"],
-                height=int(args.target_size),
-                width=int(args.target_size),
-                sigma=float(args.gaussian_sigma),
-                pixel_chunk=int(args.render_pixel_chunk),
-                depth_softness=float(args.depth_softness),
-            )
+            if str(args.renderer) == "triangle":
+                render = render_soft_triangle_maps(
+                    vertices=vertices_t,
+                    faces=faces_t,
+                    face_indices=render_face_indices_t,
+                    world_to_cam=payload["world_to_cam"],
+                    intrinsic=payload["intrinsic"],
+                    height=int(args.target_size),
+                    width=int(args.target_size),
+                    pixel_chunk=int(args.render_pixel_chunk),
+                    inside_softness=float(args.triangle_inside_softness),
+                )
+            else:
+                render = render_soft_surfel_maps(
+                    surfels=surfels,
+                    normals=normals,
+                    world_to_cam=payload["world_to_cam"],
+                    intrinsic=payload["intrinsic"],
+                    height=int(args.target_size),
+                    width=int(args.target_size),
+                    sigma=float(args.gaussian_sigma),
+                    pixel_chunk=int(args.render_pixel_chunk),
+                    depth_softness=float(args.depth_softness),
+                )
             mask_np = render["mask"].detach().cpu().numpy()
             hard_mask = mask_np > 0.30
             prefix = debug_dir / f"view_{payload['view_index']:02d}_cam{payload['camera_id']}"
@@ -2196,7 +2239,12 @@ def main() -> int:
     base_normals = torch.from_numpy(normals_np).to(device=device)
     faces_t = torch.from_numpy(faces_np.astype(np.int64)).to(device=device)
     face_indices_t = torch.from_numpy(surfel_plan["face_indices"]).to(device=device)
-    render_face_indices_t = torch.unique(face_indices_t)
+    render_face_indices_np = choose_triangle_render_faces(
+        faces_np,
+        surfel_plan["face_indices"],
+        budget=int(args.triangle_render_face_budget),
+    )
+    render_face_indices_t = torch.from_numpy(render_face_indices_np.astype(np.int64)).to(device=device)
     barycentric_t = torch.from_numpy(surfel_plan["barycentric"]).to(device=device)
     surfel_part_ids_t = torch.from_numpy(surfel_plan["part_ids"]).to(device=device)
     sdf_indices_t = torch.from_numpy(sdf_indices_np).to(device=device)
@@ -2595,6 +2643,7 @@ def main() -> int:
         "renderer": {
             "mode": str(args.renderer),
             "triangle_inside_softness": float(args.triangle_inside_softness),
+            "triangle_render_face_budget": int(args.triangle_render_face_budget),
             "sampled_render_faces": int(render_face_indices_t.numel()),
             "note": (
                 "triangle mode is a connected-mesh visibility diagnostic. It is still not a production "

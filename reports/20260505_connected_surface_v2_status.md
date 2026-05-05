@@ -694,6 +694,46 @@ soft recall loss: 0.7117570042610168 -> 0.6752879619598389
 photometric consistency: 0.09462591260671616 -> 0.09386990964412689
 ```
 
+The renderer was then fixed so diagnostic contact sheets follow the selected
+renderer. Before this fix, `--renderer triangle` still saved surfel debug
+overlays, which could mislead visual review. The optimizer also gained:
+
+```text
+--triangle-render-face-budget
+```
+
+where `-1` renders all connected mesh faces at low resolution instead of only
+sampled surfel faces.
+
+All-face CUDA smoke:
+
+```text
+output/normal_line_multiview_20260505/triangle_renderer_allfaces_cuda_smoke1_t64_step1
+renderer = triangle
+triangle_render_face_budget = -1
+sampled render faces = 21580
+device = cuda in D:\anaconda\envs\g3splat
+```
+
+Metrics:
+
+```text
+initial mean IoU = 0.7706708312034607
+optimized mean IoU = 0.772230863571167
+IoU delta = +0.0015600323677062988
+initial target recall = 0.8502581715583801
+optimized target recall = 0.8519793748855591
+target recall delta = +0.001721203327178955
+```
+
+Interpretation:
+
+All-face triangle rendering removes the sampled-face speckle in debug overlays
+and is locally executable on RTX 5080 through the `g3splat` Python/Torch stack.
+It is still only a `64px`, `1-view`, `1-step` smoke and is not a teacher, but it
+confirms that connected mesh visibility can be tested locally without falling
+back to Gaussian surfel splats.
+
 Interpretation:
 
 This is the first raw-surface diagnostic in this sequence where the optimized
