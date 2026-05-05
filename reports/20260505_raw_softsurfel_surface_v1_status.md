@@ -270,6 +270,36 @@ similarity. Per-view offsets or per-view threshold tuning should remain blocked
 because they would turn this into a protocol-fitting shortcut rather than a
 defensible surface bridge.
 
+## Hairline Flex Smoke
+
+Run:
+
+```text
+output/normal_line_multiview_20260505/raw_softsurfel_surface_smoke6_t126_hairflex_export6v
+```
+
+This loosened head/head-top residual limits and increased boundary pressure to
+test whether hairline failure is just an offset-limit issue.
+
+Result:
+
+```text
+initial mean IoU = 0.7653
+optimized mean IoU = 0.7729
+IoU delta = +0.0076
+initial target recall = 0.8835
+optimized target recall = 0.7892
+target recall delta = -0.0944
+```
+
+Conclusion:
+
+This is negative. Simply allowing larger head/hairline offsets causes a
+shrink-to-fit failure and does not create a better surface. Do not continue by
+increasing hairline offset limits. The next hairline attempt needs actual
+head-top/hair support from image boundary / mask-edge surface construction, not
+looser SMPL-X residuals.
+
 ## Next Non-Wall Actions
 
 Do not return to r-candidate threshold/confidence loops.
