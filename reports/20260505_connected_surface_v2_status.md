@@ -175,6 +175,42 @@ still a template-like head/body shell with a crude cap and missing/fragmented
 hairline/face support. It is not a normal human Open3D surface and must remain
 blocked.
 
+## Soft Depth-Ordering Smoke
+
+The soft surfel renderer was extended with an optional `--depth-softness`
+parameter. When enabled, the renderer keeps the differentiable spatial alpha
+mask, but computes depth/normal maps with front-surface-biased weights. This is
+a renderer-layer diagnostic, not another threshold/support loop.
+
+Depth-ordered smoke:
+
+```text
+output/normal_line_multiview_20260505/connected_surface_template_v2_0012_11_frame0000_smoothcap_depthsoft_smoke3_t96
+```
+
+Comparison against the previous connected-template smoke:
+
+```text
+baseline connected smoke:
+  IoU delta = +0.022438645362854004
+  target recall delta = -0.04302024841308594
+  photo loss first -> last = 0.09653176367282867 -> 0.09178324043750763
+
+soft depth-ordering smoke:
+  depth_softness = 0.035
+  IoU delta = +0.021018385887145996
+  target recall delta = -0.04438692331314087
+  photo loss first -> last = 0.0676174983382225 -> 0.053195662796497345
+```
+
+Interpretation:
+
+Soft depth ordering improves the photometric visibility signal, but it does not
+fix the surface problem: recall still drops, and this smoke still has no strict
+teacher pass. The next useful step is therefore not more renderer temperature
+tuning; it is adding an actual connected surface objective that can move the
+cap/face/hands toward raw-image boundaries without shrinking the body.
+
 ## Decision
 
 Do not:

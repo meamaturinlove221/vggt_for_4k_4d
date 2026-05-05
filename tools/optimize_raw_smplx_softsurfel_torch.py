@@ -72,6 +72,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--render-pixel-chunk", type=int, default=4096)
     parser.add_argument("--gaussian-sigma", type=float, default=1.7)
     parser.add_argument(
+        "--depth-softness",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional soft z ordering for surfel rendering. When >0, depth/normal maps use "
+            "spatial Gaussian weights multiplied by exp(-z/depth_softness), stabilized per pixel. "
+            "The alpha mask still uses spatial support."
+        ),
+    )
+    parser.add_argument(
         "--connected-template-payload",
         type=Path,
         help=(
@@ -366,6 +376,7 @@ def render_soft_surfel_maps(
     width: int,
     sigma: float,
     pixel_chunk: int,
+    depth_softness: float = 0.0,
 ) -> dict[str, torch.Tensor]:
     uv, z, cam = project_points(surfels, world_to_cam, intrinsic)
     valid = (
@@ -404,17 +415,25 @@ def render_soft_surfel_maps(
     for start in range(0, pixels.shape[0], chunk):
         pixel_chunk_xy = pixels[start : start + chunk]
         d2 = (pixel_chunk_xy[:, None, :] - uv_valid[None, :, :]).square().sum(dim=2)
-        weights = torch.exp(-0.5 * d2 / sigma2)
-        sumw = weights.sum(dim=1).clamp_min(1e-8)
+        spatial_logits = -0.5 * d2 / sigma2
+        spatial_weights = torch.exp(spatial_logits)
+        sumw_spatial = spatial_weights.sum(dim=1).clamp_min(1e-8)
         # Saturating alpha keeps the mask differentiable without pretending to be a z-buffer.
-        alpha = 1.0 - torch.exp(-sumw)
+        alpha = 1.0 - torch.exp(-sumw_spatial)
+        if float(depth_softness) > 0.0:
+            depth_logits = spatial_logits - z_valid[None, :] / max(1e-6, float(depth_softness))
+            depth_logits = depth_logits - depth_logits.max(dim=1, keepdim=True).values
+            weights = torch.exp(depth_logits) * (spatial_weights > 1e-7).to(spatial_weights.dtype)
+        else:
+            weights = spatial_weights
+        sumw = weights.sum(dim=1).clamp_min(1e-8)
         depth = (weights * z_valid[None, :]).sum(dim=1) / sumw
         normal = (weights @ normals_valid) / sumw[:, None]
         normal = F.normalize(normal, dim=1, eps=1e-6)
         masks.append(alpha)
         depths.append(depth)
         normal_maps.append(normal)
-        vis_maps.append(sumw)
+        vis_maps.append(sumw_spatial)
 
     mask = torch.cat(masks, dim=0).reshape(height, width).clamp(0.0, 1.0)
     depth = torch.cat(depths, dim=0).reshape(height, width)
@@ -1140,6 +1159,7 @@ def save_soft_render_debug(
                 width=int(args.target_size),
                 sigma=float(args.gaussian_sigma),
                 pixel_chunk=int(args.render_pixel_chunk),
+                depth_softness=float(args.depth_softness),
             )
             mask_np = render["mask"].detach().cpu().numpy()
             hard_mask = mask_np > 0.30
@@ -1317,6 +1337,7 @@ def main() -> int:
                 width=width,
                 sigma=float(args.gaussian_sigma),
                 pixel_chunk=int(args.render_pixel_chunk),
+                depth_softness=float(args.depth_softness),
             )
             visibility_depths.append(render["depth"])
             rendered_mask = render["mask"].clamp(1e-4, 1.0 - 1e-4)
