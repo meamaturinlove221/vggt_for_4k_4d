@@ -445,6 +445,50 @@ parameter loop. The next meaningful step is a real connected hair/clothing
 surface element with visibility and image-edge support, or a stronger learned
 surface backend, not stronger SMPL-X head-top deformation.
 
+## Dense-View Raw Smoke
+
+Run:
+
+```text
+output/normal_line_multiview_20260505/raw_softsurfel_surface_smoke20_t96_visphoto
+```
+
+This checks whether simply increasing raw-view count gives the current
+SMPL-X/softsurfel objective a better upper-bound signal.
+
+Setting:
+
+```text
+selected views = 20
+target_size = 96
+steps = 4
+photo_depth_tolerance = 0.035
+```
+
+Result:
+
+```text
+initial mean IoU = 0.7762
+optimized mean IoU = 0.8019
+IoU delta = +0.0257
+initial target recall = 0.8862
+optimized target recall = 0.8587
+target recall delta = -0.0276
+```
+
+Visual check:
+
+The overlay sheets still show a silhouette-driven fit with red missing regions
+around limbs/head and no new modeled face/hair surface. Increasing raw view
+count alone is not enough under the current objective.
+
+Conclusion:
+
+This confirms the next blocker is objective/representation quality, not just
+the number of raw views. A true upper-bound needs stronger connected surface
+elements, visibility/depth ordering, and image-edge/detail constraints before it
+can become a strict teacher.
+
 ## Next Non-Wall Actions
 
 Do not return to r-candidate threshold/confidence loops.
