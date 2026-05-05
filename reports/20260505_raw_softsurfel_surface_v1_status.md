@@ -403,6 +403,48 @@ remaining blocker is not just hidden/backside surfels participating in
 photometric loss; it is the absence of a continuous image-derived hair/head
 surface beyond the SMPL-X scaffold.
 
+## Connected Hairline Mesh Residual
+
+Run:
+
+```text
+output/normal_line_multiview_20260505/raw_softsurfel_surface_smoke6_t126_hairmesh_strong_export6v
+```
+
+This is a connected mesh diagnostic: only SMPL-X head-top/hairline vertices are
+allowed to move in bounded 3D, so the result cannot become detached per-view
+patches.
+
+Stress setting:
+
+```text
+hairline_free_offset_limit = 0.08
+hairline_free_offset_reg = 0.03
+hairline_free_smooth_reg = 0.01
+boundary_weight = 0.12
+photo_depth_tolerance = 0.035
+```
+
+Result:
+
+```text
+optimized mean IoU = 0.7902
+IoU delta = +0.0249
+optimized target recall = 0.8094
+target recall delta = -0.0742
+hairline free-offset p90 = 0.00756
+hairline free-offset max = 0.00979
+```
+
+Conclusion:
+
+This is negative. Even when connected head-top vertices are allowed to move in
+3D, the current raw mask/photo losses mostly degrade target recall instead of
+creating a valid hair/head surface. This should not become another offset
+parameter loop. The next meaningful step is a real connected hair/clothing
+surface element with visibility and image-edge support, or a stronger learned
+surface backend, not stronger SMPL-X head-top deformation.
+
 ## Next Non-Wall Actions
 
 Do not return to r-candidate threshold/confidence loops.
@@ -412,14 +454,16 @@ Next actions should be:
 1. Replace point-like extra hairline support with connected head-top/hair
    boundary surface elements or a true soft triangle/surfel sheet attached to
    the SMPL-X head scaffold. Per-view patches are not allowed.
-2. Refine the bridge beyond a single global similarity only if it remains
+2. Do not continue by increasing SMPL-X hairline/head-top free offsets; the
+   connected mesh stress test already degraded recall.
+3. Refine the bridge beyond a single global similarity only if it remains
    geometrically meaningful and does not become a per-view cheat; test whether a
    robust head/face weighted similarity or bounded affine scale explains the
    remaining residuals.
-3. Improve hairline/head-top surface support using image boundary / mask-edge
+4. Improve hairline/head-top surface support using image boundary / mask-edge
    residuals rather than SMPL-X face/hair hard teacher.
-4. Add a true depth-ordered soft triangle renderer, then rerun the
+5. Add a true depth-ordered soft triangle renderer, then rerun the
    same 6-view and 60-view raw-image checks.
-5. Only after raw surface, protocol bridge, hairline, Open3D visual, full-body,
+6. Only after raw surface, protocol bridge, hairline, Open3D visual, full-body,
    and hands pass strict gates should any learned backend or cloud run be
    considered.

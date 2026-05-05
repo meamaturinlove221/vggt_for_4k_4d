@@ -99,6 +99,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--normal-offset-limit-hairline", type=float, default=0.040)
     parser.add_argument("--normal-offset-limit-clothing", type=float, default=0.035)
     parser.add_argument(
+        "--hairline-free-offset-limit",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional connected mesh diagnostic: allow only head-top/hairline vertices to move in 3D, "
+            "bounded by this world-space limit. Disabled by default."
+        ),
+    )
+    parser.add_argument("--hairline-free-offset-reg", type=float, default=0.50)
+    parser.add_argument("--hairline-free-smooth-reg", type=float, default=0.10)
+    parser.add_argument(
         "--extra-hairline-surfels",
         type=int,
         default=0,
@@ -1227,18 +1238,26 @@ def main() -> int:
     part_reg_weights_t = torch.from_numpy(part_reg_weights_np).to(device=device)
     edges_t = torch.from_numpy(edges_np).to(device=device)
     center = torch.from_numpy(base_vertices_np.mean(axis=0, keepdims=True).astype(np.float32)).to(device=device)
+    hairline_vertex_mask_t = torch.from_numpy((vertex_parts_np == 3).astype(np.float32))[:, None].to(device=device)
 
     delta_t = torch.zeros(3, device=device, requires_grad=True)
     log_scale = torch.zeros(1, device=device, requires_grad=True)
     normal_offsets = torch.zeros(base_vertices_np.shape[0], device=device, requires_grad=True)
-    optimizer = torch.optim.Adam([delta_t, log_scale, normal_offsets], lr=float(args.lr))
+    hairline_free_offsets = torch.zeros((base_vertices_np.shape[0], 3), device=device, requires_grad=True)
+    optimizer_params = [delta_t, log_scale, normal_offsets]
+    if float(args.hairline_free_offset_limit) > 0.0:
+        optimizer_params.append(hairline_free_offsets)
+    optimizer = torch.optim.Adam(optimizer_params, lr=float(args.lr))
 
     history: list[dict[str, Any]] = []
     for step in range(int(args.steps)):
         optimizer.zero_grad(set_to_none=True)
         bounded_offsets = torch.tanh(normal_offsets) * part_limits_t
+        hairline_free = torch.tanh(hairline_free_offsets) * float(args.hairline_free_offset_limit)
+        hairline_free = hairline_free * hairline_vertex_mask_t
         vertices = center + torch.exp(log_scale).clamp(0.85, 1.15) * (base_vertices - center) + delta_t[None, :]
         vertices = vertices + base_normals * bounded_offsets[:, None]
+        vertices = vertices + hairline_free
         surfels, surfel_normals = compute_surfels(vertices, faces_t, face_indices_t, barycentric_t)
 
         mask_losses = []
@@ -1304,6 +1323,10 @@ def main() -> int:
         offset_values = bounded_offsets
         offset_reg = (part_reg_weights_t * offset_values.square()).mean()
         smooth_reg = (offset_values[edges_t[:, 0]] - offset_values[edges_t[:, 1]]).square().mean()
+        hairline_free_reg = hairline_free.square().sum(dim=1)
+        hairline_count = hairline_vertex_mask_t.reshape(-1).sum().clamp_min(1.0)
+        hairline_free_reg = (hairline_free_reg * hairline_vertex_mask_t.reshape(-1)).sum() / hairline_count
+        hairline_free_smooth = (hairline_free[edges_t[:, 0]] - hairline_free[edges_t[:, 1]]).square().sum(dim=1).mean()
         loss = (
             float(args.mask_weight) * mask_loss
             + float(args.recall_weight) * recall_loss
@@ -1313,6 +1336,8 @@ def main() -> int:
             + global_reg
             + float(args.offset_reg) * offset_reg
             + float(args.offset_smooth_reg) * smooth_reg
+            + float(args.hairline_free_offset_reg) * hairline_free_reg
+            + float(args.hairline_free_smooth_reg) * hairline_free_smooth
         )
         loss.backward()
         optimizer.step()
@@ -1329,6 +1354,8 @@ def main() -> int:
                     "photometric_consistency_loss": float(photo_loss.detach().cpu()),
                     "offset_reg": float(offset_reg.detach().cpu()),
                     "offset_smooth_reg": float(smooth_reg.detach().cpu()),
+                    "hairline_free_offset_reg": float(hairline_free_reg.detach().cpu()),
+                    "hairline_free_smooth_reg": float(hairline_free_smooth.detach().cpu()),
                     "photo_valid_surfels": photo_meta["valid_surfels"],
                     "photo_mean_support": photo_meta["mean_support"],
                     "translation": [float(v) for v in delta_t.detach().cpu().numpy().reshape(-1)],
@@ -1338,10 +1365,14 @@ def main() -> int:
 
     with torch.no_grad():
         final_offsets = torch.tanh(normal_offsets) * part_limits_t
+        final_hairline_free = torch.tanh(hairline_free_offsets) * float(args.hairline_free_offset_limit)
+        final_hairline_free = final_hairline_free * hairline_vertex_mask_t
         optimized = center + torch.exp(log_scale).clamp(0.85, 1.15) * (base_vertices - center) + delta_t[None, :]
         optimized = optimized + base_normals * final_offsets[:, None]
+        optimized = optimized + final_hairline_free
         optimized_np = optimized.detach().cpu().numpy().astype(np.float32)
         final_offsets_np = final_offsets.detach().cpu().numpy().astype(np.float32)
+        final_hairline_free_np = final_hairline_free.detach().cpu().numpy().astype(np.float32)
 
     initial_rows, initial_overlays = evaluate_mesh(base_vertices_np, faces_np, view_payloads, output_dir / "initial", args.overlay_limit)
     optimized_rows, optimized_overlays = evaluate_mesh(optimized_np, faces_np, view_payloads, output_dir / "optimized", args.overlay_limit)
@@ -1401,6 +1432,20 @@ def main() -> int:
             "p90_abs_offset": float(np.percentile(np.abs(values), 90)) if values.size else 0.0,
             "limit": float(np.max(part_limits_np[mask])) if mask.any() else 0.0,
         }
+    hairline_free_norm = np.linalg.norm(final_hairline_free_np, axis=1)
+    hairline_mask_np = vertex_parts_np == 3
+    hairline_free_stats = {
+        "enabled": bool(float(args.hairline_free_offset_limit) > 0.0),
+        "limit": float(args.hairline_free_offset_limit),
+        "vertices": int(hairline_mask_np.sum()),
+        "mean_norm": float(hairline_free_norm[hairline_mask_np].mean()) if hairline_mask_np.any() else 0.0,
+        "p90_norm": float(np.percentile(hairline_free_norm[hairline_mask_np], 90)) if hairline_mask_np.any() else 0.0,
+        "max_norm": float(hairline_free_norm[hairline_mask_np].max()) if hairline_mask_np.any() else 0.0,
+        "note": (
+            "This is connected head-top mesh residual only. It is not a hair teacher and must pass "
+            "the same strict visual gates before being useful."
+        ),
+    }
 
     truthful_status = "raw_softsurfel_surface_smoke_complete_not_teacher_or_candidate"
     export_summary = None
@@ -1440,6 +1485,7 @@ def main() -> int:
         "config": vars(args),
         "part_names": PART_NAMES,
         "part_stats": part_stats,
+        "hairline_free_offset": hairline_free_stats,
         "extra_hairline": extra_hairline_summary,
         "optimization_history": history,
         "metrics": {
@@ -1488,6 +1534,8 @@ def main() -> int:
         f"- uses VGGT depth/point/normal: `False`",
         f"- creates teacher targets: `{bool(args.export_raster_targets)}`",
         f"- creates candidate predictions: `False`",
+        f"- hairline free-offset enabled: `{hairline_free_stats['enabled']}`",
+        f"- hairline free-offset p90: `{hairline_free_stats['p90_norm']}`",
         f"- extra hairline surfels: `{extra_hairline_summary.get('kept_points', 0)}`",
         f"- initial mean IoU: `{initial_iou['mean']}`",
         f"- optimized mean IoU: `{optimized_iou['mean']}`",
