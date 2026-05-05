@@ -1505,3 +1505,67 @@ Chamfer terms over large vertex sets and therefore weak. Before any more long
 optimization runs, audit whether the face/hand landmark losses are pulling the
 right connected vertices and add explicit diagnostics or correspondence-aware
 constraints if possible.
+
+## Landmark Pull Audit
+
+To test whether the weak MediaPipe terms are actually pulling the intended
+connected vertices, a diagnostic-only audit tool was added:
+
+```text
+tools/audit_connected_surface_landmark_pull.py
+```
+
+It projects the optimized connected mesh into the raw views, runs the same face
+and hand landmark detectors, and reports nearest connected surface vertices and
+pixel distances. It creates no teacher, no candidate, and no cloud unlock.
+
+Audit run:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_v24_outer_triangle_rgbgrad_allfaces_smoke2_t64_step5/landmark_pull_audit
+```
+
+Results:
+
+```text
+face candidate vertices = 7352
+left/right hand vertices = 2564 / 2560
+face lm->mesh mean px = 8.83
+face lm->mesh p50 px = 3.81
+face lm->mesh p90 px = 19.28
+face lm->mesh max px = 25.64
+hand lm->mesh mean px = 4.65
+hand lm->mesh p50 px = 1.74
+hand lm->mesh p90 px = 10.31
+hand lm->mesh max px = 18.82
+hand matches = 9
+duplicate-side hand views = 2
+```
+
+Representative overlays:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_v24_outer_triangle_rgbgrad_allfaces_smoke2_t64_step5/landmark_pull_audit/overlays/view_00_cam00_face_pull.png
+output/normal_line_multiview_20260506/connected_surface_v24_outer_triangle_rgbgrad_allfaces_smoke2_t64_step5/landmark_pull_audit/overlays/view_00_cam00_hand0_pull.png
+output/normal_line_multiview_20260506/connected_surface_v24_outer_triangle_rgbgrad_allfaces_smoke2_t64_step5/landmark_pull_audit/overlays/view_20_cam20_face_pull.png
+```
+
+Conclusion:
+
+```text
+The landmark losses have usable local signal in several views, but they are too
+broad to guarantee correct detailed geometry. Face pull is good in some views
+but fails badly in at least one front view. Hand landmarks are often close to
+connected hand vertices, but two views match multiple detected hands to the
+same side, so the loss can reinforce ambiguous or wrong hand-side alignment.
+This explains why the current landmark terms do not turn the template hand/face
+surface into mentor-pass geometry.
+```
+
+Next non-redundant implication:
+
+Do not increase landmark weights blindly. The next method change should make
+landmark supervision correspondence-aware: enforce per-view left/right hand
+assignment uniqueness and split face landmarks into contour / central face /
+hairline regions before applying losses. Otherwise stronger weights will only
+pull broad vertex sets and can worsen template artifacts.
