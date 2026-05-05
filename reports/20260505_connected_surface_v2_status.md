@@ -908,3 +908,122 @@ guard, not as the main optimization signal.
 Only if the optimized 60-view connected surface looks like a normal human and
 rasterizes back to the original 6-view protocol under the strict teacher gate
 can it become a teacher for a later 6-view learned backend.
+
+## Existing Mesh Export Helper And Strict Gate Refresh
+
+After disk cleanup, the current best positive-signal triangle diagnostic was
+not re-optimized. Instead, it was exported from the already existing mesh to
+avoid another parameter loop:
+
+```text
+tools/export_raw_surface_mesh_targets.py
+```
+
+Input mesh:
+
+```text
+output/normal_line_multiview_20260505/triangle_renderer_budget8000_cuda_smoke3_t96_step5/optimized_softsurfel_surface_mesh.ply
+```
+
+Export output:
+
+```text
+output/normal_line_multiview_20260505/triangle_renderer_budget8000_cuda_smoke3_t96_step5_export6v/rasterized_surface_targets/rasterized_surface_targets.npz
+```
+
+The helper only reads an ASCII triangle PLY and writes raw-camera rasterized
+debug targets. It is explicitly marked:
+
+```text
+truthful_status = raw_surface_mesh_export_complete_not_teacher_or_candidate
+uses_vggt_depth_point_normal_as_teacher = false
+creates_candidate_predictions = false
+allows_cloud = false
+```
+
+The export was bridged to the signfix VGGT protocol with the fixed bridge:
+
+```text
+output/normal_line_multiview_20260505/triangle_renderer_budget8000_cuda_smoke3_t96_step5_export6v/raw_export_to_signfix_bridge_fixed/teacher_targets.npz
+```
+
+Strict teacher gate with explicit visual fail:
+
+```text
+output/normal_line_multiview_20260505/triangle_renderer_budget8000_cuda_smoke3_t96_step5_export6v/teacher_gate_after_raw_export_bridge_manual_visual_fail_v2
+```
+
+Numeric gate:
+
+```text
+overall numeric pass = false
+visual pass = false
+overall pass = false
+face_core pass = 2 / 6
+head_face pass = 2 / 6
+hairline pass = 0 / 6
+head pass = 2 / 6
+```
+
+Aggregate compatible coverage:
+
+```text
+face_core mean compatible coverage = 0.4228
+head_face mean compatible coverage = 0.6460
+hairline mean compatible coverage = 0.3330
+head mean compatible coverage = 0.6460
+```
+
+Explicit local visual review:
+
+```text
+output/normal_line_multiview_20260505/triangle_renderer_budget8000_cuda_smoke3_t96_step5/manual_visual_review_fail.json
+```
+
+Review conclusion:
+
+```text
+Open3D review shows a template-like SMPL-X head/body shell with missing modeled
+face detail, fragmented hairline/head-top support, and non-human sparse surface
+artifacts; not a normal human surface.
+```
+
+Representative reviewed images:
+
+```text
+teacher_gate_after_raw_export_bridge_fixed/open3d_teacher_head_face/iso.png
+teacher_gate_after_raw_export_bridge_fixed/open3d_teacher_face_core/face_close.png
+teacher_gate_after_raw_export_bridge_fixed/open3d_teacher_hairline/iso.png
+```
+
+Interpretation:
+
+The connected triangle renderer is still the right implementation direction
+because it improved hard-raster IoU and target recall without global shrink.
+However, the current optimized surface is still a coarse SMPL-X-like shell. It
+does not contain modeled face, hairline, or normal-human head surface geometry,
+and it cannot become a teacher. Do not tune its thresholds, landmark weights,
+or support counts. The next non-redundant step remains a real connected,
+visibility-aware mesh/surface backend with enough expressive capacity for
+face/hairline/hands, not another raw export or r-candidate.
+
+## Refreshed Strict Registry After Cleanup
+
+The strict registry was refreshed after removing old output directories:
+
+```text
+reports/20260504_strict_gate_registry.json
+```
+
+Cloud gate result:
+
+```text
+cloud_allowed = false
+strict_candidate_passes = 0
+strict_teacher_passes = 0
+registry_age_hours ~= 0
+```
+
+This keeps the cloud guard current. Local cleanup removed stale artifacts but
+did not change the truthful result: no candidate or teacher currently satisfies
+the mentor strict gate.
