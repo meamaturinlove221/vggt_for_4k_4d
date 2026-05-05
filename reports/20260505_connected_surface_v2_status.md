@@ -542,6 +542,82 @@ surface. Therefore this is a negative diagnostic, not a teacher and not a
 candidate. Do not continue by tuning the landmark weight: the failure mode is
 representation/objective mismatch, not a missing scalar weight.
 
+## Connected Hand Landmark Weak-Loss Diagnostic
+
+Because the mentor explicitly requires full-body and hand detail as hard
+bottom-line checks, the same weak-landmark idea was applied to hands, again
+without constructing a floating patch:
+
+```text
+--hand-landmarker-task
+--hand-landmark-weight
+--hand-landmark-bidir-weight
+--hand-landmark-min-points
+```
+
+Important constraint:
+
+```text
+MediaPipe hand landmarks are only 2D weak constraints on connected SMPL-X hand
+vertices. They are not triangulated and do not create a hand teacher patch.
+```
+
+Detection smoke:
+
+```text
+output/normal_line_multiview_20260505/hand_landmark_detect_stride10_smoke6_t96_step1
+```
+
+Detected hand landmarks:
+
+```text
+detected views = 6 / 6
+detected hands = 9
+mean inside-mask ratio = 0.9722222222222222
+left/right hand vertex counts = 629 / 628
+```
+
+This confirms there is usable 2D hand evidence in the selected 60-view raw
+images.
+
+The 40-step freeze-global hand-landmark diagnostic was:
+
+```text
+output/normal_line_multiview_20260505/smoothcap_hand_landmark_freezeglobal_40step6_stride10_t96_s4000
+```
+
+Metrics:
+
+```text
+initial mean IoU = 0.7700232863426208
+optimized mean IoU = 0.762291431427002
+IoU delta = -0.0077318549156188965
+initial target recall = 0.8914699554443359
+optimized target recall = 0.8523262143135071
+target recall delta = -0.03914374113082886
+```
+
+Losses did move:
+
+```text
+hand landmark loss: 0.05577178671956062 -> 0.05188523605465889
+photometric consistency: 0.12127858400344849 -> 0.11710040271282196
+hair boundary loss: 0.023661160841584206 -> 0.018925823271274567
+```
+
+Hand vertices moved more than in the no-landmark run:
+
+```text
+left hand mean abs offset = 0.008744870312511921
+right hand mean abs offset = 0.009468389675021172
+```
+
+However, the hard rasterized body metrics still regress and the visual overlay
+remains a connected template shell, not a normal-human hand/full-body surface.
+Therefore the hand landmark signal is useful evidence, but the current carrier
+and objective still cannot satisfy the full-body/hands strict gate. Do not
+continue by tuning hand landmark weights.
+
 ## Decision
 
 Do not:
@@ -553,6 +629,7 @@ cloud train
 turn this into an r-candidate
 continue tuning offsets/support/threshold/view count
 continue tuning landmark loss weights
+continue tuning hand landmark loss weights
 ```
 
 Next non-redundant step:

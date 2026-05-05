@@ -203,6 +203,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--face-landmark-min-points", type=int, default=80)
     parser.add_argument("--face-landmark-min-confidence", type=float, default=0.02)
     parser.add_argument(
+        "--hand-landmarker-task",
+        type=Path,
+        help=(
+            "Optional MediaPipe HandLandmarker task. When combined with --hand-landmark-weight, "
+            "2D hand landmarks weakly constrain only connected SMPL-X hand vertices."
+        ),
+    )
+    parser.add_argument(
+        "--hand-landmark-weight",
+        type=float,
+        default=0.0,
+        help="Weight for connected-hand projected landmark Chamfer loss. Disabled by default.",
+    )
+    parser.add_argument("--hand-landmark-bidir-weight", type=float, default=0.10)
+    parser.add_argument("--hand-landmark-min-points", type=int, default=12)
+    parser.add_argument("--hand-landmark-min-confidence", type=float, default=0.02)
+    parser.add_argument(
         "--extra-hairline-surfels",
         type=int,
         default=0,
@@ -398,6 +415,36 @@ def create_face_landmarker(task_path: Path, min_confidence: float) -> tuple[Any 
     return mp, detector, meta
 
 
+def create_hand_landmarker(task_path: Path, min_confidence: float) -> tuple[Any | None, Any | None, dict[str, Any]]:
+    task_path = task_path.expanduser().resolve()
+    meta: dict[str, Any] = {
+        "requested": True,
+        "task_path": str(task_path),
+        "available": False,
+        "reason": None,
+    }
+    if not task_path.is_file():
+        meta["reason"] = "task_file_missing"
+        return None, None, meta
+    try:
+        import mediapipe as mp  # type: ignore
+        from mediapipe.tasks import python as mp_python  # type: ignore
+        from mediapipe.tasks.python import vision as mp_vision  # type: ignore
+    except Exception as exc:  # pragma: no cover - depends on local optional package
+        meta["reason"] = f"mediapipe_import_failed: {type(exc).__name__}: {exc}"
+        return None, None, meta
+    options = mp_vision.HandLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=str(task_path)),
+        num_hands=2,
+        min_hand_detection_confidence=float(min_confidence),
+        min_hand_presence_confidence=float(min_confidence),
+        min_tracking_confidence=float(min_confidence),
+    )
+    detector = mp_vision.HandLandmarker.create_from_options(options)
+    meta.update({"available": True, "reason": None})
+    return mp, detector, meta
+
+
 def detect_face_landmarks_2d(
     *,
     mp_module: Any,
@@ -442,11 +489,56 @@ def detect_face_landmarks_2d(
     return coords_np, meta, image
 
 
+def detect_hand_landmarks_2d(
+    *,
+    mp_module: Any,
+    detector: Any,
+    image_path: Path,
+    mask_path: Path,
+    target_size: int,
+) -> tuple[list[np.ndarray], dict[str, Any], Image.Image]:
+    image, mask = load_image_mask_for_detection(image_path, mask_path, target_size)
+    result = detector.detect(mp_module.Image(image_format=mp_module.ImageFormat.SRGB, data=np.asarray(image)))
+    landmark_sets: list[np.ndarray] = []
+    inside_ratios: list[float] = []
+    if result.hand_landmarks:
+        for hand in result.hand_landmarks:
+            coords = np.asarray(
+                [[float(lm.x) * target_size, float(lm.y) * target_size, float(lm.z)] for lm in hand],
+                dtype=np.float32,
+            )
+            xi = np.clip(np.rint(coords[:, 0]).astype(np.int32), 0, target_size - 1)
+            yi = np.clip(np.rint(coords[:, 1]).astype(np.int32), 0, target_size - 1)
+            inside = mask[yi, xi]
+            landmark_sets.append(coords)
+            inside_ratios.append(float(inside.mean()) if inside.size else 0.0)
+    meta: dict[str, Any] = {
+        "detected": bool(landmark_sets),
+        "hands": int(len(landmark_sets)),
+        "landmarks": int(sum(item.shape[0] for item in landmark_sets)),
+        "inside_mask_ratio": float(np.mean(inside_ratios)) if inside_ratios else 0.0,
+    }
+    if not landmark_sets:
+        meta["reason"] = "no_hands"
+    return landmark_sets, meta, image
+
+
 def save_face_landmark_overlay(image: Image.Image, landmarks: np.ndarray, output_path: Path) -> None:
     draw = image.copy()
     drawer = ImageDraw.Draw(draw)
     for x, y, _ in np.asarray(landmarks, dtype=np.float32):
         drawer.ellipse((float(x) - 1.5, float(y) - 1.5, float(x) + 1.5, float(y) + 1.5), fill=(255, 32, 32))
+    draw.save(output_path)
+
+
+def save_hand_landmark_overlay(image: Image.Image, landmark_sets: list[np.ndarray], output_path: Path) -> None:
+    draw = image.copy()
+    drawer = ImageDraw.Draw(draw)
+    colors = [(32, 96, 255), (255, 160, 32)]
+    for hand_idx, landmarks in enumerate(landmark_sets):
+        color = colors[hand_idx % len(colors)]
+        for x, y, _ in np.asarray(landmarks, dtype=np.float32):
+            drawer.ellipse((float(x) - 1.6, float(y) - 1.6, float(x) + 1.6, float(y) + 1.6), fill=color)
     draw.save(output_path)
 
 
@@ -959,6 +1051,76 @@ def face_landmark_projection_loss(
         "mean_landmarks": float(np.mean(landmark_counts)) if landmark_counts else 0.0,
         "reason": None,
     }
+
+
+def hand_landmark_projection_loss(
+    vertices: torch.Tensor,
+    left_vertex_ids: torch.Tensor,
+    right_vertex_ids: torch.Tensor,
+    view_payloads: list[dict[str, Any]],
+    height: int,
+    width: int,
+    *,
+    bidirectional_weight: float,
+    min_points: int,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Weak 2D hand constraint attached to connected SMPL-X hand vertices."""
+
+    if left_vertex_ids.numel() == 0 and right_vertex_ids.numel() == 0:
+        zero = vertices.sum() * 0.0
+        return zero, {"views": 0.0, "hands": 0.0, "reason": "no_hand_vertices"}
+
+    def projected_vertices(vertex_ids: torch.Tensor, payload: dict[str, Any]) -> torch.Tensor | None:
+        if vertex_ids.numel() == 0:
+            return None
+        selected = vertices.index_select(0, vertex_ids)
+        uv, z, _ = project_points(selected, payload["world_to_cam"], payload["intrinsic"])
+        valid = (
+            (z > 1e-5)
+            & (uv[:, 0] >= 0.0)
+            & (uv[:, 0] <= width - 1)
+            & (uv[:, 1] >= 0.0)
+            & (uv[:, 1] <= height - 1)
+        )
+        if int(valid.float().sum().detach().cpu()) < 6:
+            return None
+        return uv[valid] / float(max(height, width))
+
+    def chamfer(landmarks_xy: torch.Tensor, uv_valid: torch.Tensor) -> torch.Tensor:
+        dists = torch.cdist(landmarks_xy, uv_valid)
+        return dists.min(dim=1).values.mean() + float(bidirectional_weight) * dists.min(dim=0).values.mean()
+
+    losses: list[torch.Tensor] = []
+    used_hands = 0
+    used_views = 0
+    for payload in view_payloads:
+        hand_sets = payload.get("hand_landmarks_t") or []
+        if not hand_sets:
+            continue
+        left_uv = projected_vertices(left_vertex_ids, payload)
+        right_uv = projected_vertices(right_vertex_ids, payload)
+        if left_uv is None and right_uv is None:
+            continue
+        view_used = False
+        for landmarks in hand_sets:
+            if landmarks.numel() < int(min_points) * 2:
+                continue
+            landmarks_xy = landmarks[:, :2] / float(max(height, width))
+            candidates: list[torch.Tensor] = []
+            if left_uv is not None:
+                candidates.append(chamfer(landmarks_xy, left_uv))
+            if right_uv is not None:
+                candidates.append(chamfer(landmarks_xy, right_uv))
+            if candidates:
+                losses.append(torch.stack(candidates).min())
+                used_hands += 1
+                view_used = True
+        if view_used:
+            used_views += 1
+    if not losses:
+        zero = vertices.sum() * 0.0
+        return zero, {"views": 0.0, "hands": 0.0, "reason": "no_usable_hand_landmark_views"}
+    return torch.stack(losses).mean(), {"views": float(used_views), "hands": float(used_hands), "reason": None}
 
 
 def compute_mask_metrics(rendered: np.ndarray, target: np.ndarray) -> dict[str, Any]:
@@ -1757,6 +1919,11 @@ def main() -> int:
     face_landmarker_meta: dict[str, Any] = {"requested": bool(args.face_landmarker_task), "available": False}
     face_landmark_overlay_paths: list[Path] = []
     face_landmark_rows: list[dict[str, Any]] = []
+    hand_mp_module = None
+    hand_detector = None
+    hand_landmarker_meta: dict[str, Any] = {"requested": bool(args.hand_landmarker_task), "available": False}
+    hand_landmark_overlay_paths: list[Path] = []
+    hand_landmark_rows: list[dict[str, Any]] = []
     if args.face_landmarker_task is not None:
         face_mp_module, face_detector, face_landmarker_meta = create_face_landmarker(
             args.face_landmarker_task,
@@ -1767,6 +1934,16 @@ def main() -> int:
                 "Face landmark loss was requested, but the detector is unavailable: "
                 f"{face_landmarker_meta.get('reason')}"
             )
+    if args.hand_landmarker_task is not None:
+        hand_mp_module, hand_detector, hand_landmarker_meta = create_hand_landmarker(
+            args.hand_landmarker_task,
+            min_confidence=float(args.hand_landmark_min_confidence),
+        )
+        if float(args.hand_landmark_weight) > 0.0 and hand_detector is None:
+            raise RuntimeError(
+                "Hand landmark loss was requested, but the detector is unavailable: "
+                f"{hand_landmarker_meta.get('reason')}"
+            )
     face_landmark_pad = (
         int(args.face_landmark_pad)
         if int(args.face_landmark_pad) >= 0
@@ -1775,6 +1952,9 @@ def main() -> int:
     face_landmark_overlay_dir = output_dir / "face_landmark_overlays"
     if face_detector is not None:
         face_landmark_overlay_dir.mkdir(parents=True, exist_ok=True)
+    hand_landmark_overlay_dir = output_dir / "hand_landmark_overlays"
+    if hand_detector is not None:
+        hand_landmark_overlay_dir.mkdir(parents=True, exist_ok=True)
     for view_idx in selected_indices:
         view = views[view_idx]
         camera_id = str(view["camera_id"]).zfill(2)
@@ -1813,6 +1993,22 @@ def main() -> int:
                 face_landmark_overlay_paths.append(overlay_path)
         face_meta.update({"view_index": int(view_idx), "camera_id": camera_id})
         face_landmark_rows.append(json_ready(face_meta))
+        hand_landmarks_np: list[np.ndarray] = []
+        hand_meta: dict[str, Any] = {"detected": False, "reason": "hand_landmarker_disabled", "hands": 0, "landmarks": 0}
+        if hand_detector is not None and hand_mp_module is not None:
+            hand_landmarks_np, hand_meta, hand_image = detect_hand_landmarks_2d(
+                mp_module=hand_mp_module,
+                detector=hand_detector,
+                image_path=image_path,
+                mask_path=mask_path,
+                target_size=height,
+            )
+            if hand_landmarks_np and len(hand_landmark_overlay_paths) < int(args.overlay_limit):
+                overlay_path = hand_landmark_overlay_dir / f"view_{view_idx:02d}_cam{camera_id}_hands.png"
+                save_hand_landmark_overlay(hand_image, hand_landmarks_np, overlay_path)
+                hand_landmark_overlay_paths.append(overlay_path)
+        hand_meta.update({"view_index": int(view_idx), "camera_id": camera_id})
+        hand_landmark_rows.append(json_ready(hand_meta))
         view_payloads.append(
             {
                 "view_index": int(view_idx),
@@ -1841,10 +2037,17 @@ def main() -> int:
                     else torch.from_numpy(face_landmarks_np.astype(np.float32)).to(device=device)
                 ),
                 "face_landmark_meta": face_meta,
+                "hand_landmarks": hand_landmarks_np,
+                "hand_landmarks_t": [
+                    torch.from_numpy(item.astype(np.float32)).to(device=device) for item in hand_landmarks_np
+                ],
+                "hand_landmark_meta": hand_meta,
             }
         )
     if face_detector is not None and hasattr(face_detector, "close"):
         face_detector.close()
+    if hand_detector is not None and hasattr(hand_detector, "close"):
+        hand_detector.close()
 
     base_vertices = torch.from_numpy(base_vertices_np).to(device=device)
     base_normals = torch.from_numpy(normals_np).to(device=device)
@@ -1860,6 +2063,8 @@ def main() -> int:
     hairline_vertex_mask_t = torch.from_numpy((vertex_parts_np == 4).astype(np.float32))[:, None].to(device=device)
     hair_outer_vertex_ids_t = torch.from_numpy(hair_outer_vertex_ids_np.astype(np.int64)).to(device=device)
     face_landmark_vertex_ids_t = torch.from_numpy(np.nonzero(face_landmark_vertex_mask_np)[0].astype(np.int64)).to(device=device)
+    left_hand_vertex_ids_t = torch.from_numpy(np.nonzero(vertex_parts_np == 1)[0].astype(np.int64)).to(device=device)
+    right_hand_vertex_ids_t = torch.from_numpy(np.nonzero(vertex_parts_np == 2)[0].astype(np.int64)).to(device=device)
 
     delta_t = torch.zeros(3, device=device, requires_grad=True)
     log_scale = torch.zeros(1, device=device, requires_grad=True)
@@ -1971,6 +2176,16 @@ def main() -> int:
             bidirectional_weight=float(args.face_landmark_bidir_weight),
             min_points=int(args.face_landmark_min_points),
         )
+        hand_landmark_loss, hand_landmark_meta = hand_landmark_projection_loss(
+            vertices=vertices,
+            left_vertex_ids=left_hand_vertex_ids_t,
+            right_vertex_ids=right_hand_vertex_ids_t,
+            view_payloads=view_payloads,
+            height=height,
+            width=width,
+            bidirectional_weight=float(args.hand_landmark_bidir_weight),
+            min_points=int(args.hand_landmark_min_points),
+        )
 
         if bool(args.freeze_global_transform):
             global_reg = delta_t.sum() * 0.0 + log_scale.sum() * 0.0
@@ -1991,6 +2206,7 @@ def main() -> int:
             + float(args.part_recall_weight) * part_loss
             + float(args.hair_boundary_weight) * hair_boundary_loss
             + float(args.face_landmark_weight) * face_landmark_loss
+            + float(args.hand_landmark_weight) * hand_landmark_loss
             + float(args.photo_weight) * photo_loss
             + global_reg
             + float(args.offset_reg) * offset_reg
@@ -2016,6 +2232,8 @@ def main() -> int:
                     "hair_boundary_meta": hair_boundary_meta,
                     "face_landmark_loss": float(face_landmark_loss.detach().cpu()),
                     "face_landmark_meta": face_landmark_meta,
+                    "hand_landmark_loss": float(hand_landmark_loss.detach().cpu()),
+                    "hand_landmark_meta": hand_landmark_meta,
                     "photometric_consistency_loss": float(photo_loss.detach().cpu()),
                     "offset_reg": float(offset_reg.detach().cpu()),
                     "offset_smooth_reg": float(smooth_reg.detach().cpu()),
@@ -2151,6 +2369,28 @@ def main() -> int:
             "They are not triangulated and do not create a face teacher patch."
         ),
     }
+    hand_landmark_detected = [row for row in hand_landmark_rows if bool(row.get("detected"))]
+    hand_landmark_stats = {
+        "detector": hand_landmarker_meta,
+        "weight": float(args.hand_landmark_weight),
+        "bidirectional_weight": float(args.hand_landmark_bidir_weight),
+        "left_hand_vertex_count": int((vertex_parts_np == 1).sum()),
+        "right_hand_vertex_count": int((vertex_parts_np == 2).sum()),
+        "detected_views": int(len(hand_landmark_detected)),
+        "selected_views": int(len(view_payloads)),
+        "detected_hands": int(sum(int(row.get("hands", 0)) for row in hand_landmark_detected)),
+        "mean_inside_mask_ratio": (
+            float(np.mean([float(row.get("inside_mask_ratio", 0.0)) for row in hand_landmark_detected]))
+            if hand_landmark_detected
+            else 0.0
+        ),
+        "rows": hand_landmark_rows,
+        "overlay_paths": hand_landmark_overlay_paths,
+        "note": (
+            "These landmarks are used only as optional 2D weak constraints on connected hand vertices. "
+            "They are not triangulated and do not create a hand teacher patch."
+        ),
+    }
 
     truthful_status = "raw_softsurfel_surface_smoke_complete_not_teacher_or_candidate"
     export_summary = None
@@ -2199,6 +2439,7 @@ def main() -> int:
         "surfel_part_stats": surfel_part_stats,
         "part_target_stats": part_target_stats,
         "face_landmarks": face_landmark_stats,
+        "hand_landmarks": hand_landmark_stats,
         "hairline_free_offset": hairline_free_stats,
         "extra_hairline": extra_hairline_summary,
         "optimization_history": history,
@@ -2259,6 +2500,9 @@ def main() -> int:
         f"- face landmark weight: `{float(args.face_landmark_weight)}`",
         f"- face landmark detected views: `{face_landmark_stats['detected_views']}/{face_landmark_stats['selected_views']}`",
         f"- face landmark vertex count: `{face_landmark_stats['face_vertex_count']}`",
+        f"- hand landmark weight: `{float(args.hand_landmark_weight)}`",
+        f"- hand landmark detected views: `{hand_landmark_stats['detected_views']}/{hand_landmark_stats['selected_views']}`",
+        f"- hand landmark detected hands: `{hand_landmark_stats['detected_hands']}`",
         f"- extra hairline surfels: `{extra_hairline_summary.get('kept_points', 0)}`",
         f"- initial mean IoU: `{initial_iou['mean']}`",
         f"- optimized mean IoU: `{optimized_iou['mean']}`",
