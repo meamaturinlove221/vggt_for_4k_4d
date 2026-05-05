@@ -39,10 +39,11 @@ from tools.smplx_numpy import (  # noqa: E402
 
 PART_NAMES = {
     0: "torso_limbs",
-    1: "hands_wide",
-    2: "head_face",
-    3: "head_top_hairline_proxy",
-    4: "lower_clothing_proxy",
+    1: "left_hand",
+    2: "right_hand",
+    3: "head_face",
+    4: "head_top_hairline_proxy",
+    5: "lower_clothing_proxy",
 }
 
 
@@ -70,6 +71,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--boundary-samples", type=int, default=192)
     parser.add_argument("--render-pixel-chunk", type=int, default=4096)
     parser.add_argument("--gaussian-sigma", type=float, default=1.7)
+    parser.add_argument(
+        "--connected-template-payload",
+        type=Path,
+        help=(
+            "Optional v2 raw-surface carrier payload from build_connected_human_surface_template.py. "
+            "When set, the optimizer uses the connected hybrid mesh instead of the plain SMPL-X mesh."
+        ),
+    )
     parser.add_argument("--mask-weight", type=float, default=1.0)
     parser.add_argument(
         "--recall-weight",
@@ -249,34 +258,42 @@ def classify_vertex_parts(canonical_positions: np.ndarray) -> np.ndarray:
     canonical = np.asarray(canonical_positions, dtype=np.float32)
     x = canonical[:, 0]
     y = canonical[:, 1]
+    z = canonical[:, 2]
+    center_x = float(np.median(x))
     abs_x = np.abs(x - np.median(x))
-    y20, y55, y82, y90, y95 = np.percentile(y, [20, 55, 82, 90, 95])
+    y20, y82, y88, y94, y96 = np.percentile(y, [20, 82, 88, 94, 96])
     abs_x88 = np.percentile(abs_x, 88)
     abs_x94 = np.percentile(abs_x, 94)
+    z_head_median = float(np.median(z[y > y82])) if np.any(y > y82) else float(np.median(z))
 
     parts = np.zeros((canonical.shape[0],), dtype=np.int64)
-    parts[y < y20] = 4
-    parts[y > y82] = 2
-    parts[y > y95] = 3
-    hands = (abs_x > abs_x88) & (y > y20) & (y < y90)
-    parts[hands] = 1
-    far_hands = (abs_x > abs_x94) & (y > y20) & (y < y95)
-    parts[far_hands] = 1
+    parts[y < y20] = 5
+    parts[y > y82] = 3
+    parts[y > y96] = 4
+    hands = (abs_x > abs_x88) & (y > y20) & (y < y94)
+    far_hands = (abs_x > abs_x94) & (y > y20) & (y < y96)
+    left_hand = (hands | far_hands) & (x < center_x)
+    right_hand = (hands | far_hands) & (x >= center_x)
+    parts[left_hand] = 1
+    parts[right_hand] = 2
+    # Keep front-face vertices in the head bucket; the hairline bucket stays
+    # reserved for top/head cap freedom.
+    _ = z_head_median
     return parts.astype(np.int64)
 
 
 def make_part_limits(parts: np.ndarray, args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray]:
     limits = np.full(parts.shape, float(args.normal_offset_limit_body), dtype=np.float32)
-    limits[parts == 1] = float(args.normal_offset_limit_hands)
-    limits[parts == 2] = float(args.normal_offset_limit_head)
-    limits[parts == 3] = float(args.normal_offset_limit_hairline)
-    limits[parts == 4] = float(args.normal_offset_limit_clothing)
+    limits[(parts == 1) | (parts == 2)] = float(args.normal_offset_limit_hands)
+    limits[parts == 3] = float(args.normal_offset_limit_head)
+    limits[parts == 4] = float(args.normal_offset_limit_hairline)
+    limits[parts == 5] = float(args.normal_offset_limit_clothing)
 
     reg_weights = np.full(parts.shape, 1.0, dtype=np.float32)
-    reg_weights[parts == 1] = 0.55
-    reg_weights[parts == 2] = 0.65
-    reg_weights[parts == 3] = 0.35
-    reg_weights[parts == 4] = 0.45
+    reg_weights[(parts == 1) | (parts == 2)] = 0.55
+    reg_weights[parts == 3] = 0.65
+    reg_weights[parts == 4] = 0.35
+    reg_weights[parts == 5] = 0.45
     return limits, reg_weights
 
 
@@ -1175,6 +1192,30 @@ def main() -> int:
     faces_np = np.asarray(mesh["faces"], dtype=np.int32)
     normals_np = compute_vertex_normals(base_vertices_np, faces_np).astype(np.float32)
     vertex_parts_np = classify_vertex_parts(np.asarray(static_features["canonical_positions"], dtype=np.float32))
+    connected_template_summary: dict[str, Any] | None = None
+    if args.connected_template_payload:
+        template_payload = args.connected_template_payload.expanduser().resolve()
+        with np.load(template_payload, allow_pickle=False) as payload:
+            base_vertices_np = np.asarray(payload["hybrid_vertices"], dtype=np.float32)
+            faces_np = np.asarray(payload["hybrid_faces"], dtype=np.int32)
+            base_part_ids = np.asarray(payload["part_ids"], dtype=np.int64)
+            if base_part_ids.shape[0] > base_vertices_np.shape[0]:
+                raise ValueError(
+                    f"Template part ids ({base_part_ids.shape[0]}) exceed vertex count ({base_vertices_np.shape[0]})."
+                )
+            vertex_parts_np = np.full((base_vertices_np.shape[0],), 4, dtype=np.int64)
+            vertex_parts_np[: base_part_ids.shape[0]] = base_part_ids
+        normals_np = compute_vertex_normals(base_vertices_np, faces_np).astype(np.float32)
+        connected_template_summary = {
+            "payload": template_payload,
+            "vertices": int(base_vertices_np.shape[0]),
+            "faces": int(faces_np.shape[0]),
+            "new_vertices": int(base_vertices_np.shape[0] - mesh["vertices"].shape[0]),
+            "note": (
+                "Connected raw-surface v2 carrier is used for the local upper-bound smoke. "
+                "It is not a teacher and does not permit cloud."
+            ),
+        }
     part_limits_np, part_reg_weights_np = make_part_limits(vertex_parts_np, args)
     edges_np = unique_edges(faces_np)
 
@@ -1238,7 +1279,7 @@ def main() -> int:
     part_reg_weights_t = torch.from_numpy(part_reg_weights_np).to(device=device)
     edges_t = torch.from_numpy(edges_np).to(device=device)
     center = torch.from_numpy(base_vertices_np.mean(axis=0, keepdims=True).astype(np.float32)).to(device=device)
-    hairline_vertex_mask_t = torch.from_numpy((vertex_parts_np == 3).astype(np.float32))[:, None].to(device=device)
+    hairline_vertex_mask_t = torch.from_numpy((vertex_parts_np == 4).astype(np.float32))[:, None].to(device=device)
 
     delta_t = torch.zeros(3, device=device, requires_grad=True)
     log_scale = torch.zeros(1, device=device, requires_grad=True)
@@ -1433,7 +1474,7 @@ def main() -> int:
             "limit": float(np.max(part_limits_np[mask])) if mask.any() else 0.0,
         }
     hairline_free_norm = np.linalg.norm(final_hairline_free_np, axis=1)
-    hairline_mask_np = vertex_parts_np == 3
+    hairline_mask_np = vertex_parts_np == 4
     hairline_free_stats = {
         "enabled": bool(float(args.hairline_free_offset_limit) > 0.0),
         "limit": float(args.hairline_free_offset_limit),
@@ -1484,6 +1525,7 @@ def main() -> int:
         },
         "config": vars(args),
         "part_names": PART_NAMES,
+        "connected_template": connected_template_summary,
         "part_stats": part_stats,
         "hairline_free_offset": hairline_free_stats,
         "extra_hairline": extra_hairline_summary,
