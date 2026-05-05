@@ -1090,3 +1090,108 @@ attached to the body. Do not tune the current mesh to chase the hand gate. The
 next non-redundant method step is a part-aware connected surface backend with
 real raw-image photometric and boundary evidence, not another fullbody export
 or confidence change.
+
+## Connected Surface v2.1 Local Subdivision And Part-Free Residual
+
+To avoid repeating the same coarse-template carrier, v2.1 adds local conforming
+triangle subdivision to the connected template builder:
+
+```text
+tools/build_connected_human_surface_template.py
+```
+
+New local-only carrier:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_template_v21_conforming_subdiv_facehairhandscloth/connected_human_surface_template_payload.npz
+```
+
+Carrier counts:
+
+```text
+base vertices = 10475
+base faces = 20908
+hybrid vertices = 28185
+hybrid faces = 56424
+subdivision selected parts = left_hand, right_hand, head_face, head_top_hairline, lower_clothing_proxy
+subdivision levels = 1
+selected faces = 11496
+new midpoint vertices = 17421
+```
+
+The subdivision is conforming across selected/unselected face boundaries, so it
+does not intentionally create T-junctions. Payload invariants were checked:
+
+```text
+part_ids shape = 28185
+face_front_vertex_mask shape = 28185
+head_vertex_mask shape = 28185
+hairline_vertex_mask shape = 28185
+left/right hand masks shape = 28185
+```
+
+The raw optimizer now also supports optional bounded connected 3D part-free
+residuals for face, hands, hairline, and clothing:
+
+```text
+--part-free-offset-limit-face
+--part-free-offset-limit-hands
+--part-free-offset-limit-hairline
+--part-free-offset-limit-clothing
+--part-free-offset-reg
+--part-free-smooth-reg
+```
+
+These are disabled by default and remain connected mesh residuals, not floating
+patches.
+
+Smoke runs:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_template_v21_conforming_softsurfel_smoke6_t96_step20
+output/normal_line_multiview_20260506/connected_surface_template_v21_conforming_landmark_softsurfel_smoke6_t96_step20
+output/normal_line_multiview_20260506/connected_surface_template_v21_partfree_partrecall_landmark_smoke6_t96_step20
+```
+
+Best part-free / part-recall / landmark smoke metrics:
+
+```text
+initial_iou.mean = 0.7700
+optimized_iou.mean = 0.7727
+iou_delta = +0.0027
+initial_target_recall.mean = 0.8915
+optimized_target_recall.mean = 0.8885
+target_recall_delta = -0.0029
+face landmarks detected = 4 / 6 views
+hand landmarks detected = 6 / 6 views, 9 hands
+```
+
+Open3D review:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_template_v21_partfree_partrecall_landmark_smoke6_t96_step20/open3d_review_full/iso.png
+output/normal_line_multiview_20260506/connected_surface_template_v21_partfree_partrecall_landmark_smoke6_t96_step20/open3d_review_full/solid_mesh/face_close.png
+output/normal_line_multiview_20260506/connected_surface_template_v21_partfree_partrecall_landmark_smoke6_t96_step20/open3d_review_hands/solid_mesh/iso.png
+output/normal_line_multiview_20260506/connected_surface_template_v21_partfree_partrecall_landmark_smoke6_t96_step20/open3d_review_hands/solid_mesh/head_close.png
+```
+
+Conclusion:
+
+```text
+v2.1 is an implementation improvement, not a mentor pass. It increases local
+connected surface capacity and verifies that face/hand landmark detectors can
+supervise connected vertices, but the optimized result remains a template-like
+SMPL-X shell. The face is not modeled, the head cap is artificial, clothing is
+not reconstructed as personal geometry, and hands remain template/detail-poor.
+No strict teacher gate was run because the visual precheck already fails.
+```
+
+Next non-redundant implication:
+
+The bottleneck has moved beyond carrier density and bounded residual variables.
+The current raw-image objective is still too weak to recover a normal-human
+surface from RGB/mask constraints alone at this local smoke scale. Further
+progress needs a stronger learned or optimized surface backend with real
+visibility-aware photometric/normal objectives and possibly a strict-passing
+dense target-frame teacher; do not continue by increasing v2.1 steps or weights
+without adding new information or a stronger objective.

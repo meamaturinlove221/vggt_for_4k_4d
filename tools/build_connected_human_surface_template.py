@@ -67,6 +67,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hair-outer-offset", type=float, default=0.035)
     parser.add_argument("--hair-up-offset", type=float, default=0.030)
     parser.add_argument("--hair-cap-height", type=float, default=0.070)
+    parser.add_argument(
+        "--subdivide-parts",
+        default="",
+        help=(
+            "Optional comma-separated part ids or names to locally split triangle faces "
+            "after the connected hair cap is attached. This increases connected surface "
+            "capacity for face/hair/hands/clothing without introducing floating patches."
+        ),
+    )
+    parser.add_argument("--subdivision-levels", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -213,6 +223,170 @@ def mesh_colors_from_parts(parts: np.ndarray) -> np.ndarray:
     return out
 
 
+def parse_subdivide_parts(spec: str) -> set[int]:
+    aliases = {name: int(part_id) for part_id, name in PART_NAMES.items()}
+    aliases.update(
+        {
+            "body": 0,
+            "torso": 0,
+            "limbs": 0,
+            "left": 1,
+            "left_hand": 1,
+            "right": 2,
+            "right_hand": 2,
+            "head": 3,
+            "face": 3,
+            "head_face": 3,
+            "hair": 4,
+            "hairline": 4,
+            "head_top": 4,
+            "clothing": 5,
+            "lower": 5,
+            "skirt": 5,
+        }
+    )
+    out: set[int] = set()
+    for raw in str(spec).split(","):
+        item = raw.strip().lower()
+        if not item:
+            continue
+        if item.isdigit() or (item.startswith("-") and item[1:].isdigit()):
+            part_id = int(item)
+        else:
+            if item not in aliases:
+                raise ValueError(f"Unknown subdivision part '{raw}'. Known names: {sorted(aliases)}")
+            part_id = int(aliases[item])
+        if part_id not in PART_NAMES:
+            raise ValueError(f"Subdivision part id {part_id} is not in PART_NAMES")
+        out.add(part_id)
+    return out
+
+
+def most_common_part(part_values: np.ndarray, *, preferred: set[int] | None = None) -> int:
+    values = [int(value) for value in np.asarray(part_values).reshape(-1).tolist()]
+    if preferred:
+        preferred_values = [value for value in values if value in preferred]
+        if preferred_values:
+            values = preferred_values
+    counts = np.bincount(np.asarray(values, dtype=np.int64), minlength=max(PART_NAMES) + 1)
+    return int(np.argmax(counts))
+
+
+def subdivide_selected_faces(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    part_ids: np.ndarray,
+    face_front_mask: np.ndarray,
+    selected_parts: set[int],
+    *,
+    levels: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    vertices_np = np.asarray(vertices, dtype=np.float32)
+    faces_np = np.asarray(faces, dtype=np.int32)
+    part_ids_np = np.asarray(part_ids, dtype=np.int64)
+    face_front_np = np.asarray(face_front_mask, dtype=bool)
+    stats: list[dict[str, int]] = []
+    if int(levels) <= 0 or not selected_parts:
+        return vertices_np, faces_np, part_ids_np, face_front_np, {
+            "enabled": False,
+            "levels": int(levels),
+            "selected_parts": sorted(int(part) for part in selected_parts),
+            "stats": stats,
+        }
+
+    for level in range(int(levels)):
+        selected_face_mask: list[bool] = []
+        split_edges: set[tuple[int, int]] = set()
+        for face in faces_np:
+            a, b, c = [int(value) for value in face.tolist()]
+            face_parts = part_ids_np[[a, b, c]]
+            should_split = any(int(value) in selected_parts for value in face_parts.tolist())
+            selected_face_mask.append(bool(should_split))
+            if should_split:
+                for u, v in ((a, b), (b, c), (c, a)):
+                    split_edges.add((int(u), int(v)) if int(u) < int(v) else (int(v), int(u)))
+        edge_to_mid: dict[tuple[int, int], int] = {}
+        vertex_list = [vertices_np[index].copy() for index in range(vertices_np.shape[0])]
+        part_list = [int(value) for value in part_ids_np.tolist()]
+        face_front_list = [bool(value) for value in face_front_np.tolist()]
+        new_faces: list[list[int]] = []
+        selected_faces = 0
+
+        def midpoint(a: int, b: int, face_has_front: bool, face_part_values: np.ndarray, prefer_selected: bool) -> int:
+            key = (int(a), int(b)) if int(a) < int(b) else (int(b), int(a))
+            if key in edge_to_mid:
+                return edge_to_mid[key]
+            idx = len(vertex_list)
+            vertex_list.append(((vertices_np[int(a)] + vertices_np[int(b)]) * 0.5).astype(np.float32))
+            preferred = selected_parts if prefer_selected else None
+            edge_parts = np.asarray([part_ids_np[int(a)], part_ids_np[int(b)], most_common_part(face_part_values, preferred=preferred)])
+            part_list.append(most_common_part(edge_parts, preferred=preferred))
+            face_front_list.append(bool(face_has_front or face_front_np[int(a)] or face_front_np[int(b)]))
+            edge_to_mid[key] = idx
+            return idx
+
+        def edge_key(a: int, b: int) -> tuple[int, int]:
+            return (int(a), int(b)) if int(a) < int(b) else (int(b), int(a))
+
+        for face_idx, face in enumerate(faces_np):
+            a, b, c = [int(value) for value in face.tolist()]
+            face_parts = part_ids_np[[a, b, c]]
+            should_split = bool(selected_face_mask[face_idx])
+            face_has_front = bool(face_front_np[[a, b, c]].any())
+            split_ab = edge_key(a, b) in split_edges
+            split_bc = edge_key(b, c) in split_edges
+            split_ca = edge_key(c, a) in split_edges
+            if not (split_ab or split_bc or split_ca):
+                new_faces.append([a, b, c])
+                continue
+            selected_faces += int(should_split)
+            ab = midpoint(a, b, face_has_front, face_parts, should_split) if split_ab else None
+            bc = midpoint(b, c, face_has_front, face_parts, should_split) if split_bc else None
+            ca = midpoint(c, a, face_has_front, face_parts, should_split) if split_ca else None
+            if split_ab and split_bc and split_ca:
+                assert ab is not None and bc is not None and ca is not None
+                new_faces.extend([[a, ab, ca], [ab, b, bc], [ca, bc, c], [ab, bc, ca]])
+            elif split_ab and not split_bc and not split_ca:
+                assert ab is not None
+                new_faces.extend([[a, ab, c], [ab, b, c]])
+            elif split_bc and not split_ab and not split_ca:
+                assert bc is not None
+                new_faces.extend([[a, b, bc], [a, bc, c]])
+            elif split_ca and not split_ab and not split_bc:
+                assert ca is not None
+                new_faces.extend([[a, b, ca], [b, c, ca]])
+            elif split_ab and split_bc and not split_ca:
+                assert ab is not None and bc is not None
+                new_faces.extend([[a, ab, bc], [a, bc, c], [ab, b, bc]])
+            elif split_bc and split_ca and not split_ab:
+                assert bc is not None and ca is not None
+                new_faces.extend([[a, b, bc], [a, bc, ca], [ca, bc, c]])
+            elif split_ca and split_ab and not split_bc:
+                assert ca is not None and ab is not None
+                new_faces.extend([[a, ab, ca], [ab, b, c], [ab, c, ca]])
+
+        vertices_np = np.asarray(vertex_list, dtype=np.float32)
+        faces_np = np.asarray(new_faces, dtype=np.int32)
+        part_ids_np = np.asarray(part_list, dtype=np.int64)
+        face_front_np = np.asarray(face_front_list, dtype=bool)
+        stats.append(
+            {
+                "level": int(level + 1),
+                "selected_faces": int(selected_faces),
+                "vertices": int(vertices_np.shape[0]),
+                "faces": int(faces_np.shape[0]),
+                "new_midpoint_vertices": int(len(edge_to_mid)),
+            }
+        )
+
+    return vertices_np, faces_np, part_ids_np, face_front_np, {
+        "enabled": True,
+        "levels": int(levels),
+        "selected_parts": sorted(int(part) for part in selected_parts),
+        "stats": stats,
+    }
+
+
 def select_hair_ring(
     vertices: np.ndarray,
     normals: np.ndarray,
@@ -357,6 +531,9 @@ def write_report(path: Path, summary: dict[str, Any]) -> None:
         f"hair seam vertices = {summary['hair_cap']['ring_vertices']}",
         f"hair cap new vertices = {summary['hair_cap']['new_vertices']}",
         f"hair cap faces = {summary['hair_cap']['faces']}",
+        f"local subdivision enabled = {summary['subdivision']['enabled']}",
+        f"local subdivision levels = {summary['subdivision']['levels']}",
+        f"local subdivision parts = {summary['subdivision']['selected_part_names']}",
         "```",
         "",
         "## Part Regions",
@@ -364,6 +541,13 @@ def write_report(path: Path, summary: dict[str, Any]) -> None:
     ]
     for name, item in summary["regions"].items():
         lines.append(f"- `{name}`: vertices `{item['vertices']}`, faces `{item['faces']}`")
+    if summary["subdivision"]["enabled"]:
+        lines.extend(["", "## Local Subdivision"])
+        for item in summary["subdivision"]["stats"]:
+            lines.append(
+                "- level `{level}`: split faces `{selected_faces}`, midpoint vertices `{new_midpoint_vertices}`, "
+                "vertices `{vertices}`, faces `{faces}`".format(**item)
+            )
     lines.extend(
         [
             "",
@@ -442,8 +626,29 @@ def main() -> int:
     hair_new_vertices = np.asarray(hair_cap["new_vertices"], dtype=np.float32)
     hybrid_vertices = np.concatenate([vertices, hair_new_vertices], axis=0).astype(np.float32)
     hybrid_faces = np.concatenate([faces, hair_cap["hybrid_faces"]], axis=0).astype(np.int32)
-    hair_colors = np.tile(np.asarray(PART_COLORS[4], dtype=np.uint8)[None, :], (hair_new_vertices.shape[0], 1))
-    hybrid_colors = np.concatenate([colors, hair_colors], axis=0).astype(np.uint8)
+    hybrid_part_ids = np.concatenate(
+        [part_ids, np.full((hair_new_vertices.shape[0],), 4, dtype=np.int64)],
+        axis=0,
+    ).astype(np.int64)
+    hybrid_face_front_mask = np.concatenate(
+        [
+            np.asarray(masks["face_front_proxy"], dtype=bool),
+            np.zeros((hair_new_vertices.shape[0],), dtype=bool),
+        ],
+        axis=0,
+    )
+    selected_subdivide_parts = parse_subdivide_parts(args.subdivide_parts)
+    subdivision_summary: dict[str, Any]
+    hybrid_vertices, hybrid_faces, hybrid_part_ids, hybrid_face_front_mask, subdivision_summary = subdivide_selected_faces(
+        hybrid_vertices,
+        hybrid_faces,
+        hybrid_part_ids,
+        hybrid_face_front_mask,
+        selected_subdivide_parts,
+        levels=int(args.subdivision_levels),
+    )
+    subdivision_summary["selected_part_names"] = [PART_NAMES[int(part)] for part in subdivision_summary["selected_parts"]]
+    hybrid_colors = mesh_colors_from_parts(hybrid_part_ids)
 
     save_colored_mesh(output_dir / "smplx_part_template_full.ply", vertices, faces, colors)
     save_colored_mesh(output_dir / "connected_human_surface_template_hybrid.ply", hybrid_vertices, hybrid_faces, hybrid_colors)
@@ -460,17 +665,17 @@ def main() -> int:
     )
 
     region_masks = {
-        "face_front_proxy": np.asarray(masks["face_front_proxy"], dtype=bool),
-        "head_face": np.asarray(masks["head_face"], dtype=bool),
-        "head_top_hairline": np.asarray(masks["head_top_hairline"], dtype=bool),
-        "left_hand": np.asarray(masks["left_hand"], dtype=bool),
-        "right_hand": np.asarray(masks["right_hand"], dtype=bool),
-        "lower_clothing_proxy": np.asarray(masks["lower_clothing_proxy"], dtype=bool),
+        "face_front_proxy": hybrid_face_front_mask.astype(bool),
+        "head_face": (hybrid_part_ids == 3) | (hybrid_part_ids == 4),
+        "head_top_hairline": hybrid_part_ids == 4,
+        "left_hand": hybrid_part_ids == 1,
+        "right_hand": hybrid_part_ids == 2,
+        "lower_clothing_proxy": hybrid_part_ids == 5,
     }
     regions: dict[str, dict[str, Any]] = {}
     for name, vertex_mask in region_masks.items():
-        region_face_mask = face_mask_from_vertices(faces, vertex_mask, mode="any")
-        sub_vertices, sub_faces, used_vertices = submesh(vertices, faces, region_face_mask)
+        region_face_mask = face_mask_from_vertices(hybrid_faces, vertex_mask, mode="any")
+        sub_vertices, sub_faces, used_vertices = submesh(hybrid_vertices, hybrid_faces, region_face_mask)
         save_colored_mesh(
             output_dir / f"{name}_region.ply",
             sub_vertices,
@@ -491,7 +696,7 @@ def main() -> int:
         faces=faces.astype(np.int32),
         normals=normals.astype(np.float32),
         canonical_positions=canonical.astype(np.float32),
-        part_ids=part_ids.astype(np.int64),
+        part_ids=hybrid_part_ids.astype(np.int64),
         hybrid_vertices=hybrid_vertices.astype(np.float32),
         hybrid_faces=hybrid_faces.astype(np.int32),
         hair_ring_vertex_ids=hair_cap["ring_vertex_ids"].astype(np.int64),
@@ -503,6 +708,8 @@ def main() -> int:
         left_hand_vertex_mask=region_masks["left_hand"].astype(bool),
         right_hand_vertex_mask=region_masks["right_hand"].astype(bool),
         lower_clothing_vertex_mask=region_masks["lower_clothing_proxy"].astype(bool),
+        subdivision_selected_parts=np.asarray(subdivision_summary["selected_parts"], dtype=np.int64),
+        subdivision_levels=np.asarray([int(subdivision_summary["levels"])], dtype=np.int64),
     )
 
     summary = {
@@ -522,6 +729,7 @@ def main() -> int:
             "up_offset": float(args.hair_up_offset),
             "cap_height": float(args.hair_cap_height),
         },
+        "subdivision": subdivision_summary,
         "regions": regions,
         "thresholds": masks["thresholds"],
         "outputs": {

@@ -1,6 +1,6 @@
 # Teacher/Candidate Strict Gate Blocker Status
 
-Date: 2026-05-05
+Date: 2026-05-06
 
 ## Current Truth
 
@@ -8,9 +8,9 @@ No local candidate or teacher currently passes the strict mentor gate. Cloud upl
 
 ## Counts
 
-- Generated at: `2026-05-05T12:59:06.049229+00:00`
+- Generated at: `2026-05-05T17:11:28.255416+00:00`
 - Schema version: `20260504_visual_fullbody_hands_v2`
-- Roots scanned: `12`
+- Roots scanned: `13`
 - Candidate gate summaries scanned: `26`
 - Teacher gate summaries scanned: `81`
 - Strict full mentor candidate passes: `0`

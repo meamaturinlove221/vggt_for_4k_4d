@@ -195,6 +195,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hairline-free-offset-reg", type=float, default=0.50)
     parser.add_argument("--hairline-free-smooth-reg", type=float, default=0.10)
     parser.add_argument(
+        "--part-free-offset-limit-face",
+        type=float,
+        default=0.0,
+        help="Optional bounded 3D residual for connected face/head vertices. Disabled by default.",
+    )
+    parser.add_argument(
+        "--part-free-offset-limit-hands",
+        type=float,
+        default=0.0,
+        help="Optional bounded 3D residual for connected hand vertices. Disabled by default.",
+    )
+    parser.add_argument(
+        "--part-free-offset-limit-hairline",
+        type=float,
+        default=0.0,
+        help="Optional bounded 3D residual for connected hair/head-top vertices. Disabled by default.",
+    )
+    parser.add_argument(
+        "--part-free-offset-limit-clothing",
+        type=float,
+        default=0.0,
+        help="Optional bounded 3D residual for connected clothing/lower-body vertices. Disabled by default.",
+    )
+    parser.add_argument("--part-free-offset-reg", type=float, default=0.35)
+    parser.add_argument("--part-free-smooth-reg", type=float, default=0.08)
+    parser.add_argument(
         "--hair-boundary-weight",
         type=float,
         default=0.0,
@@ -693,6 +719,15 @@ def make_part_limits(parts: np.ndarray, args: argparse.Namespace) -> tuple[np.nd
     reg_weights[parts == 4] = 0.35
     reg_weights[parts == 5] = 0.45
     return limits, reg_weights
+
+
+def make_part_free_limits(parts: np.ndarray, args: argparse.Namespace) -> np.ndarray:
+    limits = np.zeros(parts.shape, dtype=np.float32)
+    limits[(parts == 1) | (parts == 2)] = float(args.part_free_offset_limit_hands)
+    limits[parts == 3] = float(args.part_free_offset_limit_face)
+    limits[parts == 4] = float(args.part_free_offset_limit_hairline)
+    limits[parts == 5] = float(args.part_free_offset_limit_clothing)
+    return limits.astype(np.float32)
 
 
 def unique_edges(faces: np.ndarray) -> np.ndarray:
@@ -2081,6 +2116,7 @@ def main() -> int:
     if face_landmark_vertex_mask_np.shape[0] != base_vertices_np.shape[0] or int(face_landmark_vertex_mask_np.sum()) < 16:
         face_landmark_vertex_mask_np = vertex_parts_np == 3
     part_limits_np, part_reg_weights_np = make_part_limits(vertex_parts_np, args)
+    part_free_limits_np = make_part_free_limits(vertex_parts_np, args)
     edges_np = unique_edges(faces_np)
 
     min_part_samples = None
@@ -2264,6 +2300,8 @@ def main() -> int:
     sdf_indices_t = torch.from_numpy(sdf_indices_np).to(device=device)
     part_limits_t = torch.from_numpy(part_limits_np).to(device=device)
     part_reg_weights_t = torch.from_numpy(part_reg_weights_np).to(device=device)
+    part_free_limits_t = torch.from_numpy(part_free_limits_np).to(device=device)[:, None]
+    part_free_vertex_mask_t = (part_free_limits_t.reshape(-1) > 0.0).float()
     edges_t = torch.from_numpy(edges_np).to(device=device)
     center = torch.from_numpy(base_vertices_np.mean(axis=0, keepdims=True).astype(np.float32)).to(device=device)
     hairline_vertex_mask_t = torch.from_numpy((vertex_parts_np == 4).astype(np.float32))[:, None].to(device=device)
@@ -2276,9 +2314,12 @@ def main() -> int:
     log_scale = torch.zeros(1, device=device, requires_grad=True)
     normal_offsets = torch.zeros(base_vertices_np.shape[0], device=device, requires_grad=True)
     hairline_free_offsets = torch.zeros((base_vertices_np.shape[0], 3), device=device, requires_grad=True)
+    part_free_offsets = torch.zeros((base_vertices_np.shape[0], 3), device=device, requires_grad=True)
     optimizer_params = [normal_offsets] if bool(args.freeze_global_transform) else [delta_t, log_scale, normal_offsets]
     if float(args.hairline_free_offset_limit) > 0.0:
         optimizer_params.append(hairline_free_offsets)
+    if float(part_free_limits_np.max(initial=0.0)) > 0.0:
+        optimizer_params.append(part_free_offsets)
     optimizer = torch.optim.Adam(optimizer_params, lr=float(args.lr))
 
     history: list[dict[str, Any]] = []
@@ -2287,12 +2328,14 @@ def main() -> int:
         bounded_offsets = torch.tanh(normal_offsets) * part_limits_t
         hairline_free = torch.tanh(hairline_free_offsets) * float(args.hairline_free_offset_limit)
         hairline_free = hairline_free * hairline_vertex_mask_t
+        part_free = torch.tanh(part_free_offsets) * part_free_limits_t
         if bool(args.freeze_global_transform):
             vertices = base_vertices
         else:
             vertices = center + torch.exp(log_scale).clamp(0.85, 1.15) * (base_vertices - center) + delta_t[None, :]
         vertices = vertices + base_normals * bounded_offsets[:, None]
         vertices = vertices + hairline_free
+        vertices = vertices + part_free
         surfels, surfel_normals = compute_surfels(vertices, faces_t, face_indices_t, barycentric_t)
 
         mask_losses = []
@@ -2418,6 +2461,13 @@ def main() -> int:
         hairline_count = hairline_vertex_mask_t.reshape(-1).sum().clamp_min(1.0)
         hairline_free_reg = (hairline_free_reg * hairline_vertex_mask_t.reshape(-1)).sum() / hairline_count
         hairline_free_smooth = (hairline_free[edges_t[:, 0]] - hairline_free[edges_t[:, 1]]).square().sum(dim=1).mean()
+        part_free_count = part_free_vertex_mask_t.sum().clamp_min(1.0)
+        part_free_reg = (part_free.square().sum(dim=1) * part_free_vertex_mask_t).sum() / part_free_count
+        edge_free_mask = ((part_free_limits_t[edges_t[:, 0], 0] > 0.0) | (part_free_limits_t[edges_t[:, 1], 0] > 0.0)).float()
+        edge_free_count = edge_free_mask.sum().clamp_min(1.0)
+        part_free_smooth = (
+            (part_free[edges_t[:, 0]] - part_free[edges_t[:, 1]]).square().sum(dim=1) * edge_free_mask
+        ).sum() / edge_free_count
         loss = (
             float(args.mask_weight) * mask_loss
             + float(args.recall_weight) * recall_loss
@@ -2433,6 +2483,8 @@ def main() -> int:
             + float(args.offset_smooth_reg) * smooth_reg
             + float(args.hairline_free_offset_reg) * hairline_free_reg
             + float(args.hairline_free_smooth_reg) * hairline_free_smooth
+            + float(args.part_free_offset_reg) * part_free_reg
+            + float(args.part_free_smooth_reg) * part_free_smooth
         )
         loss.backward()
         optimizer.step()
@@ -2459,6 +2511,8 @@ def main() -> int:
                     "offset_smooth_reg": float(smooth_reg.detach().cpu()),
                     "hairline_free_offset_reg": float(hairline_free_reg.detach().cpu()),
                     "hairline_free_smooth_reg": float(hairline_free_smooth.detach().cpu()),
+                    "part_free_offset_reg": float(part_free_reg.detach().cpu()),
+                    "part_free_smooth_reg": float(part_free_smooth.detach().cpu()),
                     "photo_valid_surfels": photo_meta["valid_surfels"],
                     "photo_mean_support": photo_meta["mean_support"],
                     "translation": [float(v) for v in delta_t.detach().cpu().numpy().reshape(-1)],
@@ -2470,15 +2524,18 @@ def main() -> int:
         final_offsets = torch.tanh(normal_offsets) * part_limits_t
         final_hairline_free = torch.tanh(hairline_free_offsets) * float(args.hairline_free_offset_limit)
         final_hairline_free = final_hairline_free * hairline_vertex_mask_t
+        final_part_free = torch.tanh(part_free_offsets) * part_free_limits_t
         if bool(args.freeze_global_transform):
             optimized = base_vertices
         else:
             optimized = center + torch.exp(log_scale).clamp(0.85, 1.15) * (base_vertices - center) + delta_t[None, :]
         optimized = optimized + base_normals * final_offsets[:, None]
         optimized = optimized + final_hairline_free
+        optimized = optimized + final_part_free
         optimized_np = optimized.detach().cpu().numpy().astype(np.float32)
         final_offsets_np = final_offsets.detach().cpu().numpy().astype(np.float32)
         final_hairline_free_np = final_hairline_free.detach().cpu().numpy().astype(np.float32)
+        final_part_free_np = final_part_free.detach().cpu().numpy().astype(np.float32)
 
     initial_rows, initial_overlays = evaluate_mesh(base_vertices_np, faces_np, view_payloads, output_dir / "initial", args.overlay_limit)
     optimized_rows, optimized_overlays = evaluate_mesh(optimized_np, faces_np, view_payloads, output_dir / "optimized", args.overlay_limit)
@@ -2552,6 +2609,31 @@ def main() -> int:
             "the same strict visual gates before being useful."
         ),
     }
+    part_free_norm = np.linalg.norm(final_part_free_np, axis=1)
+    part_free_stats: dict[str, Any] = {
+        "enabled": bool(float(part_free_limits_np.max(initial=0.0)) > 0.0),
+        "limits": {
+            "face": float(args.part_free_offset_limit_face),
+            "hands": float(args.part_free_offset_limit_hands),
+            "hairline": float(args.part_free_offset_limit_hairline),
+            "clothing": float(args.part_free_offset_limit_clothing),
+        },
+        "offset_reg": float(args.part_free_offset_reg),
+        "smooth_reg": float(args.part_free_smooth_reg),
+        "note": (
+            "Part-free offsets are bounded connected 3D residuals. They increase surface capacity "
+            "without adding floating face/hand/hair patches and still require strict visual gates."
+        ),
+    }
+    for part_id, part_name in PART_NAMES.items():
+        mask = (vertex_parts_np == int(part_id)) & (part_free_limits_np > 0.0)
+        part_free_stats[part_name] = {
+            "enabled_vertices": int(mask.sum()),
+            "limit": float(part_free_limits_np[mask].max()) if mask.any() else 0.0,
+            "mean_norm": float(part_free_norm[mask].mean()) if mask.any() else 0.0,
+            "p90_norm": float(np.percentile(part_free_norm[mask], 90)) if mask.any() else 0.0,
+            "max_norm": float(part_free_norm[mask].max()) if mask.any() else 0.0,
+        }
     part_target_stats: dict[str, Any] = {}
     for name in ("head_upper", "hairline_top", "hands_side"):
         counts = [
@@ -2672,6 +2754,7 @@ def main() -> int:
         "face_landmarks": face_landmark_stats,
         "hand_landmarks": hand_landmark_stats,
         "hairline_free_offset": hairline_free_stats,
+        "part_free_offset": part_free_stats,
         "extra_hairline": extra_hairline_summary,
         "optimization_history": history,
         "metrics": {
@@ -2736,6 +2819,8 @@ def main() -> int:
         f"- hand landmark weight: `{float(args.hand_landmark_weight)}`",
         f"- hand landmark detected views: `{hand_landmark_stats['detected_views']}/{hand_landmark_stats['selected_views']}`",
         f"- hand landmark detected hands: `{hand_landmark_stats['detected_hands']}`",
+        f"- part-free offsets enabled: `{part_free_stats['enabled']}`",
+        f"- part-free limits: `{json_ready(part_free_stats['limits'])}`",
         f"- extra hairline surfels: `{extra_hairline_summary.get('kept_points', 0)}`",
         f"- initial mean IoU: `{initial_iou['mean']}`",
         f"- optimized mean IoU: `{optimized_iou['mean']}`",

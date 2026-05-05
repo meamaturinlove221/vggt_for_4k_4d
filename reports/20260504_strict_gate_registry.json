@@ -1,11 +1,12 @@
 {
   "schema_version": "20260504_visual_fullbody_hands_v2",
-  "generated_at": "2026-05-05T12:59:06.049229+00:00",
+  "generated_at": "2026-05-05T17:11:28.255416+00:00",
   "roots": [
     "D:\\vggt\\vggt-main\\output\\normal_line_multiview_20260502",
     "D:\\vggt\\vggt-main\\output\\normal_line_multiview_20260503",
     "D:\\vggt\\vggt-main\\output\\normal_line_multiview_20260504",
     "D:\\vggt\\vggt-main\\output\\normal_line_multiview_20260505",
+    "D:\\vggt\\vggt-main\\output\\normal_line_multiview_20260506",
     "D:\\vggt\\vggt-main\\output\\detail_normal_refiner_20260421",
     "D:\\vggt\\vggt-main\\output\\detail_normal_refiner_20260422",
     "D:\\vggt\\vggt-main\\output\\detail_normal_refiner_20260424",
