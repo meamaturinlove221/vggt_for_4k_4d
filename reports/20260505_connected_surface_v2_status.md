@@ -1452,3 +1452,56 @@ outer-layer offset/weight loop; it should either add a more targeted connected
 face/hair/hand surface parameterization or move to a learned surface-token
 decoder trained against a strict-passing dense target-frame surface. Cloud
 remains blocked.
+
+## v2.4 + Triangle RGB/Gradient Combined Smoke
+
+The v2.4 outer-layer carrier was also tested with the all-face triangle
+RGB/gradient objective, to check whether the new geometry carrier and stronger
+raw-image objective complement each other.
+
+Run:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_v24_outer_triangle_rgbgrad_allfaces_smoke2_t64_step5
+```
+
+Key metrics:
+
+```text
+triangle color bake coverage = 0.9279
+triangle RGB pixels per view = 500.5
+initial_iou.mean = 0.7872
+optimized_iou.mean = 0.7926
+iou_delta = +0.0054
+initial_target_recall.mean = 0.9194
+optimized_target_recall.mean = 0.9212
+target_recall_delta = +0.0019
+triangle_rgb_loss = 0.1015
+triangle_gradient_loss = 0.3076
+```
+
+Open3D review:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_v24_outer_triangle_rgbgrad_allfaces_smoke2_t64_step5/open3d_review_full/solid_mesh/iso.png
+```
+
+Strict visual conclusion:
+
+```text
+The combined objective is valid and gives positive 2D alignment without recall
+collapse. But Open3D still shows a template-like body, coarse cap-like hair,
+weak hands, and non-personalized face geometry. This is not a strict teacher
+and not a candidate. It should not be escalated by simply adding more steps,
+larger RGB weights, or larger face budgets.
+```
+
+Next non-redundant implication:
+
+The remaining blocker is not merely renderer sparsity or lack of raw RGB
+signal. The current connected geometry has no precise semantic correspondence
+for face and hand details: landmark losses are computed, but they are broad
+Chamfer terms over large vertex sets and therefore weak. Before any more long
+optimization runs, audit whether the face/hand landmark losses are pulling the
+right connected vertices and add explicit diagnostics or correspondence-aware
+constraints if possible.
