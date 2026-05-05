@@ -109,6 +109,72 @@ valid local gradient. However, target recall regresses and Open3D still shows a
 template body/head with a crude connected cap, not a modeled face, hairline, or
 normal human surface. This is a useful implementation step, not a mentor pass.
 
+## Original 6-View Teacher Gate
+
+The smoke was also rasterized back to:
+
+```text
+output/4k4d_preprocessed_scene_variants/0012_11_frame0000_6views_sparseproto_headshoulder_crop
+```
+
+Initial audit against the signfix protocol exposed a bridge-tool bug: the dense
+target bridge transformed `world_points` but preserved source `depth` and source
+cameras. That produced misleading ~2m residuals. The bridge helper was fixed to:
+
+```text
+transform world_points
+rotate normals
+overwrite intrinsic/extrinsic with the target protocol cameras
+recompute depth/depths from transformed world_points in the target camera frame
+```
+
+Fixed bridge output:
+
+```text
+output/normal_line_multiview_20260505/connected_surface_template_v2_0012_11_frame0000_smoothcap_opt_smoke3_t96_export6v/raw_export_to_signfix_bridge_fixed/teacher_targets.npz
+```
+
+Fixed strict teacher-gate output:
+
+```text
+output/normal_line_multiview_20260505/connected_surface_template_v2_0012_11_frame0000_smoothcap_opt_smoke3_t96_export6v/teacher_gate_after_raw_export_bridge_fixed
+```
+
+Numeric result after the fixed bridge:
+
+```text
+overall numeric pass = false
+visual pass = false
+face_core pass = 1 / 6
+head_face pass = 2 / 6
+hairline pass = 0 / 6
+head pass = 2 / 6
+```
+
+Representative depth-compatible results:
+
+```text
+view01 head_face: coverage 0.9069, p50 depth residual 0.0161, pass true
+view05 head_face: coverage 0.8839, p50 depth residual 0.0099, pass true
+view05 face_core: coverage 0.9620, p50 depth residual 0.0087, pass true
+view00 face_core: coverage 0.1181, p50 depth residual 0.0563, pass false
+view00 hairline: coverage 0.0131, p50 depth residual 0.0539, pass false
+hairline total: 0 / 6 pass
+```
+
+Open3D visual review:
+
+```text
+teacher_gate_after_raw_export_bridge_fixed/open3d_teacher_head_face/iso.png
+teacher_gate_after_raw_export_bridge_fixed/open3d_teacher_face_core/face_close.png
+teacher_gate_after_raw_export_bridge_fixed/open3d_teacher_hairline/iso.png
+```
+
+The fixed bridge improves coordinate compatibility, but the visible geometry is
+still a template-like head/body shell with a crude cap and missing/fragmented
+hairline/face support. It is not a normal human Open3D surface and must remain
+blocked.
+
 ## Decision
 
 Do not:
