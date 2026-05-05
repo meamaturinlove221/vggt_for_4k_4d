@@ -1272,3 +1272,99 @@ the connected mesh explain raw image appearance under its own visibility:
 visibility-aware triangle RGB/gradient rendering with a fixed per-vertex
 appearance estimate. That is a stronger objective than silhouette, landmark,
 edge-SDF, or surfel color variance, and it still avoids VGGT shell recycling.
+
+## Connected Surface v2.3 Triangle RGB / Gradient Render Smoke
+
+v2.3 implements the next non-redundant objective proposed after v2.2: the
+connected mesh now bakes fixed per-vertex RGB appearance from raw views and the
+triangle renderer can output a barycentric color map. The optimizer can penalize
+foreground RGB residual and Sobel-gradient residual between the rendered mesh
+and raw images:
+
+```text
+--triangle-rgb-weight
+--triangle-gradient-weight
+--triangle-rgb-depth-tolerance
+--triangle-rgb-mask-threshold
+```
+
+The color bake and render loss use raw RGB/masks/cameras only. They do not use
+VGGT depth, point, normal, confidence, or any teacher mesh.
+
+Initial limited-face smoke:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_v22_triangle_rgbgrad_smoke3_t64_step5
+```
+
+This revealed a bad experimental setup rather than a useful signal:
+
+```text
+triangle color bake coverage = 0.0067
+triangle RGB pixels per view = 21.67
+```
+
+The depth-gated color bake was too conservative when rendering only a small
+face subset, so the bake was fixed to allow `--triangle-rgb-depth-tolerance 0`
+to mean raw-mask/in-image color baking without sampled depth gating.
+
+No-depth-gate limited-face smoke:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_v22_triangle_rgbgrad_nodgate_smoke3_t64_step5
+```
+
+This fixed vertex color coverage but the face-budget triangle renderer was
+still too sparse:
+
+```text
+triangle color bake coverage = 1.0000
+triangle RGB pixels per view = 21.33
+iou_delta = +0.0007
+target_recall_delta = +0.0013
+```
+
+All-face renderer smoke:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_v22_triangle_rgbgrad_allfaces_smoke2_t64_step5
+```
+
+This is the first valid triangle RGB/gradient smoke:
+
+```text
+rendered faces = 56424
+triangle color bake coverage = 0.9135
+triangle RGB pixels per view = 467.0
+triangle_rgb_loss = 0.0995
+triangle_gradient_loss = 0.3461
+iou_delta = +0.0042
+target_recall_delta = +0.0019
+```
+
+Open3D review:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_v22_triangle_rgbgrad_allfaces_smoke2_t64_step5/open3d_review_full/solid_mesh/iso.png
+```
+
+Conclusion:
+
+```text
+The all-face triangle RGB/gradient objective is a real raw-image signal and is
+more meaningful than the limited-face smoke. It improves 2D alignment without
+shrinking recall. However, the optimized mesh remains a connected SMPL-X-style
+template body with artificial head cap, template face, weak clothing geometry,
+and non-personalized hands. This is not a strict teacher, not a candidate pass,
+and not cloud-eligible.
+```
+
+Next non-redundant implication:
+
+Triangle RGB/gradient makes the objective stronger, but the connected carrier
+still lacks enough expressive geometry for hair, clothing, face, and hands. A
+plain SMPL-X scaffold plus small bounded offsets cannot become the mentor-level
+surface just by adding appearance losses. The next method-level change must
+increase the surface representation itself, for example explicit connected
+outer garment / hair surface layers or a learned surface-token decoder. Do not
+spend more cycles only increasing triangle steps, weights, or face budgets.

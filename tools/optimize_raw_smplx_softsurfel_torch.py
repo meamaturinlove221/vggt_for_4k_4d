@@ -136,6 +136,29 @@ def parse_args() -> argparse.Namespace:
         help="Number of faces processed per inner loop for --renderer triangle.",
     )
     parser.add_argument(
+        "--triangle-rgb-weight",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional raw RGB render loss for --renderer triangle. It bakes fixed per-vertex "
+            "appearance from raw views and makes the connected mesh explain foreground image color. "
+            "Disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--triangle-gradient-weight",
+        type=float,
+        default=0.0,
+        help="Optional Sobel-gradient loss on the triangle-rendered RGB map; disabled by default.",
+    )
+    parser.add_argument(
+        "--triangle-rgb-depth-tolerance",
+        type=float,
+        default=0.05,
+        help="Depth tolerance used when baking fixed vertex colors from initial triangle visibility.",
+    )
+    parser.add_argument("--triangle-rgb-mask-threshold", type=float, default=0.35)
+    parser.add_argument(
         "--depth-softness",
         type=float,
         default=0.0,
@@ -778,6 +801,28 @@ def sample_sdf(sdf: torch.Tensor, uv: torch.Tensor, height: int, width: int) -> 
     return sample_grid_values(sdf, uv, height, width).reshape(-1)
 
 
+def rgb_to_gray_t(rgb_hwc: torch.Tensor) -> torch.Tensor:
+    weights = torch.tensor([0.299, 0.587, 0.114], dtype=rgb_hwc.dtype, device=rgb_hwc.device)
+    return (rgb_hwc * weights[None, None, :]).sum(dim=2)
+
+
+def sobel_magnitude(gray_hw: torch.Tensor) -> torch.Tensor:
+    image = gray_hw[None, None]
+    kx = torch.tensor(
+        [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+        dtype=gray_hw.dtype,
+        device=gray_hw.device,
+    ).view(1, 1, 3, 3)
+    ky = torch.tensor(
+        [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+        dtype=gray_hw.dtype,
+        device=gray_hw.device,
+    ).view(1, 1, 3, 3)
+    gx = F.conv2d(image, kx, padding=1)
+    gy = F.conv2d(image, ky, padding=1)
+    return torch.sqrt(gx[0, 0].square() + gy[0, 0].square() + 1e-8)
+
+
 def classify_vertex_parts(canonical_positions: np.ndarray) -> np.ndarray:
     canonical = np.asarray(canonical_positions, dtype=np.float32)
     x = canonical[:, 0]
@@ -1031,6 +1076,7 @@ def render_soft_triangle_maps(
     pixel_chunk: int,
     inside_softness: float,
     face_chunk: int = 256,
+    vertex_colors: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """CPU-friendly soft triangle smoke for connected surface visibility.
 
@@ -1045,6 +1091,7 @@ def render_soft_triangle_maps(
             "mask": zeros,
             "depth": zeros,
             "normal": torch.zeros((height, width, 3), dtype=vertices.dtype, device=vertices.device),
+            "color": torch.zeros((height, width, 3), dtype=vertices.dtype, device=vertices.device),
             "visibility": zeros,
             "valid_count": torch.zeros((), dtype=vertices.dtype, device=vertices.device),
         }
@@ -1056,6 +1103,7 @@ def render_soft_triangle_maps(
     z_tri = z_flat.reshape(-1, 3)
     face_normals = torch.cross(tri_world[:, 1] - tri_world[:, 0], tri_world[:, 2] - tri_world[:, 0], dim=1)
     face_normals = F.normalize(face_normals, dim=1, eps=1e-6)
+    tri_colors = None if vertex_colors is None else vertex_colors[selected_faces].clamp(0.0, 1.0)
 
     finite = torch.isfinite(uv_tri).all(dim=(1, 2)) & torch.isfinite(z_tri).all(dim=1) & (z_tri > 1e-5).all(dim=1)
     min_xy = uv_tri.min(dim=1).values
@@ -1073,12 +1121,15 @@ def render_soft_triangle_maps(
             "mask": zeros,
             "depth": zeros,
             "normal": torch.zeros((height, width, 3), dtype=vertices.dtype, device=vertices.device),
+            "color": torch.zeros((height, width, 3), dtype=vertices.dtype, device=vertices.device),
             "visibility": zeros,
             "valid_count": torch.zeros((), dtype=vertices.dtype, device=vertices.device),
         }
     uv_tri = uv_tri[valid_faces]
     z_tri = z_tri[valid_faces]
     face_normals = face_normals[valid_faces]
+    if tri_colors is not None:
+        tri_colors = tri_colors[valid_faces]
 
     ys = torch.arange(height, dtype=vertices.dtype, device=vertices.device) + 0.5
     xs = torch.arange(width, dtype=vertices.dtype, device=vertices.device) + 0.5
@@ -1088,6 +1139,7 @@ def render_soft_triangle_maps(
     masks = []
     depths = []
     normal_maps = []
+    color_maps = []
     vis_maps = []
     pchunk = max(1, int(pixel_chunk))
     fchunk = max(1, int(face_chunk))
@@ -1097,10 +1149,12 @@ def render_soft_triangle_maps(
         sumw = torch.zeros((pixel_xy.shape[0],), dtype=vertices.dtype, device=vertices.device)
         depth_num = torch.zeros_like(sumw)
         normal_num = torch.zeros((pixel_xy.shape[0], 3), dtype=vertices.dtype, device=vertices.device)
+        color_num = torch.zeros((pixel_xy.shape[0], 3), dtype=vertices.dtype, device=vertices.device)
         for face_start in range(0, uv_tri.shape[0], fchunk):
             uv = uv_tri[face_start : face_start + fchunk]
             z = z_tri[face_start : face_start + fchunk]
             normals = face_normals[face_start : face_start + fchunk]
+            colors = None if tri_colors is None else tri_colors[face_start : face_start + fchunk]
             v0 = uv[:, 0, :]
             v1 = uv[:, 1, :]
             v2 = uv[:, 2, :]
@@ -1113,6 +1167,8 @@ def render_soft_triangle_maps(
             v2 = v2[good]
             z = z[good]
             normals = normals[good]
+            if colors is not None:
+                colors = colors[good]
             denom = denom[good]
             px = pixel_xy[:, 0:1]
             py = pixel_xy[:, 1:2]
@@ -1127,25 +1183,141 @@ def render_soft_triangle_maps(
             sumw = sumw + local_sumw
             depth_num = depth_num + (weights * tri_z).sum(dim=1)
             normal_num = normal_num + weights @ normals
+            if colors is not None:
+                tri_rgb = (
+                    w0[:, :, None] * colors[None, :, 0, :]
+                    + w1[:, :, None] * colors[None, :, 1, :]
+                    + w2[:, :, None] * colors[None, :, 2, :]
+                )
+                color_num = color_num + (weights[:, :, None] * tri_rgb).sum(dim=1)
         alpha = 1.0 - torch.exp(-sumw.clamp_min(0.0))
         depth = depth_num / sumw.clamp_min(1e-8)
         normal = F.normalize(normal_num / sumw.clamp_min(1e-8)[:, None], dim=1, eps=1e-6)
+        color = (color_num / sumw.clamp_min(1e-8)[:, None]).clamp(0.0, 1.0)
         masks.append(alpha)
         depths.append(depth)
         normal_maps.append(normal)
+        color_maps.append(color)
         vis_maps.append(sumw)
 
     mask = torch.cat(masks, dim=0).reshape(height, width).clamp(0.0, 1.0)
     depth = torch.cat(depths, dim=0).reshape(height, width)
     normal = torch.cat(normal_maps, dim=0).reshape(height, width, 3)
+    color = torch.cat(color_maps, dim=0).reshape(height, width, 3)
     visibility = torch.cat(vis_maps, dim=0).reshape(height, width)
     return {
         "mask": mask,
         "depth": depth,
         "normal": normal,
+        "color": color,
         "visibility": visibility,
         "valid_count": valid_faces.float().sum(),
     }
+
+
+@torch.no_grad()
+def bake_vertex_colors_from_views(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    face_indices: torch.Tensor,
+    view_payloads: list[dict[str, Any]],
+    height: int,
+    width: int,
+    *,
+    pixel_chunk: int,
+    inside_softness: float,
+    face_chunk: int,
+    depth_tolerance: float,
+    mask_threshold: float,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    color_sum = torch.zeros((vertices.shape[0], 3), dtype=vertices.dtype, device=vertices.device)
+    weight_sum = torch.zeros((vertices.shape[0],), dtype=vertices.dtype, device=vertices.device)
+    rows: list[dict[str, Any]] = []
+    for payload in view_payloads:
+        render = render_soft_triangle_maps(
+            vertices=vertices,
+            faces=faces,
+            face_indices=face_indices,
+            world_to_cam=payload["world_to_cam"],
+            intrinsic=payload["intrinsic"],
+            height=height,
+            width=width,
+            pixel_chunk=pixel_chunk,
+            inside_softness=inside_softness,
+            face_chunk=face_chunk,
+        )
+        uv, z, _ = project_points(vertices, payload["world_to_cam"], payload["intrinsic"])
+        valid = (
+            (z > 1e-5)
+            & (uv[:, 0] >= 0.0)
+            & (uv[:, 0] <= width - 1)
+            & (uv[:, 1] >= 0.0)
+            & (uv[:, 1] <= height - 1)
+        )
+        sampled_mask = sample_grid_values(payload["mask_t"], uv, height, width).reshape(-1).clamp(0.0, 1.0)
+        if float(depth_tolerance) > 0.0:
+            sampled_depth = sample_grid_values(render["depth"][None, None], uv, height, width).reshape(-1)
+            depth_ok = torch.isfinite(sampled_depth) & (sampled_depth > 1e-5)
+            depth_ok = depth_ok & ((z - sampled_depth).abs() <= float(depth_tolerance))
+        else:
+            depth_ok = torch.ones_like(valid)
+        valid = valid & (sampled_mask >= float(mask_threshold)) & depth_ok
+        sampled_rgb = sample_grid_values(payload["rgb_t"], uv, height, width).clamp(0.0, 1.0)
+        weights = sampled_mask * valid.float()
+        color_sum = color_sum + sampled_rgb * weights[:, None]
+        weight_sum = weight_sum + weights
+        rows.append(
+            {
+                "view_index": int(payload["view_index"]),
+                "camera_id": str(payload["camera_id"]),
+                "colored_vertices": int(valid.float().sum().detach().cpu()),
+                "mean_mask_weight": float(weights[valid].mean().detach().cpu()) if valid.any() else 0.0,
+            }
+        )
+    has_color = weight_sum > 1e-6
+    colors = color_sum / weight_sum.clamp_min(1e-6)[:, None]
+    if has_color.any():
+        fallback = colors[has_color].mean(dim=0)
+    else:
+        fallback = torch.full((3,), 0.65, dtype=vertices.dtype, device=vertices.device)
+    colors = torch.where(has_color[:, None], colors, fallback[None, :]).clamp(0.0, 1.0)
+    return colors, {
+        "colored_vertices": int(has_color.float().sum().detach().cpu()),
+        "total_vertices": int(vertices.shape[0]),
+        "coverage": float(has_color.float().mean().detach().cpu()) if vertices.shape[0] else 0.0,
+        "depth_tolerance": float(depth_tolerance),
+        "mask_threshold": float(mask_threshold),
+        "rows": rows,
+    }
+
+
+def triangle_rgb_render_loss(
+    render: dict[str, torch.Tensor],
+    payload: dict[str, Any],
+    *,
+    gradient_weight: float,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+    color = render.get("color")
+    if color is None:
+        zero = render["mask"].sum() * 0.0
+        return zero, zero, {"pixels": 0.0, "reason": "no_render_color"}
+    raw = payload["rgb_t"][0].permute(1, 2, 0)
+    target_mask = payload["mask_t"].reshape(color.shape[0], color.shape[1]).clamp(0.0, 1.0)
+    render_mask = render["mask"].clamp(0.0, 1.0)
+    weight = (target_mask * render_mask).clamp(0.0, 1.0)
+    pixel_count = float((weight > 0.05).float().sum().detach().cpu())
+    if pixel_count <= 0:
+        zero = render["mask"].sum() * 0.0
+        return zero, zero, {"pixels": 0.0, "reason": "no_foreground_overlap"}
+    residual = torch.sqrt((color - raw).square().sum(dim=2) + 1e-6)
+    rgb_loss = (residual * weight).sum() / weight.sum().clamp_min(1e-6)
+    if float(gradient_weight) <= 0.0:
+        grad_loss = rgb_loss * 0.0
+    else:
+        rendered_grad = sobel_magnitude(rgb_to_gray_t(color))
+        raw_grad = payload["rgb_grad_t"]
+        grad_loss = ((rendered_grad - raw_grad).abs() * weight).sum() / weight.sum().clamp_min(1e-6)
+    return rgb_loss, grad_loss, {"pixels": pixel_count, "reason": None}
 
 
 def photometric_consistency_loss(
@@ -2407,6 +2579,8 @@ def main() -> int:
                 hand_landmark_overlay_paths.append(overlay_path)
         hand_meta.update({"view_index": int(view_idx), "camera_id": camera_id})
         hand_landmark_rows.append(json_ready(hand_meta))
+        rgb_t = torch.from_numpy(rgb_np).permute(2, 0, 1)[None].to(device=device)
+        rgb_grad_t = sobel_magnitude(rgb_to_gray_t(rgb_t[0].permute(1, 2, 0))).detach()
         view_payloads.append(
             {
                 "view_index": int(view_idx),
@@ -2415,7 +2589,8 @@ def main() -> int:
                 "mask_path": mask_path,
                 "rgb": rgb_np,
                 "mask": mask_np,
-                "rgb_t": torch.from_numpy(rgb_np).permute(2, 0, 1)[None].to(device=device),
+                "rgb_t": rgb_t,
+                "rgb_grad_t": rgb_grad_t,
                 "mask_t": torch.from_numpy(mask_np.astype(np.float32))[None, None].to(device=device),
                 "part_targets": part_targets_np,
                 "part_target_tensors": {
@@ -2474,6 +2649,29 @@ def main() -> int:
     left_hand_vertex_ids_t = torch.from_numpy(np.nonzero(vertex_parts_np == 1)[0].astype(np.int64)).to(device=device)
     right_hand_vertex_ids_t = torch.from_numpy(np.nonzero(vertex_parts_np == 2)[0].astype(np.int64)).to(device=device)
     image_edge_vertex_ids_t = torch.from_numpy(np.nonzero(image_edge_vertex_mask_np)[0].astype(np.int64)).to(device=device)
+    triangle_vertex_colors_t: torch.Tensor | None = None
+    triangle_color_bake_meta: dict[str, Any] = {
+        "enabled": bool(float(args.triangle_rgb_weight) > 0.0 or float(args.triangle_gradient_weight) > 0.0),
+        "reason": None,
+    }
+    if bool(triangle_color_bake_meta["enabled"]):
+        if str(args.renderer) != "triangle":
+            triangle_color_bake_meta["reason"] = "triangle_rgb_requires_triangle_renderer"
+        else:
+            triangle_vertex_colors_t, triangle_color_bake_meta = bake_vertex_colors_from_views(
+                vertices=base_vertices,
+                faces=faces_t,
+                face_indices=render_face_indices_t,
+                view_payloads=view_payloads,
+                height=height,
+                width=width,
+                pixel_chunk=int(args.render_pixel_chunk),
+                inside_softness=float(args.triangle_inside_softness),
+                face_chunk=int(args.triangle_face_chunk),
+                depth_tolerance=float(args.triangle_rgb_depth_tolerance),
+                mask_threshold=float(args.triangle_rgb_mask_threshold),
+            )
+            triangle_color_bake_meta["enabled"] = True
 
     delta_t = torch.zeros(3, device=device, requires_grad=True)
     log_scale = torch.zeros(1, device=device, requires_grad=True)
@@ -2507,6 +2705,9 @@ def main() -> int:
         recall_losses = []
         outside_losses = []
         boundary_losses = []
+        triangle_rgb_losses = []
+        triangle_gradient_losses = []
+        triangle_rgb_pixel_counts = []
         visibility_depths = []
         sampled_vertices = vertices.index_select(0, sdf_indices_t)
         for payload in view_payloads:
@@ -2522,6 +2723,7 @@ def main() -> int:
                     pixel_chunk=int(args.render_pixel_chunk),
                     inside_softness=float(args.triangle_inside_softness),
                     face_chunk=int(args.triangle_face_chunk),
+                    vertex_colors=triangle_vertex_colors_t,
                 )
             else:
                 render = render_soft_surfel_maps(
@@ -2541,6 +2743,19 @@ def main() -> int:
             mask_losses.append(F.binary_cross_entropy(rendered_mask, target_mask))
             target_area = target_mask.sum().clamp_min(1.0)
             recall_losses.append((target_mask * (1.0 - rendered_mask)).sum() / target_area)
+            if (
+                str(args.renderer) == "triangle"
+                and triangle_vertex_colors_t is not None
+                and (float(args.triangle_rgb_weight) > 0.0 or float(args.triangle_gradient_weight) > 0.0)
+            ):
+                rgb_loss_i, gradient_loss_i, triangle_rgb_meta_i = triangle_rgb_render_loss(
+                    render,
+                    payload,
+                    gradient_weight=float(args.triangle_gradient_weight),
+                )
+                triangle_rgb_losses.append(rgb_loss_i)
+                triangle_gradient_losses.append(gradient_loss_i)
+                triangle_rgb_pixel_counts.append(float(triangle_rgb_meta_i.get("pixels", 0.0)))
 
             uv, z, _ = project_points(sampled_vertices, payload["world_to_cam"], payload["intrinsic"])
             sdf_values = sample_sdf(payload["sdf"], uv, height, width)
@@ -2568,6 +2783,14 @@ def main() -> int:
         recall_loss = torch.stack(recall_losses).mean() if recall_losses else torch.zeros((), device=device)
         outside_loss = torch.stack(outside_losses).mean() if outside_losses else torch.zeros((), device=device)
         boundary_loss = torch.stack(boundary_losses).mean() if boundary_losses else torch.zeros((), device=device)
+        triangle_rgb_loss = torch.stack(triangle_rgb_losses).mean() if triangle_rgb_losses else torch.zeros((), device=device)
+        triangle_gradient_loss = (
+            torch.stack(triangle_gradient_losses).mean() if triangle_gradient_losses else torch.zeros((), device=device)
+        )
+        triangle_rgb_meta = {
+            "views": float(len(triangle_rgb_losses)),
+            "mean_pixels": float(np.mean(triangle_rgb_pixel_counts)) if triangle_rgb_pixel_counts else 0.0,
+        }
         photo_loss, photo_meta = photometric_consistency_loss(
             surfels,
             view_payloads,
@@ -2651,6 +2874,8 @@ def main() -> int:
             + float(args.face_landmark_weight) * face_landmark_loss
             + float(args.hand_landmark_weight) * hand_landmark_loss
             + float(args.image_edge_weight) * image_edge_loss
+            + float(args.triangle_rgb_weight) * triangle_rgb_loss
+            + float(args.triangle_gradient_weight) * triangle_gradient_loss
             + float(args.photo_weight) * photo_loss
             + global_reg
             + float(args.offset_reg) * offset_reg
@@ -2682,6 +2907,9 @@ def main() -> int:
                     "hand_landmark_meta": hand_landmark_meta,
                     "image_edge_loss": float(image_edge_loss.detach().cpu()),
                     "image_edge_meta": image_edge_meta,
+                    "triangle_rgb_loss": float(triangle_rgb_loss.detach().cpu()),
+                    "triangle_gradient_loss": float(triangle_gradient_loss.detach().cpu()),
+                    "triangle_rgb_meta": triangle_rgb_meta,
                     "photometric_consistency_loss": float(photo_loss.detach().cpu()),
                     "offset_reg": float(offset_reg.detach().cpu()),
                     "offset_smooth_reg": float(smooth_reg.detach().cpu()),
@@ -2891,6 +3119,18 @@ def main() -> int:
             "It uses no VGGT depth/point/normal and creates no floating patch or teacher."
         ),
     }
+    triangle_rgb_stats = {
+        "rgb_weight": float(args.triangle_rgb_weight),
+        "gradient_weight": float(args.triangle_gradient_weight),
+        "depth_tolerance": float(args.triangle_rgb_depth_tolerance),
+        "mask_threshold": float(args.triangle_rgb_mask_threshold),
+        "color_bake": triangle_color_bake_meta,
+        "note": (
+            "Triangle RGB/gradient losses make the connected mesh explain raw image appearance "
+            "under its own soft visibility. Vertex colors are fixed from raw views; this is not "
+            "a learned texture teacher and uses no VGGT geometry output."
+        ),
+    }
 
     truthful_status = "raw_softsurfel_surface_smoke_complete_not_teacher_or_candidate"
     export_summary = None
@@ -2952,6 +3192,7 @@ def main() -> int:
         "face_landmarks": face_landmark_stats,
         "hand_landmarks": hand_landmark_stats,
         "image_edges": image_edge_stats,
+        "triangle_rgb": triangle_rgb_stats,
         "hairline_free_offset": hairline_free_stats,
         "part_free_offset": part_free_stats,
         "extra_hairline": extra_hairline_summary,
@@ -3022,6 +3263,9 @@ def main() -> int:
         f"- image edge part ids: `{image_edge_stats['part_ids']}`",
         f"- image edge usable views: `{image_edge_stats['usable_views']}/{image_edge_stats['selected_views']}`",
         f"- image edge mean pixels: `{image_edge_stats['mean_edge_pixels']}`",
+        f"- triangle RGB weight: `{float(args.triangle_rgb_weight)}`",
+        f"- triangle gradient weight: `{float(args.triangle_gradient_weight)}`",
+        f"- triangle color bake coverage: `{triangle_color_bake_meta.get('coverage', 0.0)}`",
         f"- part-free offsets enabled: `{part_free_stats['enabled']}`",
         f"- part-free limits: `{json_ready(part_free_stats['limits'])}`",
         f"- extra hairline surfels: `{extra_hairline_summary.get('kept_points', 0)}`",

@@ -8,7 +8,7 @@ No local candidate or teacher currently passes the strict mentor gate. Cloud upl
 
 ## Counts
 
-- Generated at: `2026-05-05T17:23:41.427846+00:00`
+- Generated at: `2026-05-05T17:41:34.423789+00:00`
 - Schema version: `20260504_visual_fullbody_hands_v2`
 - Roots scanned: `13`
 - Candidate gate summaries scanned: `26`
