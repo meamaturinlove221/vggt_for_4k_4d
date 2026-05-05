@@ -734,6 +734,47 @@ It is still only a `64px`, `1-view`, `1-step` smoke and is not a teacher, but it
 confirms that connected mesh visibility can be tested locally without falling
 back to Gaussian surfel splats.
 
+The same all-face triangle renderer was then run for a slightly larger local
+diagnostic:
+
+```text
+output/normal_line_multiview_20260505/triangle_renderer_allfaces_cuda_smoke3_t64_step5
+renderer = triangle
+triangle_render_face_budget = -1
+sampled render faces = 21580
+views = 3
+steps = 5
+target size = 64
+global transform frozen = true
+```
+
+Metrics:
+
+```text
+initial mean IoU = 0.7706115245819092
+optimized mean IoU = 0.7802132964134216
+IoU delta = +0.009601771831512451
+initial target recall = 0.8578081130981445
+optimized target recall = 0.8672575950622559
+target recall delta = +0.009449481964111328
+```
+
+Loss decreased monotonically:
+
+```text
+loss: 0.3032742142677307 -> 0.29087352752685547
+mask loss: 0.18814441561698914 -> 0.1802668273448944
+soft recall loss: 0.23325559496879578 -> 0.22342583537101746
+photometric consistency: 0.09475450962781906 -> 0.09383748471736908
+```
+
+This is the strongest local raw-surface signal so far because hard raster IoU
+and target recall improve together while the global transform is frozen and all
+connected mesh faces participate in the soft mask. The limitation is equally
+important: the visual result is still a low-resolution SMPL-X-like template
+surface, not a normal-human Open3D surface with modeled face/hair/hands. This is
+therefore a renderer/backend direction signal, not a teacher pass.
+
 Interpretation:
 
 This is the first raw-surface diagnostic in this sequence where the optimized
