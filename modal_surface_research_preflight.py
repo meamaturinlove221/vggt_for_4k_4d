@@ -157,7 +157,7 @@ CODE_SYNC_IGNORE = [
 RESEARCH_IMAGE = (
     modal.Image.from_registry("nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04", add_python="3.11")
     .env({"CUDA_HOME": "/usr/local/cuda", "FORCE_CUDA": "1", "MAX_JOBS": "8"})
-    .apt_install("git", "build-essential", "ffmpeg", "libglib2.0-0", "libsm6", "libxext6", "libxrender1")
+    .apt_install("git", "build-essential", "clang", "ffmpeg", "libglib2.0-0", "libsm6", "libxext6", "libxrender1")
     .pip_install(
         *_resolve_base_requirements(),
         "hydra-core",
