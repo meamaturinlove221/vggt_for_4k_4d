@@ -202,6 +202,14 @@ RESEARCH_IMAGE = (
     .add_local_dir(str(REPO_ROOT / "vggt"), remote_path=(REMOTE_CODE_DIR / "vggt").as_posix(), ignore=CODE_SYNC_IGNORE)
 )
 
+CPU_RESEARCH_IMAGE = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("git", "libglib2.0-0", "libsm6", "libxext6", "libxrender1")
+    .pip_install("numpy==1.26.1", "Pillow", "opencv-python-headless", "scipy", "h5py")
+    .add_local_dir(str(REPO_ROOT / "tools"), remote_path=(REMOTE_CODE_DIR / "tools").as_posix(), ignore=CODE_SYNC_IGNORE)
+    .add_local_dir(str(REPO_ROOT / "vggt"), remote_path=(REMOTE_CODE_DIR / "vggt").as_posix(), ignore=CODE_SYNC_IGNORE)
+)
+
 app = modal.App(APP_NAME)
 data_volume = modal.Volume.from_name(DATA_VOLUME_NAME, create_if_missing=True)
 output_volume = modal.Volume.from_name(OUTPUT_VOLUME_NAME, create_if_missing=True)
@@ -251,18 +259,7 @@ def _download_volume_dir(remote_subdir: str, local_dir: Path) -> None:
             output_volume.read_file_into_fileobj(entry.path, handle)
 
 
-@app.function(
-    image=RESEARCH_IMAGE,
-    gpu=GPU_SPEC,
-    cpu=CPU_COUNT,
-    memory=MEMORY_MB,
-    timeout=TIMEOUT_SEC,
-    volumes={
-        REMOTE_DATA_DIR.as_posix(): data_volume,
-        REMOTE_OUTPUT_DIR.as_posix(): output_volume,
-    },
-)
-def run_remote_surface_research(cfg_json: str, registry_status_json: str) -> dict:
+def _run_surface_research_impl(cfg_json: str, registry_status_json: str) -> dict:
     cfg = ResearchConfig.from_json(cfg_json)
     registry_status = json.loads(registry_status_json)
     if cfg.lane not in {"ping_scene", "A_readiness", "B0_surface_tokens"}:
@@ -382,6 +379,35 @@ def run_remote_surface_research(cfg_json: str, registry_status_json: str) -> dic
     return summary
 
 
+@app.function(
+    image=CPU_RESEARCH_IMAGE,
+    cpu=2.0,
+    memory=16 * 1024,
+    timeout=30 * 60,
+    volumes={
+        REMOTE_DATA_DIR.as_posix(): data_volume,
+        REMOTE_OUTPUT_DIR.as_posix(): output_volume,
+    },
+)
+def run_remote_surface_research_cpu(cfg_json: str, registry_status_json: str) -> dict:
+    return _run_surface_research_impl(cfg_json, registry_status_json)
+
+
+@app.function(
+    image=RESEARCH_IMAGE,
+    gpu=GPU_SPEC,
+    cpu=CPU_COUNT,
+    memory=MEMORY_MB,
+    timeout=TIMEOUT_SEC,
+    volumes={
+        REMOTE_DATA_DIR.as_posix(): data_volume,
+        REMOTE_OUTPUT_DIR.as_posix(): output_volume,
+    },
+)
+def run_remote_surface_research_gpu(cfg_json: str, registry_status_json: str) -> dict:
+    return _run_surface_research_impl(cfg_json, registry_status_json)
+
+
 @app.local_entrypoint()
 def upload_research_assets(
     local_scene_dir: str,
@@ -463,7 +489,10 @@ def run_research(
     )
     print("[surface-research] launch config:")
     print(json.dumps(asdict(cfg), indent=2, ensure_ascii=False))
-    summary = run_remote_surface_research.remote(cfg.to_json(), json.dumps(registry_status, ensure_ascii=False))
+    if cfg.lane in {"ping_scene", "A_readiness"}:
+        summary = run_remote_surface_research_cpu.remote(cfg.to_json(), json.dumps(registry_status, ensure_ascii=False))
+    else:
+        summary = run_remote_surface_research_gpu.remote(cfg.to_json(), json.dumps(registry_status, ensure_ascii=False))
     print("[surface-research] remote summary:")
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     if download_local_dir.strip():
