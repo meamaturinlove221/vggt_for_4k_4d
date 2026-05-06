@@ -232,6 +232,8 @@ class ResearchConfig:
     token_hidden: int = 64
     methods: str = "A1_neural_sdf,A2_gaussian_surface,A3_visual_hull_init"
     expected_gpu: str = ""
+    grid_resolution: int = 56
+    support_threshold: int = 4
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -266,7 +268,7 @@ def _download_volume_dir(remote_subdir: str, local_dir: Path) -> None:
 def _run_surface_research_impl(cfg_json: str, registry_status_json: str) -> dict:
     cfg = ResearchConfig.from_json(cfg_json)
     registry_status = json.loads(registry_status_json)
-    if cfg.lane not in {"ping_scene", "A_readiness", "B0_surface_tokens"}:
+    if cfg.lane not in {"ping_scene", "A_readiness", "A3_visual_hull_init", "B0_surface_tokens"}:
         raise ValueError(f"Unsupported research lane: {cfg.lane}")
     if any(word in cfg.output_subdir.lower() for word in ("strict_pass", "teacher_export", "candidate_export")):
         raise ValueError("Research preflight output_subdir must not look like a pass/export path.")
@@ -342,6 +344,28 @@ def _run_surface_research_impl(cfg_json: str, registry_status_json: str) -> dict
             str(int(cfg.target_size)),
             "--methods",
             cfg.methods,
+            "--overwrite",
+        ]
+    elif cfg.lane == "A3_visual_hull_init":
+        if not cfg.template_payload_subpath.strip():
+            raise ValueError("A3_visual_hull_init requires template_payload_subpath")
+        cmd = [
+            sys.executable,
+            str(remote_code_dir / "tools" / "preflight_visual_hull_init.py"),
+            "--scene-dir",
+            str(scene_dir),
+            "--template-payload",
+            str(_remote_data_path(cfg.template_payload_subpath)),
+            "--output-dir",
+            str(output_dir / "A3_visual_hull_init"),
+            "--view-indices",
+            cfg.view_indices,
+            "--target-size",
+            str(int(cfg.target_size)),
+            "--grid-resolution",
+            str(int(cfg.grid_resolution)),
+            "--support-threshold",
+            str(int(cfg.support_threshold)),
             "--overwrite",
         ]
     else:
@@ -470,6 +494,8 @@ def run_research(
     token_hidden: int = 64,
     methods: str = "A1_neural_sdf,A2_gaussian_surface,A3_visual_hull_init",
     expected_gpu: str = "",
+    grid_resolution: int = 56,
+    support_threshold: int = 4,
     download_local_dir: str = "",
 ) -> None:
     registry_status = _registry_status(DEFAULT_STRICT_GATE_REGISTRY)
@@ -497,10 +523,12 @@ def run_research(
         token_hidden=int(token_hidden),
         methods=",".join(_split_csv(methods)),
         expected_gpu=expected_gpu or GPU_SPEC,
+        grid_resolution=int(grid_resolution),
+        support_threshold=int(support_threshold),
     )
     print("[surface-research] launch config:")
     print(json.dumps(asdict(cfg), indent=2, ensure_ascii=False))
-    if cfg.lane in {"ping_scene", "A_readiness"}:
+    if cfg.lane in {"ping_scene", "A_readiness", "A3_visual_hull_init"}:
         summary = run_remote_surface_research_cpu.remote(cfg.to_json(), json.dumps(registry_status, ensure_ascii=False))
     else:
         summary = run_remote_surface_research_gpu.remote(cfg.to_json(), json.dumps(registry_status, ensure_ascii=False))

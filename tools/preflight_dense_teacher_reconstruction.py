@@ -64,6 +64,20 @@ def parse_view_indices(spec: str, view_count: int) -> list[int]:
     return sorted(dict.fromkeys(out))
 
 
+def align_intrinsics_for_loaded_scene_view(intrinsic: np.ndarray, view: dict[str, Any], target_size: int) -> np.ndarray:
+    image_size = view.get("image_size") or [target_size, target_size]
+    native_size = int(image_size[0]) if len(image_size) >= 1 else int(target_size)
+    meta = view.get("preprocess_meta") or {}
+    if meta.get("transform") == "crop_pad_to_square" and native_size != int(target_size):
+        native = align_intrinsics_for_scene_view(intrinsic, view, target_size=native_size)
+        scale = float(target_size) / float(max(1, native_size))
+        out = native.astype(np.float32).copy()
+        out[0, :] *= scale
+        out[1, :] *= scale
+        return out
+    return align_intrinsics_for_scene_view(intrinsic, view, target_size=target_size)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -201,7 +215,11 @@ def main() -> int:
         if params is None:
             cam = {"available": False}
         else:
-            intrinsic = align_intrinsics_for_scene_view(np.asarray(params["intrinsic"], dtype=np.float32), view, target_size)
+            intrinsic = align_intrinsics_for_loaded_scene_view(
+                np.asarray(params["intrinsic"], dtype=np.float32),
+                view,
+                target_size,
+            )
             cam = {"available": True, **camera_sanity(intrinsic, np.asarray(params["world_to_cam"], dtype=np.float32), target_size)}
         camera_rows.append(cam)
         rows.append(
