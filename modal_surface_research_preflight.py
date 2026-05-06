@@ -209,7 +209,7 @@ RESEARCH_IMAGE = (
 CPU_RESEARCH_IMAGE = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git", "libglib2.0-0", "libsm6", "libxext6", "libxrender1")
-    .pip_install("numpy==1.26.1", "Pillow", "opencv-python-headless", "scipy", "h5py")
+    .pip_install("numpy==1.26.1", "Pillow", "opencv-python-headless", "scipy", "h5py", "scikit-image")
     .add_local_dir(str(REPO_ROOT / "tools"), remote_path=(REMOTE_CODE_DIR / "tools").as_posix(), ignore=CODE_SYNC_IGNORE)
     .add_local_dir(str(REPO_ROOT / "vggt"), remote_path=(REMOTE_CODE_DIR / "vggt").as_posix(), ignore=CODE_SYNC_IGNORE)
 )

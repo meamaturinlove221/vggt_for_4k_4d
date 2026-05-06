@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 from PIL import Image
+from skimage import draw, measure
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_DIR = Path(__file__).resolve().parent
@@ -143,6 +144,125 @@ def write_ply(path: Path, points: np.ndarray, support: np.ndarray, max_support: 
             )
 
 
+def write_mesh_ply(path: Path, vertices: np.ndarray, faces: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write("ply\nformat ascii 1.0\n")
+        handle.write(f"element vertex {vertices.shape[0]}\n")
+        handle.write("property float x\nproperty float y\nproperty float z\n")
+        handle.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+        handle.write(f"element face {faces.shape[0]}\n")
+        handle.write("property list uchar int vertex_indices\n")
+        handle.write("end_header\n")
+        for vertex in vertices:
+            handle.write(f"{float(vertex[0]):.7f} {float(vertex[1]):.7f} {float(vertex[2]):.7f} 180 210 255\n")
+        for face in faces:
+            handle.write(f"3 {int(face[0])} {int(face[1])} {int(face[2])}\n")
+
+
+def render_mesh_silhouette(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    intrinsic: np.ndarray,
+    world_to_cam: np.ndarray,
+    height: int,
+    width: int,
+) -> np.ndarray:
+    if vertices.shape[0] == 0 or faces.shape[0] == 0:
+        return np.zeros((height, width), dtype=bool)
+    rotation = np.asarray(world_to_cam[:3, :3], dtype=np.float32)
+    translation = np.asarray(world_to_cam[:3, 3], dtype=np.float32)
+    cam = vertices @ rotation.T + translation[None, :]
+    z = cam[:, 2]
+    uvw = (intrinsic @ cam.T).T
+    uv = uvw[:, :2] / np.clip(uvw[:, 2:3], 1e-8, None)
+    rendered = np.zeros((height, width), dtype=bool)
+    for face in faces:
+        idx = np.asarray(face, dtype=np.int64)
+        if np.any(z[idx] <= 1e-6):
+            continue
+        tri = uv[idx]
+        if not np.isfinite(tri).all():
+            continue
+        x0 = float(np.min(tri[:, 0]))
+        x1 = float(np.max(tri[:, 0]))
+        y0 = float(np.min(tri[:, 1]))
+        y1 = float(np.max(tri[:, 1]))
+        if x1 < 0 or y1 < 0 or x0 >= width or y0 >= height:
+            continue
+        # Ignore pathological triangles that usually indicate a projection issue.
+        if (x1 - x0) > width * 2.5 or (y1 - y0) > height * 2.5:
+            continue
+        rr, cc = draw.polygon(tri[:, 1], tri[:, 0], shape=rendered.shape)
+        rendered[rr, cc] = True
+    return rendered
+
+
+def write_overlay(path: Path, target: np.ndarray, rendered: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image = np.zeros((target.shape[0], target.shape[1], 3), dtype=np.uint8)
+    image[..., 1] = np.where(target, 190, 25).astype(np.uint8)
+    image[..., 0] = np.where(rendered, 220, image[..., 0]).astype(np.uint8)
+    image[..., 2] = np.where(target & rendered, 70, 25).astype(np.uint8)
+    Image.fromarray(image).save(path)
+
+
+def mesh_mask_metrics(target: np.ndarray, rendered: np.ndarray) -> dict[str, float]:
+    intersection = np.logical_and(target, rendered).sum()
+    union = np.logical_or(target, rendered).sum()
+    target_sum = max(int(target.sum()), 1)
+    rendered_sum = max(int(rendered.sum()), 1)
+    return {
+        "mesh_mask_iou": float(intersection / max(int(union), 1)),
+        "mesh_mask_recall": float(intersection / target_sum),
+        "mesh_mask_precision": float(intersection / rendered_sum),
+        "mesh_mask_coverage": float(rendered.mean()),
+    }
+
+
+def extract_visual_hull_mesh(
+    occupied: np.ndarray,
+    grid: np.ndarray,
+    resolution: int,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    volume = occupied.reshape(resolution, resolution, resolution).astype(np.float32)
+    if occupied.sum() == 0 or occupied.sum() == occupied.size:
+        return (
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0, 3), dtype=np.int32),
+            {"mesh_status": "not_extractable_degenerate_occupancy"},
+        )
+    coords = grid.reshape(resolution, resolution, resolution, 3)
+    x_values = coords[:, 0, 0, 0]
+    y_values = coords[0, :, 0, 1]
+    z_values = coords[0, 0, :, 2]
+    spacing = (
+        float(x_values[1] - x_values[0]) if resolution > 1 else 1.0,
+        float(y_values[1] - y_values[0]) if resolution > 1 else 1.0,
+        float(z_values[1] - z_values[0]) if resolution > 1 else 1.0,
+    )
+    try:
+        verts, faces, _normals, _values = measure.marching_cubes(volume, level=0.5, spacing=spacing)
+    except Exception as exc:  # noqa: BLE001
+        return (
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0, 3), dtype=np.int32),
+            {"mesh_status": "marching_cubes_failed", "mesh_error": repr(exc)},
+        )
+    origin = np.asarray([x_values[0], y_values[0], z_values[0]], dtype=np.float32)
+    world_vertices = verts.astype(np.float32) + origin[None, :]
+    return (
+        world_vertices.astype(np.float32),
+        faces.astype(np.int32),
+        {
+            "mesh_status": "extracted",
+            "mesh_vertices": int(world_vertices.shape[0]),
+            "mesh_faces": int(faces.shape[0]),
+            "mesh_spacing": [float(item) for item in spacing],
+        },
+    )
+
+
 def write_report(path: Path, summary: dict[str, Any]) -> None:
     lines = [
         "# A3 Visual Hull Initialization Preflight",
@@ -184,6 +304,7 @@ def main() -> int:
     support_counts = np.zeros((grid.shape[0],), dtype=np.int16)
     visible_counts = np.zeros((grid.shape[0],), dtype=np.int16)
     per_view = []
+    view_render_inputs: list[tuple[int, str, np.ndarray, np.ndarray, np.ndarray]] = []
     for view_index in view_indices:
         view = views[view_index]
         camera_id = str(view["camera_id"])
@@ -194,6 +315,7 @@ def main() -> int:
             int(args.target_size),
         )
         world_to_cam = np.asarray(cameras[camera_id]["world_to_cam"], dtype=np.float32)
+        view_render_inputs.append((int(view_index), camera_id, mask, intrinsic, world_to_cam))
         support, visible = project_support(grid, mask, intrinsic, world_to_cam)
         support_counts += support.astype(np.int16)
         # Count visibility per point separately to diagnose too-tight frusta.
@@ -220,12 +342,44 @@ def main() -> int:
 
     all_ply = output_dir / "visual_hull_supported_points.ply"
     write_ply(all_ply, occupied_points, occupied_support, len(view_indices))
+    mesh_vertices, mesh_faces, mesh_summary = extract_visual_hull_mesh(occupied, grid, max(8, int(args.grid_resolution)))
+    mesh_ply = output_dir / "visual_hull_init_mesh.ply"
+    write_mesh_ply(mesh_ply, mesh_vertices, mesh_faces)
+    mesh_review_dir = output_dir / "mesh_projection_review"
+    mesh_review_dir.mkdir(parents=True, exist_ok=True)
+    mesh_projection_metrics = []
+    for view_index, camera_id, mask, intrinsic, world_to_cam in view_render_inputs:
+        rendered = render_mesh_silhouette(
+            mesh_vertices,
+            mesh_faces,
+            intrinsic,
+            world_to_cam,
+            height=int(args.target_size),
+            width=int(args.target_size),
+        )
+        metrics = {
+            "view_index": int(view_index),
+            "camera_id": camera_id,
+            "target_mask_coverage": float(mask.mean()),
+            **mesh_mask_metrics(mask, rendered),
+        }
+        mesh_projection_metrics.append(metrics)
+        Image.fromarray((rendered.astype(np.uint8) * 255)).save(mesh_review_dir / f"view_{camera_id}_rendered_mask.png")
+        write_overlay(mesh_review_dir / f"view_{camera_id}_overlay.png", mask, rendered)
     np.savez_compressed(
         output_dir / "visual_hull_init_points.npz",
         points=occupied_points.astype(np.float32),
         support=occupied_support.astype(np.int16),
         threshold=np.asarray(threshold, dtype=np.int16),
         view_indices=np.asarray(view_indices, dtype=np.int16),
+    )
+    np.savez_compressed(
+        output_dir / "visual_hull_init_mesh.npz",
+        vertices=mesh_vertices.astype(np.float32),
+        faces=mesh_faces.astype(np.int32),
+        threshold=np.asarray(threshold, dtype=np.int16),
+        view_indices=np.asarray(view_indices, dtype=np.int16),
+        grid_resolution=np.asarray(max(8, int(args.grid_resolution)), dtype=np.int16),
     )
     support_hist = {str(i): int((support_counts == i).sum()) for i in range(len(view_indices) + 1)}
     summary = {
@@ -248,6 +402,17 @@ def main() -> int:
             "occupied_fraction": float(occupied.mean()),
             "support_histogram": support_hist,
             "visible_points_any": int((visible_counts > 0).sum()),
+            **mesh_summary,
+            "mesh_projection_mean_iou": float(np.mean([item["mesh_mask_iou"] for item in mesh_projection_metrics]))
+            if mesh_projection_metrics
+            else 0.0,
+            "mesh_projection_mean_recall": float(np.mean([item["mesh_mask_recall"] for item in mesh_projection_metrics]))
+            if mesh_projection_metrics
+            else 0.0,
+            "mesh_projection_mean_precision": float(np.mean([item["mesh_mask_precision"] for item in mesh_projection_metrics]))
+            if mesh_projection_metrics
+            else 0.0,
+            "mesh_projection_per_view": mesh_projection_metrics,
             "per_view": per_view,
         },
         "decision": (
@@ -255,7 +420,12 @@ def main() -> int:
             "A visual hull point cloud is not continuous enough to be a teacher and must still be replaced "
             "by a strict-passing dense surface reconstruction before any teacher-supervised training."
         ),
-        "outputs": [str(all_ply), str(output_dir / "visual_hull_init_points.npz")],
+        "outputs": [
+            str(all_ply),
+            str(output_dir / "visual_hull_init_points.npz"),
+            str(mesh_ply),
+            str(output_dir / "visual_hull_init_mesh.npz"),
+        ],
     }
     (output_dir / "visual_hull_init_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     write_report(output_dir / "visual_hull_init_summary.md", summary)
