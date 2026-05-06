@@ -310,6 +310,7 @@ def _run_surface_research_impl(cfg_json: str, registry_status_json: str) -> dict
             "torch_cuda_available": None,
             "torch_cuda_device_count": None,
             "elapsed_seconds": round(time.time() - started, 3),
+            "output_subdir": output_dir.relative_to(Path(str(REMOTE_OUTPUT_DIR))).as_posix(),
         }
         try:
             import torch
