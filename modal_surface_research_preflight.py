@@ -9,6 +9,10 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
+REMOTE_IMPORT_ROOT = Path("/workspace/vggt")
+if REMOTE_IMPORT_ROOT.is_dir() and str(REMOTE_IMPORT_ROOT) not in sys.path:
+    sys.path.insert(0, str(REMOTE_IMPORT_ROOT))
+
 import modal
 import numpy as np
 
@@ -317,6 +321,12 @@ def _run_surface_research_impl(cfg_json: str, registry_status_json: str) -> dict
         except Exception as exc:  # noqa: BLE001
             summary["torch_error"] = repr(exc)
         (output_dir / "ping_scene_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        (output_dir / "research_preflight_summary.json").write_text(
+            json.dumps(summary, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        output_volume.commit()
+        return summary
     elif cfg.lane == "A_readiness":
         cmd = [
             sys.executable,
