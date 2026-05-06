@@ -1788,3 +1788,70 @@ semantic local surface carriers, but also confirms that the current CPU-smoke
 connected mesh remains too template-like. This is not a teacher, not a
 candidate, and not a cloud unblocker.
 ```
+
+## v28 Semantic Detail Layer Falsification
+
+Following the fixed stop condition, I completed one final handcrafted carrier
+falsification: payload-driven welded semantic detail layers. The layer was
+restricted to audited failure groups only:
+
+```text
+face.mouth
+face.central_nose
+left/right thumb, index, middle, ring, pinky
+```
+
+Carrier:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_template_v28_semantic_detail_mouth_nose_fingers
+```
+
+Smoke:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_v28_semantic_detail_falsification_smoke2_t96_step10
+```
+
+Result:
+
+```text
+semantic detail seed vertices = 43
+semantic detail new vertices = 268
+semantic detail duplicated faces = 235
+semantic detail stitch faces = 462
+
+v24 iou_delta = +0.005383
+v27 iou_delta = +0.004345
+v28 iou_delta = +0.003490
+
+v24 target_recall_delta = +0.001859
+v27 target_recall_delta = -0.000889
+v28 target_recall_delta = -0.001308
+```
+
+Open3D review:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_v28_semantic_detail_falsification_smoke2_t96_step10/open3d_review_full
+output/normal_line_multiview_20260506/connected_surface_v28_semantic_detail_falsification_smoke2_t96_step10/open3d_review_head
+output/normal_line_multiview_20260506/connected_surface_v28_semantic_detail_falsification_smoke2_t96_step10/open3d_review_face
+output/normal_line_multiview_20260506/connected_surface_v28_semantic_detail_falsification_smoke2_t96_step10/open3d_review_hands
+```
+
+Explicit decision:
+
+```text
+output/normal_line_multiview_20260506/connected_surface_v28_semantic_detail_falsification_smoke2_t96_step10/visual_review_codex_fail_or_pass.json
+pass = false
+```
+
+Conclusion:
+
+```text
+The handcrafted connected-surface carrier line is frozen as a main route. Even
+with outer layers, semantic losses, semantic controls, and welded semantic
+detail topology, Open3D remains template-like rather than mentor-pass normal
+human geometry. Next work moves to renderer-backend-preflight, not more
+handcrafted carrier tuning.
+```

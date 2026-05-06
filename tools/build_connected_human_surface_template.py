@@ -87,6 +87,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--outer-layer-offset", type=float, default=0.025)
+    parser.add_argument(
+        "--semantic-detail-payload",
+        type=Path,
+        help=(
+            "Optional semantic_correspondence_payload.npz from the landmark pull audit. "
+            "Selected semantic groups get local connected duplicate detail layers."
+        ),
+    )
+    parser.add_argument(
+        "--semantic-detail-groups",
+        default="",
+        help=(
+            "Comma-separated semantic groups from --semantic-detail-payload. Empty means all groups. "
+            "Examples: 'face.mouth,face.central_nose,right_hand.index'."
+        ),
+    )
+    parser.add_argument("--semantic-detail-topk", type=int, default=8)
+    parser.add_argument("--semantic-detail-offset", type=float, default=0.010)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -270,6 +288,166 @@ def parse_subdivide_parts(spec: str) -> set[int]:
             raise ValueError(f"Subdivision part id {part_id} is not in PART_NAMES")
         out.add(part_id)
     return out
+
+
+def parse_semantic_detail_groups(spec: str, available_groups: list[str]) -> list[str]:
+    available = {str(group) for group in available_groups}
+    if not str(spec).strip():
+        return sorted(available)
+    out: list[str] = []
+    for raw in str(spec).split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        if item not in available:
+            raise ValueError(f"Unknown semantic detail group '{item}'. Available groups: {sorted(available)}")
+        out.append(item)
+    return sorted(set(out))
+
+
+def load_semantic_detail_selection(
+    payload_path: Path | None,
+    *,
+    vertex_count: int,
+    group_spec: str,
+    topk: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    if payload_path is None:
+        return np.zeros((0,), dtype=np.int64), {
+            "enabled": False,
+            "payload": None,
+            "requested_groups": [],
+            "selected_vertices": 0,
+        }
+    path = payload_path.expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Semantic detail payload not found: {path}")
+    with np.load(path, allow_pickle=False) as payload:
+        if "group_names" not in payload.files:
+            raise ValueError(f"{path} does not contain group_names")
+        group_names = [str(item) for item in payload["group_names"].astype(str).tolist()]
+        selected_groups = parse_semantic_detail_groups(group_spec, group_names)
+        selected: list[int] = []
+        group_summaries: dict[str, Any] = {}
+        for group in selected_groups:
+            prefix = group.replace(".", "__")
+            ids_key = f"{prefix}__ids"
+            counts_key = f"{prefix}__counts"
+            if ids_key not in payload.files:
+                continue
+            ids = np.asarray(payload[ids_key], dtype=np.int64)
+            counts = (
+                np.asarray(payload[counts_key], dtype=np.float32)
+                if counts_key in payload.files and np.asarray(payload[counts_key]).shape[0] == ids.shape[0]
+                else np.ones_like(ids, dtype=np.float32)
+            )
+            valid = (ids >= 0) & (ids < int(vertex_count))
+            ids = ids[valid]
+            counts = counts[valid]
+            if ids.size == 0:
+                group_summaries[group] = {"available_vertices": 0, "selected_vertices": 0}
+                continue
+            order = np.argsort(-counts, kind="stable")
+            chosen = ids[order[: max(1, min(int(topk), int(ids.size)))]]
+            selected.extend(int(idx) for idx in chosen.tolist())
+            group_summaries[group] = {
+                "available_vertices": int(ids.size),
+                "selected_vertices": int(np.unique(chosen).size),
+                "top_count": float(counts[order[0]]) if order.size else 0.0,
+            }
+    unique = np.asarray(sorted(set(selected)), dtype=np.int64)
+    return unique, {
+        "enabled": bool(unique.size > 0),
+        "payload": path,
+        "requested_groups": selected_groups,
+        "topk": int(topk),
+        "selected_vertices": int(unique.size),
+        "groups": group_summaries,
+    }
+
+
+def add_semantic_detail_layer(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    part_ids: np.ndarray,
+    face_front_mask: np.ndarray,
+    selected_vertices: np.ndarray,
+    *,
+    offset: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    vertices_np = np.asarray(vertices, dtype=np.float32)
+    faces_np = np.asarray(faces, dtype=np.int32)
+    part_ids_np = np.asarray(part_ids, dtype=np.int64)
+    face_front_np = np.asarray(face_front_mask, dtype=bool)
+    selected_vertices_np = np.asarray(selected_vertices, dtype=np.int64)
+    selected_vertices_np = selected_vertices_np[
+        (selected_vertices_np >= 0) & (selected_vertices_np < vertices_np.shape[0])
+    ]
+    if float(offset) <= 0.0 or selected_vertices_np.size == 0:
+        return vertices_np, faces_np, part_ids_np, face_front_np, {
+            "enabled": False,
+            "offset": float(offset),
+            "seed_vertices": int(selected_vertices_np.size),
+            "new_vertices": 0,
+            "duplicated_faces": 0,
+            "stitch_faces": 0,
+        }
+
+    seed_mask = np.zeros((vertices_np.shape[0],), dtype=bool)
+    seed_mask[np.unique(selected_vertices_np)] = True
+    selected_face_mask = seed_mask[faces_np].any(axis=1)
+    selected_faces = faces_np[selected_face_mask]
+    if selected_faces.size == 0:
+        return vertices_np, faces_np, part_ids_np, face_front_np, {
+            "enabled": False,
+            "offset": float(offset),
+            "seed_vertices": int(seed_mask.sum()),
+            "new_vertices": 0,
+            "duplicated_faces": 0,
+            "stitch_faces": 0,
+            "reason": "no_adjacent_faces",
+        }
+
+    normals = compute_vertex_normals(vertices_np, faces_np).astype(np.float32)
+    used_vertices = np.unique(selected_faces.reshape(-1)).astype(np.int64)
+    old_to_new = {int(old): int(vertices_np.shape[0] + idx) for idx, old in enumerate(used_vertices.tolist())}
+    new_vertices = vertices_np[used_vertices] + float(offset) * normals[used_vertices]
+    duplicate_faces = np.asarray([[old_to_new[int(v)] for v in face] for face in selected_faces], dtype=np.int32)
+
+    edge_counts: dict[tuple[int, int], int] = {}
+    for face in selected_faces:
+        a, b, c = [int(v) for v in face.tolist()]
+        for u, v in ((a, b), (b, c), (c, a)):
+            key = (u, v) if u < v else (v, u)
+            edge_counts[key] = edge_counts.get(key, 0) + 1
+    stitch_faces: list[list[int]] = []
+    for (a, b), count in edge_counts.items():
+        if count != 1:
+            continue
+        na = old_to_new[int(a)]
+        nb = old_to_new[int(b)]
+        stitch_faces.append([int(a), int(b), int(nb)])
+        stitch_faces.append([int(a), int(nb), int(na)])
+    stitch_faces_np = np.asarray(stitch_faces, dtype=np.int32) if stitch_faces else np.zeros((0, 3), dtype=np.int32)
+
+    out_vertices = np.concatenate([vertices_np, new_vertices.astype(np.float32)], axis=0).astype(np.float32)
+    out_faces = np.concatenate([faces_np, duplicate_faces, stitch_faces_np], axis=0).astype(np.int32)
+    out_part_ids = np.concatenate([part_ids_np, part_ids_np[used_vertices]], axis=0).astype(np.int64)
+    out_face_front = np.concatenate([face_front_np, face_front_np[used_vertices]], axis=0).astype(bool)
+    return out_vertices, out_faces, out_part_ids, out_face_front, {
+        "enabled": True,
+        "offset": float(offset),
+        "seed_vertices": int(seed_mask.sum()),
+        "used_vertices": int(used_vertices.shape[0]),
+        "new_vertices": int(new_vertices.shape[0]),
+        "duplicated_faces": int(duplicate_faces.shape[0]),
+        "stitch_faces": int(stitch_faces_np.shape[0]),
+        "note": (
+            "Semantic detail layers duplicate only one-ring faces around audited failure groups "
+            "and weld the duplicate sheet through boundary stitch faces. They are carrier "
+            "topology only, not teacher geometry and not a pass signal."
+        ),
+    }
 
 
 def most_common_part(part_values: np.ndarray, *, preferred: set[int] | None = None) -> int:
@@ -626,6 +804,11 @@ def write_report(path: Path, summary: dict[str, Any]) -> None:
         f"local subdivision enabled = {summary['subdivision']['enabled']}",
         f"local subdivision levels = {summary['subdivision']['levels']}",
         f"local subdivision parts = {summary['subdivision']['selected_part_names']}",
+        f"semantic detail enabled = {summary['semantic_detail']['layer']['enabled']}",
+        f"semantic detail groups = {summary['semantic_detail']['selection'].get('requested_groups', [])}",
+        f"semantic detail seed vertices = {summary['semantic_detail']['selection'].get('selected_vertices', 0)}",
+        f"semantic detail new vertices = {summary['semantic_detail']['layer'].get('new_vertices', 0)}",
+        f"semantic detail faces = {summary['semantic_detail']['layer'].get('duplicated_faces', 0) + summary['semantic_detail']['layer'].get('stitch_faces', 0)}",
         "```",
         "",
         "## Part Regions",
@@ -639,6 +822,18 @@ def write_report(path: Path, summary: dict[str, Any]) -> None:
             lines.append(
                 "- level `{level}`: split faces `{selected_faces}`, midpoint vertices `{new_midpoint_vertices}`, "
                 "vertices `{vertices}`, faces `{faces}`".format(**item)
+            )
+    if summary["semantic_detail"]["layer"]["enabled"]:
+        lines.extend(["", "## Semantic Detail Layer", ""])
+        lines.append(
+            "This is payload-driven connected carrier topology around audited failure groups. "
+            "It is not teacher geometry and not a pass signal."
+        )
+        lines.append("")
+        for group, item in summary["semantic_detail"]["selection"].get("groups", {}).items():
+            lines.append(
+                f"- `{group}`: available `{item.get('available_vertices', 0)}`, "
+                f"selected `{item.get('selected_vertices', 0)}`, top_count `{item.get('top_count', 0.0)}`"
             )
     lines.extend(
         [
@@ -750,6 +945,25 @@ def main() -> int:
         levels=int(args.subdivision_levels),
     )
     subdivision_summary["selected_part_names"] = [PART_NAMES[int(part)] for part in subdivision_summary["selected_parts"]]
+    semantic_detail_vertices, semantic_detail_selection = load_semantic_detail_selection(
+        args.semantic_detail_payload,
+        vertex_count=int(hybrid_vertices.shape[0]),
+        group_spec=str(args.semantic_detail_groups),
+        topk=int(args.semantic_detail_topk),
+    )
+    semantic_detail_summary: dict[str, Any]
+    hybrid_vertices, hybrid_faces, hybrid_part_ids, hybrid_face_front_mask, semantic_detail_layer = add_semantic_detail_layer(
+        hybrid_vertices,
+        hybrid_faces,
+        hybrid_part_ids,
+        hybrid_face_front_mask,
+        semantic_detail_vertices,
+        offset=float(args.semantic_detail_offset),
+    )
+    semantic_detail_summary = {
+        "selection": semantic_detail_selection,
+        "layer": semantic_detail_layer,
+    }
     hybrid_colors = mesh_colors_from_parts(hybrid_part_ids)
 
     save_colored_mesh(output_dir / "smplx_part_template_full.ply", vertices, faces, colors)
@@ -765,6 +979,15 @@ def main() -> int:
         hair_cap["ring_points"],
         np.tile(np.asarray([255, 40, 220], dtype=np.uint8)[None, :], (hair_cap["ring_points"].shape[0], 1)),
     )
+    if semantic_detail_vertices.size:
+        save_points(
+            output_dir / "semantic_detail_seed_points.ply",
+            hybrid_vertices[semantic_detail_vertices],
+            np.tile(
+                np.asarray([255, 255, 40], dtype=np.uint8)[None, :],
+                (semantic_detail_vertices.shape[0], 1),
+            ),
+        )
 
     region_masks = {
         "face_front_proxy": hybrid_face_front_mask.astype(bool),
@@ -814,6 +1037,8 @@ def main() -> int:
         outer_layer_offset=np.asarray([float(outer_layer_summary["offset"])], dtype=np.float32),
         subdivision_selected_parts=np.asarray(subdivision_summary["selected_parts"], dtype=np.int64),
         subdivision_levels=np.asarray([int(subdivision_summary["levels"])], dtype=np.int64),
+        semantic_detail_seed_vertices=semantic_detail_vertices.astype(np.int64),
+        semantic_detail_offset=np.asarray([float(args.semantic_detail_offset)], dtype=np.float32),
     )
 
     summary = {
@@ -835,6 +1060,7 @@ def main() -> int:
         },
         "outer_layer": outer_layer_summary,
         "subdivision": subdivision_summary,
+        "semantic_detail": semantic_detail_summary,
         "regions": regions,
         "thresholds": masks["thresholds"],
         "outputs": {
@@ -843,6 +1069,9 @@ def main() -> int:
             "hybrid_mesh": output_dir / "connected_human_surface_template_hybrid.ply",
             "hair_cap_mesh": output_dir / "connected_head_hair_cap_template.ply",
             "seam_ring_points": output_dir / "scalp_hairline_seam_ring_points.ply",
+            "semantic_detail_seed_points": output_dir / "semantic_detail_seed_points.ply"
+            if semantic_detail_vertices.size
+            else None,
             "report_md": output_dir / "report.md",
             "summary_json": output_dir / "connected_human_surface_template_summary.json",
         },
