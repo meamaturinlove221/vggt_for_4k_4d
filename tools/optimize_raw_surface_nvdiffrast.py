@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch import nn
 from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -62,6 +63,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--view-indices", default="0,10,20,30,40,50")
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--lr", type=float, default=0.01)
+    parser.add_argument(
+        "--offset-mode",
+        choices=("vertex", "mlp"),
+        default="vertex",
+        help=(
+            "vertex optimizes bounded per-vertex residuals. mlp optimizes a tiny shared residual decoder "
+            "over canonical mesh features, a first learned-surface-backend smoke."
+        ),
+    )
+    parser.add_argument("--mlp-hidden", type=int, default=64)
     parser.add_argument("--mask-bce-weight", type=float, default=1.0)
     parser.add_argument("--target-recall-weight", type=float, default=0.5)
     parser.add_argument("--overfill-weight", type=float, default=0.35)
@@ -117,6 +128,37 @@ def part_offset_limits(part_ids: np.ndarray) -> np.ndarray:
         limits[np.asarray(part_ids) == int(part_id)] = float(value)
     limits[limits <= 0] = 0.002
     return limits
+
+
+class SurfaceOffsetMLP(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 3),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, features: torch.Tensor, limits: torch.Tensor) -> torch.Tensor:
+        return torch.tanh(self.net(features)) * limits
+
+
+def build_vertex_features(vertices: np.ndarray, normals: np.ndarray, part_ids: np.ndarray) -> np.ndarray:
+    vertices_np = np.asarray(vertices, dtype=np.float32)
+    normals_np = np.asarray(normals, dtype=np.float32)
+    centered = vertices_np - vertices_np.mean(axis=0, keepdims=True)
+    scale = float(np.percentile(np.linalg.norm(centered, axis=1), 95))
+    if not np.isfinite(scale) or scale < 1e-6:
+        scale = 1.0
+    geom = centered / scale
+    one_hot = np.zeros((vertices_np.shape[0], len(PART_LIMITS)), dtype=np.float32)
+    clipped_parts = np.clip(np.asarray(part_ids, dtype=np.int64), 0, len(PART_LIMITS) - 1)
+    one_hot[np.arange(vertices_np.shape[0]), clipped_parts] = 1.0
+    return np.concatenate([geom, normals_np, one_hot], axis=1).astype(np.float32)
 
 
 def render_mask_depth(
@@ -302,8 +344,17 @@ def main() -> int:
     base_vertices = torch.as_tensor(base_vertices_np, dtype=torch.float32, device=device).contiguous()
     limits = torch.as_tensor(limits_np, dtype=torch.float32, device=device).view(-1, 1)
     edges = torch.as_tensor(edges_np, dtype=torch.long, device=device).contiguous()
-    raw_delta = torch.zeros_like(base_vertices, requires_grad=True)
-    optimizer = torch.optim.Adam([raw_delta], lr=float(args.lr))
+    base_normals_np = compute_vertex_normals(base_vertices_np, faces_np)
+    vertex_features_np = build_vertex_features(base_vertices_np, base_normals_np, part_ids)
+    vertex_features = torch.as_tensor(vertex_features_np, dtype=torch.float32, device=device).contiguous()
+    if args.offset_mode == "mlp":
+        offset_model = SurfaceOffsetMLP(vertex_features.shape[1], int(args.mlp_hidden)).to(device)
+        raw_delta = None
+        optimizer = torch.optim.Adam(offset_model.parameters(), lr=float(args.lr))
+    else:
+        offset_model = None
+        raw_delta = torch.zeros_like(base_vertices, requires_grad=True)
+        optimizer = torch.optim.Adam([raw_delta], lr=float(args.lr))
 
     view_payloads: list[dict[str, Any]] = []
     height = width = int(args.target_size)
@@ -342,7 +393,11 @@ def main() -> int:
     start_time = time.perf_counter()
     for step in range(int(args.steps) + 1):
         optimizer.zero_grad(set_to_none=True)
-        delta = torch.tanh(raw_delta) * limits
+        if offset_model is not None:
+            delta = offset_model(vertex_features, limits)
+        else:
+            assert raw_delta is not None
+            delta = torch.tanh(raw_delta) * limits
         vertices = base_vertices + delta
         mask_bce_total = torch.zeros((), dtype=torch.float32, device=device)
         recall_total = torch.zeros((), dtype=torch.float32, device=device)
@@ -416,7 +471,11 @@ def main() -> int:
 
     elapsed = float(time.perf_counter() - start_time)
     with torch.no_grad():
-        delta = torch.tanh(raw_delta) * limits
+        if offset_model is not None:
+            delta = offset_model(vertex_features, limits)
+        else:
+            assert raw_delta is not None
+            delta = torch.tanh(raw_delta) * limits
         optimized_vertices_np = (base_vertices + delta).detach().cpu().numpy().astype(np.float32)
         delta_np = delta.detach().cpu().numpy().astype(np.float32)
     normals_np = compute_vertex_normals(optimized_vertices_np, faces_np)
@@ -465,6 +524,8 @@ def main() -> int:
             "views": view_indices,
             "target_size": int(args.target_size),
             "steps": int(args.steps),
+            "offset_mode": str(args.offset_mode),
+            "mlp_hidden": int(args.mlp_hidden) if args.offset_mode == "mlp" else None,
             "photometric_variance_weight": float(args.photometric_variance_weight),
             "elapsed_seconds": elapsed,
             "avg_initial_iou": avg_initial_iou,
