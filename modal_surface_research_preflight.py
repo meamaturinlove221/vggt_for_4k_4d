@@ -265,7 +265,7 @@ def _download_volume_dir(remote_subdir: str, local_dir: Path) -> None:
 def run_remote_surface_research(cfg_json: str, registry_status_json: str) -> dict:
     cfg = ResearchConfig.from_json(cfg_json)
     registry_status = json.loads(registry_status_json)
-    if cfg.lane not in {"A_readiness", "B0_surface_tokens"}:
+    if cfg.lane not in {"ping_scene", "A_readiness", "B0_surface_tokens"}:
         raise ValueError(f"Unsupported research lane: {cfg.lane}")
     if any(word in cfg.output_subdir.lower() for word in ("strict_pass", "teacher_export", "candidate_export")):
         raise ValueError("Research preflight output_subdir must not look like a pass/export path.")
@@ -292,7 +292,35 @@ def run_remote_surface_research(cfg_json: str, registry_status_json: str) -> dic
         encoding="utf-8",
     )
 
-    if cfg.lane == "A_readiness":
+    if cfg.lane == "ping_scene":
+        scene_files = sorted(path.relative_to(scene_dir).as_posix() for path in scene_dir.glob("*"))
+        image_count = len(list((scene_dir / "images").glob("*.png")))
+        mask_count = len(list((scene_dir / "masks").glob("*.png")))
+        sidecar = scene_dir / CAMERA_SIDECAR_NAME
+        summary = {
+            **run_meta,
+            "status": "ping_scene_complete",
+            "scene_dir": str(scene_dir),
+            "scene_exists": scene_dir.is_dir(),
+            "top_level_files": scene_files,
+            "image_count": image_count,
+            "mask_count": mask_count,
+            "camera_sidecar_exists": sidecar.is_file(),
+            "torch_cuda_available": None,
+            "torch_cuda_device_count": None,
+            "elapsed_seconds": round(time.time() - started, 3),
+        }
+        try:
+            import torch
+
+            summary["torch_cuda_available"] = bool(torch.cuda.is_available())
+            summary["torch_cuda_device_count"] = int(torch.cuda.device_count())
+            if torch.cuda.is_available():
+                summary["torch_cuda_device_name"] = torch.cuda.get_device_name(0)
+        except Exception as exc:  # noqa: BLE001
+            summary["torch_error"] = repr(exc)
+        (output_dir / "ping_scene_summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    elif cfg.lane == "A_readiness":
         cmd = [
             sys.executable,
             str(remote_code_dir / "tools" / "preflight_dense_teacher_reconstruction.py"),
