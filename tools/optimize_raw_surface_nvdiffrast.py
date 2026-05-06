@@ -65,11 +65,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument(
         "--offset-mode",
-        choices=("vertex", "mlp"),
+        choices=("vertex", "mlp", "image_mlp"),
         default="vertex",
         help=(
             "vertex optimizes bounded per-vertex residuals. mlp optimizes a tiny shared residual decoder "
-            "over canonical mesh features, a first learned-surface-backend smoke."
+            "over canonical mesh features. image_mlp appends fixed multi-view RGB/support features sampled "
+            "from the raw images at the initial surface."
         ),
     )
     parser.add_argument("--mlp-hidden", type=int, default=64)
@@ -254,6 +255,58 @@ def multiview_photometric_variance_loss(
     }
 
 
+@torch.no_grad()
+def compute_image_condition_features(
+    vertices: torch.Tensor,
+    view_payloads: list[dict[str, Any]],
+    height: int,
+    width: int,
+    mask_threshold: float,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    colors: list[torch.Tensor] = []
+    weights: list[torch.Tensor] = []
+    for payload in view_payloads:
+        grid, inside = project_vertices_to_grid(
+            vertices,
+            payload["world_to_cam"],
+            payload["intrinsic"],
+            height,
+            width,
+        )
+        sample_grid = grid.view(1, -1, 1, 2)
+        rgb = F.grid_sample(
+            payload["rgb_tensor"],
+            sample_grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )[0, :, :, 0].T
+        mask = F.grid_sample(
+            payload["mask_tensor"],
+            sample_grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )[0, 0, :, 0]
+        weight = inside.to(vertices.dtype) * (mask > float(mask_threshold)).to(vertices.dtype)
+        colors.append(rgb)
+        weights.append(weight)
+    color_stack = torch.stack(colors, dim=0)
+    weight_stack = torch.stack(weights, dim=0)
+    support = weight_stack.sum(dim=0)
+    weighted = weight_stack[:, :, None]
+    mean = (color_stack * weighted).sum(dim=0) / support.clamp_min(1.0)[:, None]
+    variance = (((color_stack - mean[None, :, :]) ** 2) * weighted).sum(dim=0) / support.clamp_min(1.0)[:, None]
+    support_norm = (support / max(1, len(view_payloads))).clamp(0.0, 1.0)[:, None]
+    features = torch.cat([mean, variance, support_norm], dim=1)
+    meta = {
+        "image_condition_dim": int(features.shape[1]),
+        "vertices_with_two_view_support": int((support >= 2).sum().cpu()),
+        "mean_support": float(support[support >= 1].mean().cpu()) if bool((support >= 1).any()) else 0.0,
+    }
+    return features.contiguous(), meta
+
+
 def mask_metrics(mask: np.ndarray, target: np.ndarray, threshold: float = 0.5) -> dict[str, Any]:
     pred = np.asarray(mask) >= float(threshold)
     tgt = np.asarray(target).astype(bool)
@@ -344,18 +397,6 @@ def main() -> int:
     base_vertices = torch.as_tensor(base_vertices_np, dtype=torch.float32, device=device).contiguous()
     limits = torch.as_tensor(limits_np, dtype=torch.float32, device=device).view(-1, 1)
     edges = torch.as_tensor(edges_np, dtype=torch.long, device=device).contiguous()
-    base_normals_np = compute_vertex_normals(base_vertices_np, faces_np)
-    vertex_features_np = build_vertex_features(base_vertices_np, base_normals_np, part_ids)
-    vertex_features = torch.as_tensor(vertex_features_np, dtype=torch.float32, device=device).contiguous()
-    if args.offset_mode == "mlp":
-        offset_model = SurfaceOffsetMLP(vertex_features.shape[1], int(args.mlp_hidden)).to(device)
-        raw_delta = None
-        optimizer = torch.optim.Adam(offset_model.parameters(), lr=float(args.lr))
-    else:
-        offset_model = None
-        raw_delta = torch.zeros_like(base_vertices, requires_grad=True)
-        optimizer = torch.optim.Adam([raw_delta], lr=float(args.lr))
-
     view_payloads: list[dict[str, Any]] = []
     height = width = int(args.target_size)
     for view_index in view_indices:
@@ -388,6 +429,28 @@ def main() -> int:
                 "intrinsic": torch.as_tensor(intrinsic_np, dtype=torch.float32, device=device).contiguous(),
             }
         )
+
+    base_normals_np = compute_vertex_normals(base_vertices_np, faces_np)
+    vertex_features_np = build_vertex_features(base_vertices_np, base_normals_np, part_ids)
+    vertex_features = torch.as_tensor(vertex_features_np, dtype=torch.float32, device=device).contiguous()
+    image_condition_meta: dict[str, Any] | None = None
+    if args.offset_mode == "image_mlp":
+        image_features, image_condition_meta = compute_image_condition_features(
+            base_vertices,
+            view_payloads,
+            height,
+            width,
+            float(args.photometric_mask_threshold),
+        )
+        vertex_features = torch.cat([vertex_features, image_features], dim=1).contiguous()
+    if args.offset_mode in {"mlp", "image_mlp"}:
+        offset_model = SurfaceOffsetMLP(vertex_features.shape[1], int(args.mlp_hidden)).to(device)
+        raw_delta = None
+        optimizer = torch.optim.Adam(offset_model.parameters(), lr=float(args.lr))
+    else:
+        offset_model = None
+        raw_delta = torch.zeros_like(base_vertices, requires_grad=True)
+        optimizer = torch.optim.Adam([raw_delta], lr=float(args.lr))
 
     loss_curve: list[dict[str, Any]] = []
     start_time = time.perf_counter()
@@ -525,7 +588,8 @@ def main() -> int:
             "target_size": int(args.target_size),
             "steps": int(args.steps),
             "offset_mode": str(args.offset_mode),
-            "mlp_hidden": int(args.mlp_hidden) if args.offset_mode == "mlp" else None,
+            "mlp_hidden": int(args.mlp_hidden) if args.offset_mode in {"mlp", "image_mlp"} else None,
+            "image_condition_meta": image_condition_meta,
             "photometric_variance_weight": float(args.photometric_variance_weight),
             "elapsed_seconds": elapsed,
             "avg_initial_iou": avg_initial_iou,
