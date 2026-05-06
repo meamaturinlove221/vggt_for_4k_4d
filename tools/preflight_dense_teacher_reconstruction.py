@@ -16,7 +16,6 @@ if str(REPO_ROOT) not in sys.path:
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
-from preflight_differentiable_renderer_backend import parse_view_indices  # noqa: E402
 from prepare_4k4d_prior_training_case import (  # noqa: E402
     align_intrinsics_for_scene_view,
     load_scene_manifest,
@@ -46,6 +45,23 @@ METHODS = {
         "stop_condition": "freeze if used as final teacher or if visual hull remains coarse template shell",
     },
 }
+
+
+def parse_view_indices(spec: str, view_count: int) -> list[int]:
+    out: list[int] = []
+    for raw in str(spec).split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        value = int(item)
+        if value < 0:
+            value = view_count + value
+        if value < 0 or value >= view_count:
+            raise IndexError(f"view index {raw} resolved to {value}, outside [0, {view_count})")
+        out.append(value)
+    if not out:
+        out = list(range(min(6, view_count)))
+    return sorted(dict.fromkeys(out))
 
 
 def parse_args() -> argparse.Namespace:
