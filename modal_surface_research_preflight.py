@@ -157,8 +157,8 @@ CODE_SYNC_IGNORE = [
 RESEARCH_IMAGE = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git", "build-essential", "ffmpeg", "libglib2.0-0", "libsm6", "libxext6", "libxrender1")
-    .pip_install(*_resolve_base_requirements(), "hydra-core", "omegaconf", "opencv-python-headless", "scipy")
-    .pip_install("git+https://github.com/NVlabs/nvdiffrast.git")
+    .pip_install(*_resolve_base_requirements(), "hydra-core", "omegaconf", "opencv-python-headless", "scipy", "ninja")
+    .run_commands("python -m pip install --no-build-isolation git+https://github.com/NVlabs/nvdiffrast.git")
     .add_local_dir(str(REPO_ROOT / "tools"), remote_path=(REMOTE_CODE_DIR / "tools").as_posix(), ignore=CODE_SYNC_IGNORE)
     .add_local_dir(str(REPO_ROOT / "vggt"), remote_path=(REMOTE_CODE_DIR / "vggt").as_posix(), ignore=CODE_SYNC_IGNORE)
 )
