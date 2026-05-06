@@ -42,6 +42,7 @@ from prepare_4k4d_prior_training_case import (  # noqa: E402
     recover_legacy_crop_source_sizes,
     resolve_scene_camera_params,
 )
+from research_scene_assets import load_camera_params_sidecar, localize_scene_manifest_paths  # noqa: E402
 from tools.smplx_numpy import compute_vertex_normals  # noqa: E402
 
 
@@ -219,11 +220,12 @@ def main() -> int:
     ctx = dr.RasterizeCudaContext(device=device)
 
     scene_dir = args.scene_dir.resolve()
-    manifest = recover_legacy_crop_source_sizes(scene_dir, load_scene_manifest(scene_dir))
+    manifest = localize_scene_manifest_paths(recover_legacy_crop_source_sizes(scene_dir, load_scene_manifest(scene_dir)), scene_dir)
     views = manifest["exported_views"]
     view_indices = parse_view_indices(args.view_indices, len(views))
     dataset_root = args.dataset_root or Path(str(manifest.get("dataset_root", "")))
-    cameras, camera_source = resolve_scene_camera_params(manifest, dataset_root, args.subset_name)
+    camera_override = load_camera_params_sidecar(scene_dir)
+    cameras, camera_source = resolve_scene_camera_params(manifest, dataset_root, args.subset_name, camera_override)
 
     mesh = load_connected_mesh(args.template_payload)
     base_vertices_np = mesh["vertices"].astype(np.float32)

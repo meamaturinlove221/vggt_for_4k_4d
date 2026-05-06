@@ -10,6 +10,14 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 import modal
+import numpy as np
+
+from tools.prepare_4k4d_prior_training_case import (
+    load_scene_manifest,
+    recover_legacy_crop_source_sizes,
+    resolve_scene_camera_params,
+)
+from tools.research_scene_assets import CAMERA_SIDECAR_NAME
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -139,6 +147,27 @@ def _upload_file(local_path: Path, remote_subpath: str) -> str:
     with data_volume.batch_upload(force=True) as batch:
         batch.put_file(str(local_path), remote_subpath)
     return remote_subpath
+
+
+def _write_scene_camera_sidecar(local_scene_dir: Path) -> Path:
+    local_scene_dir = local_scene_dir.expanduser().resolve()
+    manifest = recover_legacy_crop_source_sizes(local_scene_dir, load_scene_manifest(local_scene_dir))
+    dataset_root = Path(str(manifest.get("dataset_root", "")))
+    cameras, source = resolve_scene_camera_params(manifest, dataset_root, "data_used_in_4K4D")
+    camera_ids = [str(view["camera_id"]) for view in manifest["exported_views"]]
+    intrinsics = np.stack([np.asarray(cameras[camera_id]["intrinsic"], dtype=np.float32) for camera_id in camera_ids], axis=0)
+    cam_to_world = np.stack([np.asarray(cameras[camera_id]["cam_to_world"], dtype=np.float32) for camera_id in camera_ids], axis=0)
+    world_to_cam = np.stack([np.asarray(cameras[camera_id]["world_to_cam"], dtype=np.float32) for camera_id in camera_ids], axis=0)
+    sidecar_path = local_scene_dir / CAMERA_SIDECAR_NAME
+    np.savez_compressed(
+        sidecar_path,
+        camera_ids=np.asarray(camera_ids),
+        intrinsics=intrinsics,
+        cam_to_world=cam_to_world,
+        world_to_cam=world_to_cam,
+        source=np.asarray(str(source)),
+    )
+    return sidecar_path
 
 
 CODE_SYNC_IGNORE = [
@@ -335,6 +364,8 @@ def upload_research_assets(
     registry_status = _registry_status(DEFAULT_STRICT_GATE_REGISTRY)
     print("[surface-research] upload is research-only and does not unblock formal cloud:")
     print(json.dumps(registry_status, indent=2, ensure_ascii=False))
+    sidecar_path = _write_scene_camera_sidecar(Path(local_scene_dir))
+    print(f"[surface-research] wrote portable camera sidecar: {sidecar_path}")
     scene_remote = _upload_dir(Path(local_scene_dir), remote_scene_subdir)
     payload_remote = ""
     if local_template_payload.strip():
